@@ -1,2319 +1,2069 @@
-/* نظام الوليم RPM - V3 (Front-end only)
-   - زباين + سيارات + سجل
-   - تبديل دهن + عداد حالي/جاي + طباعة
-   - تفاصيل أمر شغل + صرف قطع + أجور + فاتورة
-   - موظفين
-   - تقارير
-   - نسخ احتياطي
+/*  نظام الوليم RPM - نسخة Vanilla (HTML/CSS/JS)
+    - Firebase Auth + Firestore
+    - Roles: admin / staff / viewer
+    - Modules: Dashboard, Check-in, Orders, Customers, Vehicles, Oil, Inventory, Invoices, Employees, Reports, Backup, Settings, Admin
+    ملاحظة: فعّلي Firestore + Auth Email/Password داخل Firebase
 */
 
-const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js";
+import {
+  getAuth, signInWithEmailAndPassword, signOut,
+  onAuthStateChanged
+} from "https://www.gstatic.com/firebasejs/10.8.1/firebase-auth.js";
 
-/* ------------------------ IndexedDB ------------------------ */
-const DB_NAME = "alwaleem_rpm_db";
-const DB_VER = 3;
+import {
+  getFirestore, collection, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
+  onSnapshot, query, where, orderBy, limit, serverTimestamp, getDocs, writeBatch
+} from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
 
-const stores = {
-  customers: "id",
-  vehicles: "id",
-  workOrders: "id",
-  parts: "id",
-  invoices: "id",
-  employees: "id",
+/* ====== 1) ضع إعدادات مشروعك هنا ====== */
+const firebaseConfig = {
+  apiKey: "AIzaSyC0p4cqNHuqZs9_gNuKLl7nEY0MqRXbf_A",
+  authDomain: "rpm574.firebaseapp.com",
+  databaseURL: "https://rpm574-default-rtdb.firebaseio.com",
+  projectId: "rpm574",
+  storageBucket: "rpm574.firebasestorage.app",
+  messagingSenderId: "150918603525",
+  appId: "1:150918603525:web:fe1d0fbe5c4505936c4d6c"
 };
+/* ==================================== */
 
-function uid() {
-  return "id_" + (crypto?.randomUUID ? crypto.randomUUID() : (Date.now() + "_" + Math.random()).replace(".", ""));
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+// ---------- Helpers ----------
+const $ = (sel, root=document) => root.querySelector(sel);
+const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
+const fmtDate = (d) => new Intl.DateTimeFormat("ar-IQ", {dateStyle:"medium"}).format(d);
+const fmtTime = (d) => new Intl.DateTimeFormat("ar-IQ", {timeStyle:"short"}).format(d);
+const fmtMoney = (n) => (Number(n||0)).toLocaleString("ar-IQ") + " د.ع";
+const uid = () => Math.random().toString(16).slice(2) + Date.now().toString(16);
+const todayISO = () => new Date().toISOString().slice(0,10);
+const inRange = (iso, from, to) => (!from || iso>=from) && (!to || iso<=to);
+
+function toast(msg, type=""){
+  const el = $("#toast");
+  el.classList.remove("hidden");
+  el.textContent = msg;
+  if(type==="bad") el.style.borderColor="rgba(251,113,133,.55)";
+  else if(type==="good") el.style.borderColor="rgba(52,211,153,.55)";
+  else el.style.borderColor="rgba(255,255,255,.12)";
+  clearTimeout(window.__toastTimer);
+  window.__toastTimer = setTimeout(()=>el.classList.add("hidden"), 2600);
 }
 
-function openDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VER);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      Object.entries(stores).forEach(([name, keyPath]) => {
-        if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath });
-      });
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+function escapeHtml(s){
+  return String(s ?? "").replace(/[&<>"']/g, (c)=>({
+    "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
+  }[c]));
+}
+
+// ---------- Auth + Roles ----------
+let CURRENT_USER = null;
+let CURRENT_ROLE = "viewer"; // default least privilege
+let SETTINGS = { shopName:"نظام الوليم", phone:"", address:"", invoicePrefix:"INV-", vatPercent:0 };
+
+async function getUserRole(uid){
+  const snap = await getDoc(doc(db, "users", uid));
+  if(!snap.exists()) return "viewer";
+  return (snap.data().role || "viewer");
+}
+
+function can(required){
+  const order = { viewer:0, staff:1, admin:2 };
+  return order[CURRENT_ROLE] >= order[required];
+}
+
+function requireRole(required){
+  if(!can(required)){
+    toast("ليس لديك صلاحية للوصول", "bad");
+    location.hash = "#/dashboard";
+    return false;
+  }
+  return true;
+}
+
+// ---------- Firestore Collections (names stable) ----------
+const C = {
+  settings: () => doc(db, "meta", "settings"),
+  users: () => collection(db, "users"),
+  customers: () => collection(db, "customers"),
+  vehicles: () => collection(db, "vehicles"),
+  employees: () => collection(db, "employees"),
+  inventory: () => collection(db, "inventory"),
+  checkins: () => collection(db, "checkins"),
+  orders: () => collection(db, "orders"),
+  invoices: () => collection(db, "invoices"),
+  counters: () => doc(db, "meta", "counters"),
+};
+
+// ---------- UI Shell ----------
+const authScreen = $("#authScreen");
+const appShell = $("#appShell");
+const view = $("#view");
+const pageTitle = $("#pageTitle");
+const userBadge = $("#userBadge");
+const todayBadge = $("#todayBadge");
+const sidebar = $("#sidebar");
+const globalSearch = $("#globalSearch");
+
+function setActiveNav(route){
+  $$(".nav-item").forEach(a=>{
+    a.classList.toggle("active", a.dataset.route===route);
+  });
+  $$(".tab").forEach(a=>{
+    a.classList.toggle("active", a.dataset.route===route);
   });
 }
 
-async function tx(storeName, mode, fn) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const t = db.transaction(storeName, mode);
-    const store = t.objectStore(storeName);
-    let out;
-    Promise.resolve(fn(store)).then(v => out = v).catch(reject);
-    t.oncomplete = () => resolve(out);
-    t.onerror = () => reject(t.error);
-  });
+function showAuth(){
+  authScreen.classList.remove("hidden");
+  appShell.classList.add("hidden");
+}
+function showApp(){
+  authScreen.classList.add("hidden");
+  appShell.classList.remove("hidden");
 }
 
-const dbAPI = {
-  getAll: (store) => tx(store, "readonly", (s) => new Promise((res, rej) => {
-    const r = s.getAll();
-    r.onsuccess = () => res(r.result || []);
-    r.onerror = () => rej(r.error);
-  })),
-  get: (store, key) => tx(store, "readonly", (s) => new Promise((res, rej) => {
-    const r = s.get(key);
-    r.onsuccess = () => res(r.result || null);
-    r.onerror = () => rej(r.error);
-  })),
-  put: (store, obj) => tx(store, "readwrite", (s) => new Promise((res, rej) => {
-    const r = s.put(obj);
-    r.onsuccess = () => res(true);
-    r.onerror = () => rej(r.error);
-  })),
-  del: (store, key) => tx(store, "readwrite", (s) => new Promise((res, rej) => {
-    const r = s.delete(key);
-    r.onsuccess = () => res(true);
-    r.onerror = () => rej(r.error);
-  })),
-  clear: (store) => tx(store, "readwrite", (s) => new Promise((res, rej) => {
-    const r = s.clear();
-    r.onsuccess = () => res(true);
-    r.onerror = () => rej(r.error);
-  })),
-};
-
-/* ------------------------ State & Router ------------------------ */
-const state = {
-  route: "dashboard",
-  search: "",
-};
-
-function parseHash() {
-  const raw = (location.hash || "#/dashboard").replace("#/", "");
-  const [path, query] = raw.split("?");
-  const params = new URLSearchParams(query || "");
-  return { route: path || "dashboard", params };
+// ---------- Settings load ----------
+async function loadSettings(){
+  const snap = await getDoc(C.settings());
+  if(snap.exists()){
+    SETTINGS = { ...SETTINGS, ...snap.data() };
+  }else{
+    await setDoc(C.settings(), SETTINGS, {merge:true});
+  }
 }
 
-function baseRoute(route) {
-  // حتى تبقى القائمة مفعلة بالصفحات الفرعية
-  const map = {
-    customer: "customers",
-    vehicle: "vehicles",
-    order: "orders",
-    more: "more",
-  };
-  return map[route] || route;
+async function ensureCounters(){
+  const snap = await getDoc(C.counters());
+  if(!snap.exists()){
+    await setDoc(C.counters(), { orderNo: 1000, invoiceNo: 1000 }, {merge:true});
+  }
 }
 
-function setTitle(route) {
-  const map = {
-    dashboard: "لوحة التحكم",
-    checkin: "الاستقبال",
-    orders: "أوامر الشغل",
-    order: "تفاصيل أمر شغل",
-    customers: "الزباين",
-    customer: "سجل الزبون",
-    vehicles: "السيارات",
-    vehicle: "سجل السيارة",
-    oil: "تبديل دهن",
-    inventory: "المخزون",
-    invoices: "الفواتير",
-    employees: "الموظفين",
-    reports: "التقارير",
-    backup: "نسخ احتياطي",
-    more: "المزيد",
-  };
-  $("#pageTitle").textContent = map[route] || "نظام الوليم RPM";
+async function nextCounter(field){
+  const ref = C.counters();
+  const snap = await getDoc(ref);
+  const data = snap.exists() ? snap.data() : {};
+  const next = Number(data[field]||0) + 1;
+  await setDoc(ref, { [field]: next }, {merge:true});
+  return next;
 }
 
-function setActiveNav(route) {
-  const b = baseRoute(route);
-  $$(".nav-item").forEach(a => a.classList.toggle("active", a.dataset.route === b));
-  $$(".tab").forEach(a => a.classList.toggle("active", a.dataset.route === b));
-}
-
-/* ------------------------ Helpers ------------------------ */
-function fmtDate(ts) { return new Date(ts).toLocaleString("ar-IQ"); }
-function fmtDay(ts) { return new Date(ts).toLocaleDateString("ar-IQ"); }
-function money(n) { return (Number(n || 0)).toLocaleString("ar-IQ") + " د.ع"; }
-
-function escapeHtml(s) {
-  return String(s ?? "")
-    .replaceAll("&","&amp;")
-    .replaceAll("<","&lt;")
-    .replaceAll(">","&gt;")
-    .replaceAll('"',"&quot;")
-    .replaceAll("'","&#039;");
-}
-
-function pill(status) {
-  const cls =
-    status === "OPEN" ? "open" :
-    status === "IN_PROGRESS" ? "progress" :
-    status === "WAITING_PARTS" ? "parts" :
-    status === "DONE" || status === "DELIVERED" ? "done" : "";
-  const label =
-    status === "OPEN" ? "مفتوح" :
-    status === "WAITING_APPROVAL" ? "بانتظار موافقة" :
-    status === "IN_PROGRESS" ? "قيد الشغل" :
-    status === "WAITING_PARTS" ? "انتظار قطع" :
-    status === "DONE" ? "مكتمل" :
-    status === "DELIVERED" ? "مستلم" : status;
-  return `<span class="pill ${cls}">${label}</span>`;
-}
-
-function downloadText(filename, text) {
-  const blob = new Blob([text], { type: "application/json;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-function readFileAsText(file) {
-  return new Promise((res, rej) => {
-    const fr = new FileReader();
-    fr.onload = () => res(fr.result);
-    fr.onerror = () => rej(fr.error);
-    fr.readAsText(file);
-  });
-}
-
-function sum(arr, fn) { return arr.reduce((a,b)=>a+fn(b), 0); }
-
-/* ------------------------ Print (HTML) ------------------------ */
-function openPrintWindow(title, bodyHtml) {
-  const w = window.open("", "_blank", "width=900,height=700");
-  if (!w) return alert("المتصفح منع فتح نافذة الطباعة. فعّلي Popups.");
-  w.document.open();
-  w.document.write(`
-    <html lang="ar" dir="rtl">
-      <head>
-        <meta charset="utf-8" />
-        <title>${escapeHtml(title)}</title>
-        <style>
-          body{ margin:0; }
-          ${document.querySelector("style")?.textContent || ""}
-        </style>
-      </head>
-      <body>
-        ${bodyHtml}
-        <script>
-          window.onload = () => { window.print(); };
-        </script>
-      </body>
-    </html>
-  `);
-  w.document.close();
-}
-
-function printInvoice(inv, ctx) {
-  const { customer, vehicle, employee, wo } = ctx;
-  const items = Array.isArray(inv.items) ? inv.items : [];
-  const remaining = Math.max(0, Number(inv.total||0)-Number(inv.paid||0));
-
-  // Special: Oil Change invoice
-  if (inv.invoiceType === "OIL") {
-    const oil = inv.oil || {};
-    const html = `
-      <div class="print-wrap">
-        <div class="print-header">
-          <div>
-            <div class="print-brand">نظام الوليم RPM</div>
-            <div class="print-sub">فاتورة تبديل دهن</div>
-            <div class="print-sub">التاريخ: ${fmtDate(inv.createdAt)}</div>
-          </div>
-          <div style="text-align:left">
-            <div class="print-sub">رقم الفاتورة: <b>${escapeHtml(inv.id)}</b></div>
-            <div class="print-sub">رقم أمر الشغل: <b>${escapeHtml(inv.workOrderId || "—")}</b></div>
-          </div>
-        </div>
-
-        <div class="print-grid">
-          <div><b>الزبون</b><br>${escapeHtml(customer?.name || "—")}<br><span style="color:#555">${escapeHtml(customer?.phone || "—")}</span></div>
-          <div><b>السيارة</b><br>${escapeHtml([vehicle?.make, vehicle?.model, vehicle?.year].filter(Boolean).join(" ") || "—")}<br><span style="color:#555">لوحة: ${escapeHtml(vehicle?.plate || "—")}</span></div>
-          <div><b>الفني</b><br>${escapeHtml(employee?.name || "—")}<br><span style="color:#555">${escapeHtml(employee?.specialty || "")}</span></div>
-          <div><b>عدادات الدهن</b><br>الحالي: <b>${oil.currentOdo ?? "—"}</b><br>الجاي: <b>${oil.nextOdo ?? "—"}</b> <span style="color:#555">(بعد ${oil.interval ?? "—"} كم)</span></div>
-        </div>
-
-        <div class="print-box">
-          <b>تفاصيل الخدمة</b>
-          <table class="print-table">
-            <thead><tr><th>الوصف</th><th>الكمية</th><th>سعر</th><th>المجموع</th></tr></thead>
-            <tbody>
-              ${items.map(it => `
-                <tr>
-                  <td>${escapeHtml(it.name)}</td>
-                  <td>${it.qty}</td>
-                  <td>${it.unit}</td>
-                  <td>${it.total}</td>
-                </tr>
-              `).join("")}
-            </tbody>
-          </table>
-
-          <div class="print-foot">
-            <div>
-              <div>المجموع: <b>${inv.total} IQD</b></div>
-              <div>مدفوع: <b>${inv.paid} IQD</b></div>
-              <div>متبقي: <b>${remaining} IQD</b></div>
-            </div>
-            <div style="text-align:left">
-              <div>توقيع الزبون: __________________</div>
-              <div style="margin-top:8px">ختم الكراج: __________________</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="print-sub" style="margin-top:10px;color:#555">
-          ملاحظة: العداد الجاي مجرد تذكير حسب فترة التبديل، ويختلف حسب استعمال السيارة.
-        </div>
-      </div>
-    `;
-    openPrintWindow("فاتورة تبديل دهن - نظام الوليم RPM", html);
+// ---------- Bootstrap first admin ----------
+async function bootstrapFirstAdmin(){
+  if(!CURRENT_USER){
+    toast("سجلي دخول أولاً ثم اضغطي", "bad");
     return;
   }
+  const uref = doc(db, "users", CURRENT_USER.uid);
+  const snap = await getDoc(uref);
+  if(snap.exists() && snap.data().role){
+    toast("تمت التهيئة مسبقاً", "good");
+    return;
+  }
+  // If no other admin exists, make this user admin.
+  const qAdmins = query(C.users(), where("role","==","admin"), limit(1));
+  const admins = await getDocs(qAdmins);
+  if(!admins.empty){
+    toast("يوجد أدمن بالفعل. راجعي الأدمن الحالي.", "bad");
+    return;
+  }
+  await setDoc(uref, {
+    email: CURRENT_USER.email || "",
+    name: CURRENT_USER.displayName || "",
+    role: "admin",
+    createdAt: serverTimestamp()
+  }, {merge:true});
+  CURRENT_ROLE = "admin";
+  toast("تم تعيينك أدمن ✅", "good");
+  route();
+}
 
-  // General invoice
-  const html = `
+// ---------- Seed demo data ----------
+async function seedDemo(){
+  if(!requireRole("admin")) return;
+  const batch = writeBatch(db);
+  const now = new Date();
+  const custs = [
+    { name:"أحمد", phone:"0770xxxxxxx", city:"بغداد" },
+    { name:"محمد", phone:"0780xxxxxxx", city:"بغداد" },
+    { name:"حسن", phone:"0790xxxxxxx", city:"البصرة" },
+  ];
+  const custRefs = custs.map(c => doc(C.customers()));
+  custRefs.forEach((r,i)=> batch.set(r, { ...custs[i], createdAt: serverTimestamp() }));
+
+  const vehicles = [
+    { plate:"بغداد 12345", model:"تويوتا كورولا", year:2015, color:"أبيض", customerId: custRefs[0].id },
+    { plate:"بغداد 67890", model:"هونداي النترا", year:2018, color:"أسود", customerId: custRefs[1].id },
+  ];
+  const vRefs = vehicles.map(v=>doc(C.vehicles()));
+  vRefs.forEach((r,i)=> batch.set(r, { ...vehicles[i], createdAt: serverTimestamp() }));
+
+  const inv = [
+    { name:"فلتر زيت", sku:"OF-01", unit:"قطعة", buy:4000, sell:7000, qty:12, min:3 },
+    { name:"دهن 5W30 (4L)", sku:"OIL-5W30", unit:"علبة", buy:18000, sell:25000, qty:8, min:2 },
+    { name:"فحمات أمامي", sku:"BRK-F", unit:"طقم", buy:22000, sell:32000, qty:5, min:2 },
+  ];
+  inv.forEach(p => batch.set(doc(C.inventory()), { ...p, createdAt: serverTimestamp() }));
+
+  await batch.commit();
+  toast("تمت إضافة بيانات تجريبية", "good");
+}
+
+// ---------- Global search ----------
+let LAST_SEARCH = "";
+globalSearch.addEventListener("input", ()=>{
+  LAST_SEARCH = globalSearch.value.trim();
+  // re-render current route to apply filter
+  route();
+});
+
+// ---------- Responsive sidebar ----------
+$("#btnMenu").addEventListener("click", ()=> sidebar.classList.toggle("open"));
+window.addEventListener("hashchange", ()=> sidebar.classList.remove("open"));
+
+// ---------- Modal ----------
+const modal = $("#modal");
+$("#btnNew").addEventListener("click", ()=> modal.classList.remove("hidden"));
+$("#modalClose").addEventListener("click", ()=> modal.classList.add("hidden"));
+modal.addEventListener("click", (e)=>{ if(e.target===modal) modal.classList.add("hidden"); });
+$$("[data-quick]").forEach(b=>{
+  b.addEventListener("click", ()=>{
+    const r = b.dataset.quick;
+    modal.classList.add("hidden");
+    if(r==="checkin") location.hash = "#/checkin?new=1";
+    if(r==="oil") location.hash = "#/oil?new=1";
+    if(r==="customer") location.hash = "#/customers?new=1";
+    if(r==="vehicle") location.hash = "#/vehicles?new=1";
+    if(r==="employee") location.hash = "#/employees?new=1";
+    if(r==="part") location.hash = "#/inventory?new=1";
+  })
+});
+
+// ---------- Logout ----------
+$("#btnLogout").addEventListener("click", async ()=>{
+  await signOut(auth);
+  toast("تم تسجيل الخروج");
+});
+
+// ---------- Login ----------
+$("#btnLoginDemo").addEventListener("click", ()=>{
+  $("#loginEmail").value = "admin@example.com";
+  $("#loginPass").value = "12345678";
+});
+
+$("#btnLogin").addEventListener("click", async ()=>{
+  const email = $("#loginEmail").value.trim();
+  const pass = $("#loginPass").value;
+  if(!email || !pass) return toast("أدخلي البريد وكلمة المرور", "bad");
+  try{
+    await signInWithEmailAndPassword(auth, email, pass);
+  }catch(err){
+    console.error(err);
+    toast("فشل الدخول: تأكدي من البيانات أو فعلي Auth", "bad");
+  }
+});
+
+$("#btnBootstrapAdmin").addEventListener("click", bootstrapFirstAdmin);
+$("#btnSeed").addEventListener("click", seedDemo);
+
+// ---------- Tabs "more" route shortcut ----------
+$$(".tab").forEach(a=>{
+  a.addEventListener("click", ()=>{ /* active handled by router */ });
+});
+
+// ---------- Data caches ----------
+let CACHE = {
+  customers: new Map(),
+  vehicles: new Map(),
+  employees: new Map(),
+  inventory: new Map(),
+};
+
+// subscribe core lists for fast UX
+function subscribeCore(){
+  onSnapshot(query(C.customers(), orderBy("createdAt","desc"), limit(200)), (snap)=>{
+    CACHE.customers.clear();
+    snap.forEach(d=> CACHE.customers.set(d.id, {id:d.id, ...d.data()}));
+  });
+  onSnapshot(query(C.vehicles(), orderBy("createdAt","desc"), limit(200)), (snap)=>{
+    CACHE.vehicles.clear();
+    snap.forEach(d=> CACHE.vehicles.set(d.id, {id:d.id, ...d.data()}));
+  });
+  onSnapshot(query(C.employees(), orderBy("createdAt","desc"), limit(200)), (snap)=>{
+    CACHE.employees.clear();
+    snap.forEach(d=> CACHE.employees.set(d.id, {id:d.id, ...d.data()}));
+  });
+  onSnapshot(query(C.inventory(), orderBy("createdAt","desc"), limit(300)), (snap)=>{
+    CACHE.inventory.clear();
+    snap.forEach(d=> CACHE.inventory.set(d.id, {id:d.id, ...d.data()}));
+  });
+}
+
+// ---------- UI builders ----------
+function viewHeader(title, subtitle=""){
+  pageTitle.textContent = title;
+  todayBadge.textContent = subtitle || fmtDate(new Date());
+  return `<div class="row-actions" style="justify-content:space-between;align-items:flex-end;">
+    <div>
+      <div class="section-title">${escapeHtml(title)}</div>
+      <div class="small">${escapeHtml(subtitle || "")}</div>
+    </div>
+  </div>`;
+}
+
+function pillStatus(s){
+  const cls = s==="open" ? "open" : s==="progress" ? "progress" : s==="parts" ? "parts" : s==="done" ? "done" : "off";
+  const txt = s==="open" ? "مفتوح" : s==="progress" ? "قيد العمل" : s==="parts" ? "بانتظار قطع" : s==="done" ? "مكتمل" : "—";
+  return `<span class="pill ${cls}">${txt}</span>`;
+}
+
+function matchSearch(text){
+  const q = (LAST_SEARCH||"").toLowerCase();
+  if(!q) return true;
+  return String(text||"").toLowerCase().includes(q);
+}
+
+// ---------- Forms ----------
+function formRow(label, inputHtml){
+  return `<div class="col">
+    <div class="small">${escapeHtml(label)}</div>
+    ${inputHtml}
+  </div>`;
+}
+
+function input(name, value="", type="text", placeholder=""){
+  return `<input class="input" name="${escapeHtml(name)}" type="${type}" value="${escapeHtml(value)}" placeholder="${escapeHtml(placeholder)}" />`;
+}
+
+function select(name, options, value=""){
+  const opts = options.map(o=>{
+    const v = typeof o==="string" ? o : o.value;
+    const t = typeof o==="string" ? o : o.label;
+    const sel = v==value ? "selected" : "";
+    return `<option value="${escapeHtml(v)}" ${sel}>${escapeHtml(t)}</option>`;
+  }).join("");
+  return `<select class="input" name="${escapeHtml(name)}">${opts}</select>`;
+}
+
+function textarea(name, value="", placeholder=""){
+  return `<textarea class="input" name="${escapeHtml(name)}" rows="3" placeholder="${escapeHtml(placeholder)}">${escapeHtml(value)}</textarea>`;
+}
+
+function getFormData(form){
+  const fd = new FormData(form);
+  const obj = {};
+  for(const [k,v] of fd.entries()) obj[k]=v;
+  return obj;
+}
+
+// ---------- Print invoice ----------
+function openPrint(html){
+  const w = window.open("", "_blank");
+  if(!w) return toast("منع المتصفح نافذة الطباعة", "bad");
+  w.document.write(html);
+  w.document.close();
+  w.focus();
+  w.print();
+}
+
+function invoiceHtml(inv, items){
+  const shop = SETTINGS.shopName || "الورشة";
+  const phone = SETTINGS.phone || "";
+  const addr = SETTINGS.address || "";
+  const vat = Number(SETTINGS.vatPercent||0);
+
+  const subTotal = items.reduce((s,it)=> s + Number(it.qty||0)*Number(it.price||0), 0);
+  const vatVal = subTotal * (vat/100);
+  const total = subTotal + vatVal - Number(inv.discount||0);
+
+  const rows = items.map((it,i)=>`
+    <tr>
+      <td>${i+1}</td>
+      <td>${escapeHtml(it.name||"")}</td>
+      <td>${escapeHtml(it.unit||"")}</td>
+      <td>${escapeHtml(it.qty||0)}</td>
+      <td>${fmtMoney(it.price||0)}</td>
+      <td>${fmtMoney(Number(it.qty||0)*Number(it.price||0))}</td>
+    </tr>`).join("");
+
+  return `<!doctype html><html lang="ar" dir="rtl"><head>
+    <meta charset="utf-8" />
+    <title>فاتورة</title>
+    <style>${stylesForPrint()}</style>
+  </head>
+  <body>
     <div class="print-wrap">
       <div class="print-header">
         <div>
-          <div class="print-brand">نظام الوليم RPM</div>
-          <div class="print-sub">فاتورة</div>
-          <div class="print-sub">التاريخ: ${fmtDate(inv.createdAt)}</div>
+          <div class="print-brand">${escapeHtml(shop)}</div>
+          <div class="print-sub">${escapeHtml(addr)}<br/>${escapeHtml(phone)}</div>
         </div>
-        <div style="text-align:left">
-          <div class="print-sub">رقم الفاتورة: <b>${escapeHtml(inv.id)}</b></div>
-          <div class="print-sub">رقم أمر الشغل: <b>${escapeHtml(inv.workOrderId || "—")}</b></div>
+        <div>
+          <div><b>فاتورة:</b> ${escapeHtml(inv.code||inv.id||"")}</div>
+          <div><b>تاريخ:</b> ${escapeHtml(inv.date||todayISO())}</div>
         </div>
       </div>
 
       <div class="print-grid">
-        <div><b>الزبون</b><br>${escapeHtml(customer?.name || "—")}<br><span style="color:#555">${escapeHtml(customer?.phone || "—")}</span></div>
-        <div><b>السيارة</b><br>${escapeHtml([vehicle?.make, vehicle?.model, vehicle?.year].filter(Boolean).join(" ") || "—")}<br><span style="color:#555">لوحة: ${escapeHtml(vehicle?.plate || "—")}</span></div>
-        <div><b>الفني</b><br>${escapeHtml(employee?.name || "—")}<br><span style="color:#555">${escapeHtml(employee?.specialty || "")}</span></div>
-        <div><b>ملاحظة</b><br>${escapeHtml(wo?.complaint || "—")}</div>
+        <div><b>الزبون:</b> ${escapeHtml(inv.customerName||"")}</div>
+        <div><b>السيارة:</b> ${escapeHtml(inv.vehicleLabel||"")}</div>
+        <div><b>الهاتف:</b> ${escapeHtml(inv.customerPhone||"")}</div>
+        <div><b>المسؤول:</b> ${escapeHtml(inv.createdByEmail||"")}</div>
       </div>
 
       <div class="print-box">
-        <b>تفاصيل</b>
         <table class="print-table">
-          <thead><tr><th>الوصف</th><th>الكمية</th><th>سعر</th><th>المجموع</th></tr></thead>
+          <thead><tr>
+            <th>#</th><th>الوصف</th><th>الوحدة</th><th>الكمية</th><th>سعر</th><th>المجموع</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+
+        <div class="print-foot">
+          <div><b>ملاحظات:</b> ${escapeHtml(inv.note||"")}</div>
+          <div style="min-width:240px">
+            <div class="kv"><span>الإجمالي الفرعي</span><b>${fmtMoney(subTotal)}</b></div>
+            <div class="kv"><span>الضريبة (${vat}%)</span><b>${fmtMoney(vatVal)}</b></div>
+            <div class="kv"><span>خصم</span><b>${fmtMoney(inv.discount||0)}</b></div>
+            <div class="hr"></div>
+            <div class="kv"><span>الإجمالي</span><b>${fmtMoney(total)}</b></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body></html>`;
+}
+
+function stylesForPrint(){
+  // minimal print css (copied from styles.css section)
+  return `
+  body{font-family: Arial, "Noto Sans Arabic", sans-serif; direction:rtl}
+  .print-wrap{padding:18px}
+  .print-header{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+  .print-brand{font-weight:900;font-size:18px}
+  .print-sub{font-size:12px;color:#333}
+  .print-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:10px;margin-top:12px}
+  .print-box{margin-top:12px;border:1px solid #ddd;border-radius:12px;padding:12px}
+  .print-table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}
+  .print-table th,.print-table td{border:1px solid #ddd;padding:8px;text-align:right}
+  .print-foot{display:flex;justify-content:space-between;gap:10px;margin-top:10px;font-size:12px}
+  .hr{height:1px;background:#ddd;margin:12px 0}
+  .kv{display:flex;justify-content:space-between;gap:10px}
+  `;
+}
+
+// ---------- CRUD wrappers ----------
+async function createDoc(col, data){
+  data.createdAt = serverTimestamp();
+  data.updatedAt = serverTimestamp();
+  data.createdBy = CURRENT_USER?.uid || "";
+  data.createdByEmail = CURRENT_USER?.email || "";
+  const ref = await addDoc(col, data);
+  return ref.id;
+}
+async function updateDocSafe(ref, data){
+  data.updatedAt = serverTimestamp();
+  await updateDoc(ref, data);
+}
+async function deleteDocSafe(ref){
+  await deleteDoc(ref);
+}
+
+// ---------- Route Views (Part 1) ----------
+async function renderDashboard(){
+  view.innerHTML = viewHeader("لوحة التحكم", fmtDate(new Date()));
+
+  const today = todayISO();
+  const qOrders = query(C.orders(), orderBy("createdAt","desc"), limit(50));
+  const qInvoices = query(C.invoices(), orderBy("createdAt","desc"), limit(50));
+
+  const [ordersSnap, invSnap] = await Promise.all([getDocs(qOrders), getDocs(qInvoices)]);
+
+  const orders = [];
+  ordersSnap.forEach(d=> orders.push({id:d.id, ...d.data()}));
+  const invoices = [];
+  invSnap.forEach(d=> invoices.push({id:d.id, ...d.data()}));
+
+  const open = orders.filter(o=> o.status!=="done");
+  const doneToday = orders.filter(o=> o.status==="done" && (o.doneDate||"").slice(0,10)===today);
+  const invToday = invoices.filter(i=> (i.date||"").slice(0,10)===today);
+  const salesToday = invToday.reduce((s,i)=> s+Number(i.total||0), 0);
+
+  const lowStock = Array.from(CACHE.inventory.values()).filter(p=> Number(p.qty||0) <= Number(p.min||0));
+
+  view.innerHTML += `
+    <div class="cards">
+      <div class="card"><div class="card-title">أوامر مفتوحة</div><div class="card-value">${open.length}</div></div>
+      <div class="card"><div class="card-title">مكتمل اليوم</div><div class="card-value">${doneToday.length}</div></div>
+      <div class="card"><div class="card-title">فواتير اليوم</div><div class="card-value">${invToday.length}</div></div>
+      <div class="card"><div class="card-title">مبيعات اليوم</div><div class="card-value">${fmtMoney(salesToday)}</div></div>
+    </div>
+
+    <div class="row" style="margin-top:12px;">
+      <div class="card subcard">
+        <div class="section-title">أحدث أوامر الشغل</div>
+        <div class="small">آخر 8</div>
+        <div class="hr"></div>
+        ${orders.slice(0,8).map(o=> orderRow(o)).join("") || `<div class="notice">لا توجد بيانات</div>`}
+      </div>
+      <div class="card subcard">
+        <div class="section-title">مخزون منخفض</div>
+        <div class="small">تنبيه</div>
+        <div class="hr"></div>
+        ${lowStock.slice(0,10).map(p=> `<div class="kv"><span>${escapeHtml(p.name||"")}</span><b>${escapeHtml(p.qty||0)}</b></div>`).join("") || `<div class="notice">لا يوجد نقص</div>`}
+      </div>
+    </div>
+  `;
+}
+
+function orderRow(o){
+  const cust = o.customerName || (CACHE.customers.get(o.customerId||"")?.name || "");
+  const veh = o.vehicleLabel || (CACHE.vehicles.get(o.vehicleId||"")?.plate || "");
+  const line = `${escapeHtml(o.code||o.id||"")} — ${escapeHtml(cust)} — ${escapeHtml(veh)}`;
+  return `<div class="kv" style="margin:8px 0;">
+    <span>${line}</span>
+    <span>${pillStatus(o.status||"open")}</span>
+  </div>`;
+}
+
+async function renderCheckin(params){
+  if(!requireRole("staff")) return;
+  const isNew = params.get("new")==="1";
+  view.innerHTML = viewHeader("الاستقبال", "فتح حالة استقبال وربط زبون + سيارة");
+
+  const customers = Array.from(CACHE.customers.values());
+  const vehicles = Array.from(CACHE.vehicles.values());
+
+  view.innerHTML += `
+    <div class="card">
+      <div class="section-title">استقبال جديد</div>
+      <div class="small">اختاري زبون وسيارة ثم اكتب الملاحظات</div>
+      <div class="hr"></div>
+      <form id="fCheckin" class="grid3">
+        ${formRow("الزبون", select("customerId",
+          [{value:"",label:"— اختاري —"}, ...customers.map(c=>({value:c.id,label:`${c.name} (${c.phone||""})`}))],
+          ""))}
+        ${formRow("السيارة", select("vehicleId",
+          [{value:"",label:"— اختاري —"}, ...vehicles.map(v=>({value:v.id,label:`${v.plate} - ${v.model||""}`}))],
+          ""))}
+        ${formRow("ملاحظات", textarea("note","", "مثال: صوت بالمحرك/فحص فرامل/..." ))}
+        <div class="row-actions" style="grid-column:1/-1;justify-content:flex-start;">
+          <button class="btn btn-primary" type="submit">حفظ استقبال</button>
+        </div>
+      </form>
+      <div class="notice" style="margin-top:12px;">بعد الاستقبال، أنشئي أمر شغل من صفحة "أوامر الشغل".</div>
+    </div>
+
+    <div class="card subcard" style="margin-top:12px;">
+      <div class="section-title">آخر الاستقبالات</div>
+      <div class="small">آخر 20</div>
+      <div class="hr"></div>
+      <div id="checkinList" class="notice">... تحميل</div>
+    </div>
+  `;
+
+  $("#fCheckin").addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    const data = getFormData(e.target);
+    if(!data.customerId || !data.vehicleId) return toast("اختاري زبون وسيارة", "bad");
+
+    const c = CACHE.customers.get(data.customerId);
+    const v = CACHE.vehicles.get(data.vehicleId);
+    await createDoc(C.checkins(), {
+      customerId:data.customerId,
+      customerName:c?.name||"",
+      customerPhone:c?.phone||"",
+      vehicleId:data.vehicleId,
+      vehicleLabel:`${v?.plate||""} - ${v?.model||""}`,
+      note:data.note||"",
+      date: todayISO(),
+      status:"open"
+    });
+    toast("تم حفظ الاستقبال", "good");
+    e.target.reset();
+  });
+
+  onSnapshot(query(C.checkins(), orderBy("createdAt","desc"), limit(20)), (snap)=>{
+    const rows=[];
+    snap.forEach(d=> rows.push({id:d.id, ...d.data()}));
+    const html = rows
+      .filter(r => matchSearch(`${r.customerName} ${r.vehicleLabel} ${r.note} ${r.date}`))
+      .map(r=> `<div class="kv" style="margin:8px 0;">
+        <span><b>${escapeHtml(r.customerName||"")}</b> — ${escapeHtml(r.vehicleLabel||"")}<div class="small">${escapeHtml(r.note||"")}</div></span>
+        <span class="small">${escapeHtml(r.date||"")}</span>
+      </div>`).join("") || `<div class="notice">لا توجد بيانات</div>`;
+    $("#checkinList").outerHTML = `<div id="checkinList">${html}</div>`;
+  });
+}
+
+
+// ---------- Orders ----------
+async function renderOrders(params){
+  if(!requireRole("staff")) return;
+  view.innerHTML = viewHeader("أوامر الشغل", "إدارة الحالات من فتح إلى إكمال");
+
+  view.innerHTML += `
+    <div class="card">
+      <div class="row-actions" style="justify-content:space-between;">
+        <div>
+          <div class="section-title">القائمة</div>
+          <div class="small">البحث يعمل على الاسم/السيارة/الكود/الحالة</div>
+        </div>
+        <div class="row-actions">
+          <button id="btnNewOrder" class="btn btn-primary">+ أمر جديد</button>
+          <select id="statusFilter" class="input" style="width:180px;">
+            <option value="">كل الحالات</option>
+            <option value="open">مفتوح</option>
+            <option value="progress">قيد العمل</option>
+            <option value="parts">بانتظار قطع</option>
+            <option value="done">مكتمل</option>
+          </select>
+        </div>
+      </div>
+      <div class="hr"></div>
+      <div id="ordersList" class="notice">... تحميل</div>
+    </div>
+
+    <div id="orderEditor" class="card subcard hidden" style="margin-top:12px;"></div>
+  `;
+
+  $("#btnNewOrder").addEventListener("click", ()=> openOrderEditor(null));
+  $("#statusFilter").addEventListener("change", ()=> route());
+
+  const statusF = $("#statusFilter").value;
+
+  onSnapshot(query(C.orders(), orderBy("createdAt","desc"), limit(200)), (snap)=>{
+    const rows=[];
+    snap.forEach(d=> rows.push({id:d.id, ...d.data()}));
+
+    const filtered = rows.filter(o=>{
+      const f = $("#statusFilter")?.value || statusF || "";
+      if(f && (o.status||"")!==f) return false;
+      return matchSearch(`${o.code} ${o.customerName} ${o.vehicleLabel} ${o.status} ${o.problem} ${o.note}`);
+    });
+
+    const html = `
+      <table class="table">
+        <thead>
+          <tr><th>الكود</th><th>الزبون</th><th>السيارة</th><th>الحالة</th><th>آخر تحديث</th><th></th></tr>
+        </thead>
+        <tbody>
+          ${filtered.map(o=>`
+            <tr class="tr">
+              <td><b>${escapeHtml(o.code||o.id||"")}</b></td>
+              <td>${escapeHtml(o.customerName||"")}</td>
+              <td>${escapeHtml(o.vehicleLabel||"")}</td>
+              <td>${pillStatus(o.status||"open")}</td>
+              <td class="small">${escapeHtml((o.updatedAt?.toDate?.() ? fmtDate(o.updatedAt.toDate())+" "+fmtTime(o.updatedAt.toDate()) : ""))}</td>
+              <td><button class="btn btn-soft" data-edit="${o.id}">فتح</button></td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+      ${filtered.length? "" : `<div class="notice">لا توجد نتائج</div>`}
+    `;
+
+    $("#ordersList").outerHTML = `<div id="ordersList">${html}</div>`;
+
+    $$("[data-edit]").forEach(b=> b.addEventListener("click", ()=>{
+      const id = b.dataset.edit;
+      const obj = rows.find(x=>x.id===id);
+      openOrderEditor(obj);
+    }));
+  });
+
+  async function openOrderEditor(order){
+    const box = $("#orderEditor");
+    box.classList.remove("hidden");
+
+    const customers = Array.from(CACHE.customers.values());
+    const vehicles = Array.from(CACHE.vehicles.values());
+    const employees = Array.from(CACHE.employees.values());
+
+    if(!order){
+      box.innerHTML = `
+        <div class="section-title">أمر جديد</div>
+        <div class="small">اختاري زبون/سيارة ووصفي المشكلة</div>
+        <div class="hr"></div>
+        <form id="fOrderNew" class="grid3">
+          ${formRow("الزبون", select("customerId",
+            [{value:"",label:"— اختاري —"}, ...customers.map(c=>({value:c.id,label:`${c.name} (${c.phone||""})`}))],
+            ""))}
+          ${formRow("السيارة", select("vehicleId",
+            [{value:"",label:"— اختاري —"}, ...vehicles.map(v=>({value:v.id,label:`${v.plate} - ${v.model||""}`}))],
+            ""))}
+          ${formRow("الحالة", select("status", [{value:"open",label:"مفتوح"},{value:"progress",label:"قيد العمل"},{value:"parts",label:"بانتظار قطع"},{value:"done",label:"مكتمل"}], "open"))}
+          ${formRow("المسؤول", select("assignedTo",
+            [{value:"",label:"— اختاري —"}, ...employees.map(e=>({value:e.id,label:`${e.name} (${e.role||""})`}))],
+            ""))}
+          <div class="col" style="grid-column:1/-1">
+            <div class="small">المشكلة</div>
+            ${textarea("problem","","مثال: تبديل فحمات/تصليح عطل كهرباء/..." )}
+          </div>
+          <div class="col" style="grid-column:1/-1">
+            <div class="small">ملاحظات</div>
+            ${textarea("note","")}
+          </div>
+          <div class="row-actions" style="grid-column:1/-1;">
+            <button class="btn btn-primary" type="submit">حفظ</button>
+            <button class="btn btn-soft" type="button" id="btnCancelNew">إلغاء</button>
+          </div>
+        </form>
+      `;
+      $("#btnCancelNew").addEventListener("click", ()=> box.classList.add("hidden"));
+      $("#fOrderNew").addEventListener("submit", async (e)=>{
+        e.preventDefault();
+        const data = getFormData(e.target);
+        if(!data.customerId || !data.vehicleId) return toast("اختاري زبون وسيارة", "bad");
+
+        const c = CACHE.customers.get(data.customerId);
+        const v = CACHE.vehicles.get(data.vehicleId);
+        const no = await nextCounter("orderNo");
+        const code = `WO-${no}`;
+
+        const id = await createDoc(C.orders(), {
+          code,
+          customerId:data.customerId,
+          customerName:c?.name||"",
+          customerPhone:c?.phone||"",
+          vehicleId:data.vehicleId,
+          vehicleLabel:`${v?.plate||""} - ${v?.model||""}`,
+          status: data.status || "open",
+          assignedTo: data.assignedTo || "",
+          problem: data.problem||"",
+          note: data.note||"",
+          parts: [],
+          labor: [],
+          doneDate: ""
+        });
+        toast("تم إنشاء أمر الشغل", "good");
+        box.classList.add("hidden");
+        location.hash = "#/orders";
+      });
+      return;
+    }
+
+    // existing order editor
+    const parts = Array.isArray(order.parts) ? order.parts : [];
+    const labor = Array.isArray(order.labor) ? order.labor : [];
+
+    box.innerHTML = `
+      <div class="row-actions" style="justify-content:space-between;align-items:flex-end;">
+        <div>
+          <div class="section-title">تعديل: ${escapeHtml(order.code||order.id||"")}</div>
+          <div class="small">${escapeHtml(order.customerName||"")} — ${escapeHtml(order.vehicleLabel||"")}</div>
+        </div>
+        <div class="row-actions">
+          <button id="btnMakeInvoice" class="btn btn-primary">تحويل إلى فاتورة</button>
+          <button id="btnCloseEditor" class="btn btn-soft">إغلاق</button>
+        </div>
+      </div>
+      <div class="hr"></div>
+
+      <form id="fOrderEdit" class="grid3">
+        ${formRow("الحالة", select("status", [
+          {value:"open",label:"مفتوح"},
+          {value:"progress",label:"قيد العمل"},
+          {value:"parts",label:"بانتظار قطع"},
+          {value:"done",label:"مكتمل"}
+        ], order.status||"open"))}
+
+        ${formRow("المسؤول", select("assignedTo",
+          [{value:"",label:"—"} ,...employees.map(e=>({value:e.id,label:`${e.name} (${e.role||""})`}))],
+          order.assignedTo||""))}
+
+        <div class="col" style="grid-column:1/-1">
+          <div class="small">المشكلة</div>
+          ${textarea("problem", order.problem||"")}
+        </div>
+        <div class="col" style="grid-column:1/-1">
+          <div class="small">ملاحظات</div>
+          ${textarea("note", order.note||"")}
+        </div>
+
+        <div class="col" style="grid-column:1/-1">
+          <div class="section-title">القطع المستخدمة</div>
+          <div class="small">يتم خصمها من المخزون عند حفظ الفاتورة (أو عند التخصيص اختياريًا)</div>
+          <div class="hr"></div>
+
+          <div class="row-actions">
+            <select id="partSel" class="input" style="min-width:260px">
+              <option value="">— اختيار قطعة —</option>
+              ${Array.from(CACHE.inventory.values()).map(p=>`<option value="${p.id}">${escapeHtml(p.name)} (متوفر: ${p.qty||0})</option>`).join("")}
+            </select>
+            <input id="partQty" class="input" style="width:120px" type="number" min="1" value="1" />
+            <input id="partPrice" class="input" style="width:160px" type="number" min="0" value="0" placeholder="السعر" />
+            <button id="btnAddPart" class="btn btn-soft" type="button">إضافة</button>
+          </div>
+
+          <div id="partsList" style="margin-top:10px;"></div>
+        </div>
+
+        <div class="col" style="grid-column:1/-1">
+          <div class="section-title">الأجور</div>
+          <div class="hr"></div>
+          <div class="row-actions">
+            <input id="laborName" class="input" style="min-width:260px" placeholder="مثال: أجرة تصليح" />
+            <input id="laborPrice" class="input" style="width:160px" type="number" min="0" value="0" placeholder="المبلغ" />
+            <button id="btnAddLabor" class="btn btn-soft" type="button">إضافة</button>
+          </div>
+          <div id="laborList" style="margin-top:10px;"></div>
+        </div>
+
+        <div class="row-actions" style="grid-column:1/-1;">
+          <button class="btn btn-primary" type="submit">حفظ</button>
+          <button id="btnDeleteOrder" class="btn btn-danger" type="button">حذف</button>
+        </div>
+      </form>
+    `;
+
+    const ref = doc(db, "orders", order.id);
+
+    function renderParts(){
+      const total = parts.reduce((s,it)=> s+Number(it.qty||0)*Number(it.price||0),0);
+      $("#partsList").innerHTML = `
+        <table class="table">
+          <thead><tr><th>القطعة</th><th>الكمية</th><th>السعر</th><th>المجموع</th><th></th></tr></thead>
           <tbody>
-            ${items.map(it => `
-              <tr>
-                <td>${escapeHtml(it.name)}</td>
-                <td>${it.qty}</td>
-                <td>${it.unit}</td>
-                <td>${it.total}</td>
+            ${parts.map((it,idx)=>`
+              <tr class="tr">
+                <td>${escapeHtml(it.name||"")}</td>
+                <td>${escapeHtml(it.qty||0)}</td>
+                <td>${fmtMoney(it.price||0)}</td>
+                <td>${fmtMoney(Number(it.qty||0)*Number(it.price||0))}</td>
+                <td><button class="btn btn-soft" data-rmp="${idx}">حذف</button></td>
               </tr>
             `).join("")}
           </tbody>
         </table>
-
-        <div class="print-foot">
-          <div>
-            <div>المجموع: <b>${inv.total} IQD</b></div>
-            <div>مدفوع: <b>${inv.paid} IQD</b></div>
-            <div>متبقي: <b>${remaining} IQD</b></div>
-          </div>
-          <div style="text-align:left">
-            <div>توقيع الزبون: __________________</div>
-            <div style="margin-top:8px">ختم الكراج: __________________</div>
-          </div>
-        </div>
-      </div>
-    </div>
-  `;
-  openPrintWindow("فاتورة - نظام الوليم RPM", html);
-}
-
-/* ------------------------ Seed Demo ------------------------ */
-async function seedDemo() {
-  const now = Date.now();
-
-  // Employees
-  const emp1 = { id:"emp_demo_1", name:"حسن", phone:"07xxxxxxxxx", specialty:"ميكانيك", salaryType:"شهري", salaryAmount:900000, active:true, createdAt: now };
-  const emp2 = { id:"emp_demo_2", name:"طه", phone:"07yyyyyyyyy", specialty:"كهرباء سيارات", salaryType:"شهري", salaryAmount:850000, active:true, createdAt: now };
-  await dbAPI.put("employees", emp1);
-  await dbAPI.put("employees", emp2);
-
-  // Customer + Vehicles
-  const c1 = { id:"cust_demo_1", name:"زبون تجريبي", phone:"07zzzzzzzzz", address:"", notes:"", createdAt: now };
-  await dbAPI.put("customers", c1);
-
-  const v1 = { id:"veh_demo_1", customerId:c1.id, plate:"بغداد-12345", vin:"", make:"Toyota", model:"Corolla", year:2015, odometer:150500, nextOilOdo:155500, createdAt: now };
-  await dbAPI.put("vehicles", v1);
-
-  // Parts
-  const pOil = { id:"part_oil", name:"زيت محرك 4L", sku:"OIL-4L", buy:18000, sell:25000, stock:8, min:3, createdAt: now };
-  const pFilter = { id:"part_filter", name:"فلتر زيت", sku:"FILTER-OIL", buy:6000, sell:9000, stock:4, min:2, createdAt: now };
-  await dbAPI.put("parts", pOil);
-  await dbAPI.put("parts", pFilter);
-
-  // Work order
-  const wo = {
-    id:"wo_demo_1",
-    customerId:c1.id,
-    vehicleId:v1.id,
-    employeeId: emp1.id,
-    serviceType:"GENERAL",
-    complaint:"فحص اهتزاز + ميزان",
-    odometer:150500,
-    status:"OPEN",
-    createdAt: now - 3600e3,
-    updatedAt: now - 3600e3,
-    partLines: [],
-    laborLines: [{ title:"أجور فحص", amount:10000 }]
-  };
-  await dbAPI.put("workOrders", wo);
-
-  // Oil change work order + invoice
-  const woOil = {
-    id:"wo_demo_oil",
-    customerId:c1.id,
-    vehicleId:v1.id,
-    employeeId: emp2.id,
-    serviceType:"OIL",
-    complaint:"تبديل دهن + فلتر",
-    odometer:150500,
-    status:"DONE",
-    createdAt: now - 2*86400e3,
-    updatedAt: now - 2*86400e3,
-    partLines: [{ partId:"part_oil", qty:1, unit:25000 }, { partId:"part_filter", qty:1, unit:9000 }],
-    laborLines: [{ title:"أجور خدمة", amount:8000 }]
-  };
-  await dbAPI.put("workOrders", woOil);
-
-  const invOil = {
-    id:"inv_demo_oil",
-    workOrderId: woOil.id,
-    invoiceType:"OIL",
-    subtotal: 25000+9000+8000,
-    discount:0,
-    total: 42000,
-    paid: 42000,
-    createdAt: now - 2*86400e3,
-    oil: { currentOdo:150500, interval:5000, nextOdo:155500, oilType:"5W-30" },
-    items: [
-      { name:"زيت محرك 4L", qty:1, unit:25000, total:25000, kind:"part" },
-      { name:"فلتر زيت", qty:1, unit:9000, total:9000, kind:"part" },
-      { name:"أجور خدمة", qty:1, unit:8000, total:8000, kind:"labor" },
-    ]
-  };
-  await dbAPI.put("invoices", invOil);
-
-  alert("تمت إضافة بيانات تجريبية ✅");
-  renderRoute();
-}
-
-/* ------------------------ CRUD Prompts (خفيفة وبسيطة) ------------------------ */
-async function createCustomer() {
-  const name = prompt("اسم الزبون:");
-  if (!name) return;
-  const phone = prompt("الهاتف (اختياري):") || "";
-  const address = prompt("العنوان (اختياري):") || "";
-  const notes = prompt("ملاحظات (اختياري):") || "";
-  const obj = { id:"cust_"+uid().slice(3), name:name.trim(), phone:phone.trim(), address:address.trim(), notes:notes.trim(), createdAt:Date.now() };
-  await dbAPI.put("customers", obj);
-  alert("تم إضافة الزبون ✅");
-  renderRoute();
-}
-
-async function editCustomer(id) {
-  const c = await dbAPI.get("customers", id);
-  if (!c) return;
-  const name = prompt("اسم الزبون:", c.name || "") ?? c.name;
-  const phone = prompt("الهاتف:", c.phone || "") ?? c.phone;
-  const address = prompt("العنوان:", c.address || "") ?? c.address;
-  const notes = prompt("ملاحظات:", c.notes || "") ?? c.notes;
-  c.name = (name || c.name).trim();
-  c.phone = (phone || "").trim();
-  c.address = (address || "").trim();
-  c.notes = (notes || "").trim();
-  await dbAPI.put("customers", c);
-  alert("تم التعديل ✅");
-  renderRoute();
-}
-
-async function deleteCustomer(id) {
-  const c = await dbAPI.get("customers", id);
-  if (!c) return;
-  if (!confirm("هسه إذا حذفنا الزبون راح نحذف سياراته + أوامره + فواتيره. موافقة؟")) return;
-
-  const vehicles = await dbAPI.getAll("vehicles");
-  const workOrders = await dbAPI.getAll("workOrders");
-  const invoices = await dbAPI.getAll("invoices");
-
-  const vIds = vehicles.filter(v => v.customerId === id).map(v => v.id);
-  const woIds = workOrders.filter(w => w.customerId === id).map(w => w.id);
-  const invIds = invoices.filter(i => woIds.includes(i.workOrderId)).map(i => i.id);
-
-  for (const invId of invIds) await dbAPI.del("invoices", invId);
-  for (const woId of woIds) await dbAPI.del("workOrders", woId);
-  for (const vid of vIds) await dbAPI.del("vehicles", vid);
-  await dbAPI.del("customers", id);
-
-  alert("تم الحذف ✅");
-  renderRoute();
-}
-
-async function createVehicle(prefCustomerId = "") {
-  const customers = await dbAPI.getAll("customers");
-  if (!customers.length) return alert("سوي زبون أولاً.");
-
-  let customerId = prefCustomerId;
-  if (!customerId) {
-    const list = customers.map((c,i)=> `${i+1}) ${c.name} ${c.phone? "• "+c.phone:""}`).join("\n");
-    const pick = prompt("اختاري رقم الزبون:\n" + list);
-    const idx = Number(pick) - 1;
-    if (!(idx>=0 && idx<customers.length)) return;
-    customerId = customers[idx].id;
-  }
-
-  const plate = prompt("رقم اللوحة:") || "";
-  const make = prompt("الشركة (Toyota):") || "";
-  const model = prompt("الموديل:") || "";
-  const year = Number(prompt("السنة (اختياري):","") || 0) || undefined;
-  const vin = prompt("VIN (اختياري):") || "";
-  const odometer = Number(prompt("عداد حالي (اختياري):","") || 0) || undefined;
-
-  const v = { id:"veh_"+uid().slice(3), customerId, plate:plate.trim(), make:make.trim(), model:model.trim(), year, vin:vin.trim(), odometer, nextOilOdo: undefined, createdAt: Date.now() };
-  await dbAPI.put("vehicles", v);
-  alert("تم إضافة السيارة ✅");
-  renderRoute();
-}
-
-async function editVehicle(id) {
-  const v = await dbAPI.get("vehicles", id);
-  if (!v) return;
-  const plate = prompt("رقم اللوحة:", v.plate || "") ?? v.plate;
-  const make = prompt("الشركة:", v.make || "") ?? v.make;
-  const model = prompt("الموديل:", v.model || "") ?? v.model;
-  const year = prompt("السنة:", String(v.year || "")) ?? String(v.year || "");
-  const vin = prompt("VIN:", v.vin || "") ?? v.vin;
-  const od = prompt("العداد الحالي:", String(v.odometer ?? "")) ?? String(v.odometer ?? "");
-  const nextOil = prompt("العداد الجاي للدهن (اختياري):", String(v.nextOilOdo ?? "")) ?? String(v.nextOilOdo ?? "");
-
-  v.plate = (plate || "").trim();
-  v.make = (make || "").trim();
-  v.model = (model || "").trim();
-  v.year = year ? (Number(year)||undefined) : undefined;
-  v.vin = (vin || "").trim();
-  v.odometer = od ? (Number(od)||undefined) : undefined;
-  v.nextOilOdo = nextOil ? (Number(nextOil)||undefined) : undefined;
-
-  await dbAPI.put("vehicles", v);
-  alert("تم التعديل ✅");
-  renderRoute();
-}
-
-async function deleteVehicle(id) {
-  const v = await dbAPI.get("vehicles", id);
-  if (!v) return;
-  if (!confirm("حذف السيارة؟ راح ينحذف وياها أوامرها وفواتيرها.")) return;
-
-  const workOrders = await dbAPI.getAll("workOrders");
-  const invoices = await dbAPI.getAll("invoices");
-
-  const woIds = workOrders.filter(w => w.vehicleId === id).map(w => w.id);
-  const invIds = invoices.filter(i => woIds.includes(i.workOrderId)).map(i => i.id);
-
-  for (const invId of invIds) await dbAPI.del("invoices", invId);
-  for (const woId of woIds) await dbAPI.del("workOrders", woId);
-  await dbAPI.del("vehicles", id);
-
-  alert("تم الحذف ✅");
-  renderRoute();
-}
-
-/* ------------------------ Employees ------------------------ */
-async function createEmployee() {
-  const name = prompt("اسم الموظف:");
-  if (!name) return;
-  const phone = prompt("الهاتف (اختياري):") || "";
-  const specialty = prompt("الاختصاص (ميكانيك/كهرباء/سمكرة...):") || "";
-  const salaryType = prompt("نوع الراتب (شهري/يومي/بالنسبة):","شهري") || "شهري";
-  const salaryAmount = Number(prompt("قيمة الراتب (رقم):","0") || "0");
-
-  const e = { id:"emp_"+uid().slice(3), name:name.trim(), phone:phone.trim(), specialty:specialty.trim(), salaryType:salaryType.trim(), salaryAmount, active:true, createdAt:Date.now() };
-  await dbAPI.put("employees", e);
-  alert("تم إضافة الموظف ✅");
-  renderRoute();
-}
-
-async function editEmployee(id) {
-  const e = await dbAPI.get("employees", id);
-  if (!e) return;
-  const name = prompt("الاسم:", e.name || "") ?? e.name;
-  const phone = prompt("الهاتف:", e.phone || "") ?? e.phone;
-  const specialty = prompt("الاختصاص:", e.specialty || "") ?? e.specialty;
-  const salaryType = prompt("نوع الراتب:", e.salaryType || "شهري") ?? e.salaryType;
-  const salaryAmount = Number(prompt("قيمة الراتب:", String(e.salaryAmount||0)) || String(e.salaryAmount||0));
-
-  e.name = (name || e.name).trim();
-  e.phone = (phone || "").trim();
-  e.specialty = (specialty || "").trim();
-  e.salaryType = (salaryType || e.salaryType || "شهري").trim();
-  e.salaryAmount = salaryAmount;
-  await dbAPI.put("employees", e);
-
-  alert("تم التعديل ✅");
-  renderRoute();
-}
-
-async function toggleEmployee(id) {
-  const e = await dbAPI.get("employees", id);
-  if (!e) return;
-  e.active = !e.active;
-  await dbAPI.put("employees", e);
-  renderRoute();
-}
-
-async function deleteEmployee(id) {
-  if (!confirm("حذف الموظف؟")) return;
-  await dbAPI.del("employees", id);
-  renderRoute();
-}
-
-/* ------------------------ Inventory ------------------------ */
-async function createPart() {
-  const name = prompt("اسم القطعة:");
-  if (!name) return;
-  const sku = prompt("SKU/رقم (اختياري):") || "";
-  const buy = Number(prompt("سعر الشراء:","0") || "0");
-  const sell = Number(prompt("سعر البيع:","0") || "0");
-  const stock = Number(prompt("الرصيد الحالي:","0") || "0");
-  const min = Number(prompt("الحد الأدنى:","0") || "0");
-  const p = { id:"part_"+uid().slice(3), name:name.trim(), sku:sku.trim(), buy, sell, stock, min, createdAt:Date.now() };
-  await dbAPI.put("parts", p);
-  alert("تمت إضافة القطعة ✅");
-  renderRoute();
-}
-
-async function adjustStock(partId, delta) {
-  const p = await dbAPI.get("parts", partId);
-  if (!p) return;
-  const amount = Number(prompt(delta>0 ? "شكد إضافة؟" : "شكد صرف؟","1") || "0");
-  if (!amount || amount<=0) return;
-  const next = Number(p.stock||0) + (delta>0 ? amount : -amount);
-  if (next < 0) return alert("ما يصير الرصيد يصير سالب.");
-  p.stock = next;
-  await dbAPI.put("parts", p);
-  renderRoute();
-}
-
-async function deletePart(partId) {
-  if (!confirm("حذف القطعة؟")) return;
-  await dbAPI.del("parts", partId);
-  renderRoute();
-}
-
-/* ------------------------ Work Orders ------------------------ */
-async function createWorkOrderFromCheckin() {
-  const customerId = $("#ciCustomer").value;
-  const vehicleId = $("#ciVehicle").value;
-  const employeeId = $("#ciEmployee").value || undefined;
-  const complaint = $("#ciComplaint").value.trim();
-  const odometer = $("#ciOdometer").value.trim();
-  const status = $("#ciStatus").value;
-
-  if (!customerId) return alert("اختاري الزبون.");
-  if (!vehicleId) return alert("اختاري السيارة.");
-  if (!complaint) return alert("اكتبي وصف الشغل.");
-
-  const now = Date.now();
-  const wo = {
-    id: "wo_" + uid().slice(3),
-    customerId,
-    vehicleId,
-    employeeId,
-    serviceType: "GENERAL",
-    complaint,
-    odometer: odometer ? Number(odometer) : undefined,
-    status,
-    createdAt: now,
-    updatedAt: now,
-    partLines: [],
-    laborLines: [],
-  };
-
-  await dbAPI.put("workOrders", wo);
-
-  // تحديث عداد السيارة إذا انكتب
-  if (wo.odometer != null) {
-    const v = await dbAPI.get("vehicles", vehicleId);
-    if (v) { v.odometer = wo.odometer; await dbAPI.put("vehicles", v); }
-  }
-
-  alert("تم فتح أمر شغل ✅");
-  location.hash = `#/order?id=${encodeURIComponent(wo.id)}`;
-}
-
-async function deleteWorkOrder(id) {
-  if (!confirm("حذف أمر الشغل؟")) return;
-  // ملاحظة: الفواتير تبقى؟ هنا نخليها تبقى مرتبطة بس راح تصير orphan.
-  // الأفضل نحذف الفواتير المرتبطة:
-  const invoices = await dbAPI.getAll("invoices");
-  for (const inv of invoices.filter(i => i.workOrderId === id)) await dbAPI.del("invoices", inv.id);
-
-  await dbAPI.del("workOrders", id);
-  alert("تم الحذف ✅");
-  location.hash = "#/orders";
-}
-
-async function setOrderStatus(id, status) {
-  const wo = await dbAPI.get("workOrders", id);
-  if (!wo) return;
-  wo.status = status;
-  wo.updatedAt = Date.now();
-  await dbAPI.put("workOrders", wo);
-  renderRoute();
-}
-
-async function setOrderEmployee(id, employeeId) {
-  const wo = await dbAPI.get("workOrders", id);
-  if (!wo) return;
-  wo.employeeId = employeeId || undefined;
-  wo.updatedAt = Date.now();
-  await dbAPI.put("workOrders", wo);
-  renderRoute();
-}
-
-async function addLaborLine(woId) {
-  const wo = await dbAPI.get("workOrders", woId);
-  if (!wo) return;
-  const title = prompt("وصف الأجور:", "أجور خدمة") || "";
-  if (!title.trim()) return;
-  const amount = Number(prompt("القيمة (رقم):","0") || "0");
-  if (!amount || amount <= 0) return;
-  wo.laborLines = Array.isArray(wo.laborLines) ? wo.laborLines : [];
-  wo.laborLines.push({ title:title.trim(), amount });
-  wo.updatedAt = Date.now();
-  await dbAPI.put("workOrders", wo);
-  renderRoute();
-}
-
-async function removeLaborLine(woId, idx) {
-  const wo = await dbAPI.get("workOrders", woId);
-  if (!wo) return;
-  wo.laborLines = Array.isArray(wo.laborLines) ? wo.laborLines : [];
-  if (!(idx>=0 && idx<wo.laborLines.length)) return;
-  wo.laborLines.splice(idx,1);
-  wo.updatedAt = Date.now();
-  await dbAPI.put("workOrders", wo);
-  renderRoute();
-}
-
-async function addPartLine(woId, partId, qty) {
-  const wo = await dbAPI.get("workOrders", woId);
-  const part = await dbAPI.get("parts", partId);
-  if (!wo || !part) return;
-
-  qty = Number(qty || 0);
-  if (!qty || qty <= 0) return alert("أدخل كمية صحيحة.");
-
-  const stock = Number(part.stock || 0);
-  if (stock < qty) return alert(`الرصيد ما يكفي. الرصيد الحالي: ${stock}`);
-
-  // خصم مخزون
-  part.stock = stock - qty;
-  await dbAPI.put("parts", part);
-
-  wo.partLines = Array.isArray(wo.partLines) ? wo.partLines : [];
-  wo.partLines.push({ partId: part.id, qty, unit: Number(part.sell || 0) });
-  wo.updatedAt = Date.now();
-  await dbAPI.put("workOrders", wo);
-
-  renderRoute();
-}
-
-async function removePartLine(woId, idx) {
-  const wo = await dbAPI.get("workOrders", woId);
-  if (!wo) return;
-  wo.partLines = Array.isArray(wo.partLines) ? wo.partLines : [];
-  if (!(idx>=0 && idx<wo.partLines.length)) return;
-
-  const line = wo.partLines[idx];
-  // رجّع للمخزون
-  const part = await dbAPI.get("parts", line.partId);
-  if (part) {
-    part.stock = Number(part.stock||0) + Number(line.qty||0);
-    await dbAPI.put("parts", part);
-  }
-
-  wo.partLines.splice(idx,1);
-  wo.updatedAt = Date.now();
-  await dbAPI.put("workOrders", wo);
-
-  renderRoute();
-}
-
-/* ------------------------ Invoice Creation ------------------------ */
-function buildInvoiceFromWO(wo, partsMap) {
-  const partLines = Array.isArray(wo.partLines) ? wo.partLines : [];
-  const laborLines = Array.isArray(wo.laborLines) ? wo.laborLines : [];
-
-  const items = [];
-
-  for (const ln of partLines) {
-    const p = partsMap.get(ln.partId);
-    const name = p?.name || ln.partId;
-    const qty = Number(ln.qty||0);
-    const unit = Number(ln.unit||0);
-    items.push({ name, qty, unit, total: qty*unit, kind:"part" });
-  }
-
-  for (const ll of laborLines) {
-    const amt = Number(ll.amount||0);
-    if (amt>0) items.push({ name: ll.title || "أجور", qty: 1, unit: amt, total: amt, kind:"labor" });
-  }
-
-  const subtotal = sum(items, it => Number(it.total||0));
-  return { items, subtotal };
-}
-
-async function createInvoiceForWO(woId) {
-  const wo = await dbAPI.get("workOrders", woId);
-  if (!wo) return alert("ما لقيت أمر الشغل.");
-
-  const parts = await dbAPI.getAll("parts");
-  const partsMap = new Map(parts.map(p => [p.id, p]));
-
-  const { items, subtotal } = buildInvoiceFromWO(wo, partsMap);
-
-  const discount = Number(prompt("خصم (اختياري):","0") || "0");
-  const total = Math.max(0, subtotal - discount);
-  const paid = Number(prompt("مدفوع الآن:","0") || "0");
-
-  const inv = {
-    id: "inv_" + uid().slice(3),
-    workOrderId: wo.id,
-    invoiceType: "GENERAL",
-    subtotal,
-    discount,
-    total,
-    paid: Math.min(paid, total),
-    createdAt: Date.now(),
-    items,
-  };
-  await dbAPI.put("invoices", inv);
-
-  alert("تم إنشاء الفاتورة ✅");
-  location.hash = "#/invoices";
-}
-
-async function payInvoice(invId) {
-  const inv = await dbAPI.get("invoices", invId);
-  if (!inv) return;
-  const rem = Math.max(0, Number(inv.total||0) - Number(inv.paid||0));
-  const add = Number(prompt(`المتبقي: ${rem}\nشكد دفعة إضافية؟`,"0") || "0");
-  if (!add || add<=0) return;
-  inv.paid = Math.min(Number(inv.total||0), Number(inv.paid||0) + add);
-  await dbAPI.put("invoices", inv);
-  renderRoute();
-}
-
-async function deleteInvoice(invId) {
-  if (!confirm("حذف الفاتورة؟")) return;
-  await dbAPI.del("invoices", invId);
-  renderRoute();
-}
-
-async function printInvoiceById(invId) {
-  const inv = await dbAPI.get("invoices", invId);
-  if (!inv) return;
-
-  const wo = await dbAPI.get("workOrders", inv.workOrderId);
-  const customer = wo ? await dbAPI.get("customers", wo.customerId) : null;
-  const vehicle = wo ? await dbAPI.get("vehicles", wo.vehicleId) : null;
-  const employee = wo?.employeeId ? await dbAPI.get("employees", wo.employeeId) : null;
-
-  printInvoice(inv, { wo, customer, vehicle, employee });
-}
-
-/* ------------------------ Oil Change Flow ------------------------ */
-async function createOilChangeInvoice() {
-  const customerId = $("#oilCustomer").value;
-  const vehicleId = $("#oilVehicle").value;
-  const employeeId = $("#oilEmployee").value || undefined;
-
-  const currentOdo = Number($("#oilCurrentOdo").value || 0);
-  const interval = Number($("#oilInterval").value || 5000);
-  const nextOdo = Number($("#oilNextOdo").value || 0);
-  const oilType = ($("#oilType").value || "").trim();
-
-  const oilPrice = Number($("#oilPrice").value || 0);
-  const filterPrice = Number($("#oilFilterPrice").value || 0);
-  const laborPrice = Number($("#oilLabor").value || 0);
-
-  if (!customerId) return alert("اختاري الزبون.");
-  if (!vehicleId) return alert("اختاري السيارة.");
-  if (!currentOdo || currentOdo <= 0) return alert("أدخلي العداد الحالي.");
-
-  const now = Date.now();
-
-  // Work Order (DONE)
-  const wo = {
-    id: "wo_" + uid().slice(3),
-    customerId,
-    vehicleId,
-    employeeId,
-    serviceType: "OIL",
-    complaint: "تبديل دهن + فلتر",
-    odometer: currentOdo,
-    status: "DONE",
-    createdAt: now,
-    updatedAt: now,
-    partLines: [],
-    laborLines: [],
-  };
-
-  // Items (direct, not linked to stock here — ممكن نربطها لاحقاً بالمخزون لو تريدين)
-  const items = [];
-  if (oilPrice > 0) items.push({ name: `دهن ${oilType || ""}`.trim() || "دهن", qty: 1, unit: oilPrice, total: oilPrice, kind:"oil" });
-  if (filterPrice > 0) items.push({ name: "فلتر دهن", qty: 1, unit: filterPrice, total: filterPrice, kind:"part" });
-  if (laborPrice > 0) items.push({ name: "أجور خدمة", qty: 1, unit: laborPrice, total: laborPrice, kind:"labor" });
-
-  const subtotal = sum(items, it => it.total);
-  const discount = Number($("#oilDiscount").value || 0);
-  const total = Math.max(0, subtotal - discount);
-  const paid = Math.min(Number($("#oilPaid").value || 0), total);
-
-  const inv = {
-    id: "inv_" + uid().slice(3),
-    workOrderId: wo.id,
-    invoiceType: "OIL",
-    subtotal,
-    discount,
-    total,
-    paid,
-    createdAt: now,
-    oil: { currentOdo, interval, nextOdo: nextOdo || (currentOdo + interval), oilType: oilType || "" },
-    items
-  };
-
-  await dbAPI.put("workOrders", wo);
-  await dbAPI.put("invoices", inv);
-
-  // Update vehicle odometer + nextOil
-  const v = await dbAPI.get("vehicles", vehicleId);
-  if (v) {
-    v.odometer = currentOdo;
-    v.nextOilOdo = inv.oil.nextOdo;
-    await dbAPI.put("vehicles", v);
-  }
-
-  alert("تم تسجيل تبديل الدهن + إنشاء فاتورة ✅");
-  location.hash = `#/invoices`;
-}
-
-/* ------------------------ Backup ------------------------ */
-async function exportAll() {
-  const data = {};
-  for (const s of Object.keys(stores)) data[s] = await dbAPI.getAll(s);
-  data._meta = { exportedAt: Date.now(), app: "نظام الوليم RPM", dbVer: DB_VER };
-  downloadText(`alwaleem_rpm_backup_${new Date().toISOString().slice(0,10)}.json`, JSON.stringify(data, null, 2));
-}
-
-async function importAll() {
-  const file = $("#importFile").files?.[0];
-  if (!file) return alert("اختاري ملف JSON أولاً.");
-  const txt = await readFileAsText(file);
-  let data;
-  try { data = JSON.parse(txt); } catch { return alert("ملف غير صالح."); }
-
-  if (!confirm("راح يتم استبدال كل البيانات الحالية. متابعة؟")) return;
-
-  for (const s of Object.keys(stores)) await dbAPI.clear(s);
-  for (const s of Object.keys(stores)) {
-    const arr = Array.isArray(data[s]) ? data[s] : [];
-    for (const obj of arr) await dbAPI.put(s, obj);
-  }
-  alert("تم الاستيراد ✅");
-  renderRoute();
-}
-
-async function resetAll() {
-  if (!confirm("تأكيد حذف كل البيانات؟")) return;
-  for (const s of Object.keys(stores)) await dbAPI.clear(s);
-  alert("تم الحذف ✅");
-  renderRoute();
-}
-
-/* ------------------------ Views ------------------------ */
-async function viewDashboard() {
-  const workOrders = await dbAPI.getAll("workOrders");
-  const invoices = await dbAPI.getAll("invoices");
-  const parts = await dbAPI.getAll("parts");
-  const vehicles = await dbAPI.getAll("vehicles");
-  const customers = await dbAPI.getAll("customers");
-
-  const today = new Date();
-  const start = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
-  const end = start + 86400e3;
-
-  const todayOrders = workOrders.filter(w => w.createdAt >= start && w.createdAt < end);
-  const openOrders = workOrders.filter(w => ["OPEN","IN_PROGRESS","WAITING_PARTS","WAITING_APPROVAL"].includes(w.status));
-  const waitingParts = workOrders.filter(w => w.status === "WAITING_PARTS");
-  const todayIncome = invoices.filter(i => i.createdAt >= start && i.createdAt < end).reduce((a,b)=> a + Number(b.paid||0), 0);
-
-  const lowStock = parts.filter(p => Number(p.stock || 0) <= Number(p.min || 0));
-
-  const latest = workOrders.sort((a,b)=>b.createdAt-a.createdAt).slice(0, 7);
-
-  // Oil reminders: if vehicle has nextOilOdo and odometer close
-  const reminders = vehicles
-    .filter(v => (v.nextOilOdo != null) && (v.odometer != null))
-    .map(v => ({ ...v, diff: Number(v.nextOilOdo) - Number(v.odometer) }))
-    .filter(v => v.diff <= 300 && v.diff >= -200) // قريب أو متأخر شوي
-    .sort((a,b)=>a.diff-b.diff)
-    .slice(0, 6);
-
-  const cMap = new Map(customers.map(c=>[c.id,c]));
-
-  return `
-    <div class="cards">
-      <div class="card"><div class="card-title">سيارات اليوم</div><div class="card-value">${todayOrders.length}</div></div>
-      <div class="card"><div class="card-title">أوامر مفتوحة</div><div class="card-value">${openOrders.length}</div></div>
-      <div class="card"><div class="card-title">انتظار قطع</div><div class="card-value">${waitingParts.length}</div></div>
-      <div class="card"><div class="card-title">دخل اليوم (مدفوع)</div><div class="card-value">${money(todayIncome)}</div></div>
-    </div>
-
-    <div class="row" style="margin-top:12px">
-      <div class="col">
-        <div class="card">
-          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
-            <div>
-              <div class="section-title">آخر أوامر الشغل</div>
-              <div class="small">تفاصيل / طباعة / فاتورة</div>
-            </div>
-            <a class="btn btn-soft" href="#/orders">عرض الكل</a>
-          </div>
-          <div class="hr"></div>
-
-          ${latest.length ? latest.map(w => `
-            <div class="card subcard" style="margin-bottom:10px">
-              <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
-                <div>
-                  <div style="font-weight:900">${escapeHtml(w.complaint).slice(0,80)}</div>
-                  <div class="small">${escapeHtml(w.id)} • ${fmtDate(w.createdAt)}</div>
-                </div>
-                <div>${pill(w.status)}</div>
-              </div>
-              <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-                <a class="btn" href="#/order?id=${encodeURIComponent(w.id)}">تفاصيل</a>
-                <button class="btn" data-act="makeInvoice" data-id="${w.id}">فاتورة</button>
-              </div>
-            </div>
-          `).join("") : `<div class="notice">بعد ماكو أوامر. روحي على الاستقبال وسوي أمر جديد.</div>`}
-        </div>
-      </div>
-
-      <div class="col">
-        <div class="card">
-          <div class="section-title">تنبيهات دهن</div>
-          <div class="small">سيارات قرب موعد الدهن الجاي</div>
-          <div class="hr"></div>
-          ${reminders.length ? reminders.map(v => {
-            const c = cMap.get(v.customerId);
-            return `
-              <div class="card subcard" style="margin-bottom:10px">
-                <div style="display:flex;justify-content:space-between;gap:10px">
-                  <div>
-                    <div style="font-weight:900">${escapeHtml(c?.name || "—")} • ${escapeHtml(v.plate || "—")}</div>
-                    <div class="small">${escapeHtml([v.make,v.model,v.year].filter(Boolean).join(" "))}</div>
-                    <div class="small">حالي: <b>${v.odometer}</b> • جاي: <b>${v.nextOilOdo}</b></div>
-                  </div>
-                  <div class="pill ${v.diff<0 ? "parts" : "progress"}">${v.diff<0 ? "متأخر" : `باقي ${v.diff} كم`}</div>
-                </div>
-                <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
-                  <a class="btn" href="#/customer?id=${encodeURIComponent(v.customerId)}">سجل الزبون</a>
-                  <a class="btn btn-primary" href="#/oil?customerId=${encodeURIComponent(v.customerId)}&vehicleId=${encodeURIComponent(v.id)}">تبديل دهن</a>
-                </div>
-              </div>
-            `;
-          }).join("") : `<div class="notice">ماكو تنبيهات دهن حالياً ✅</div>`}
-
-          <div class="hr"></div>
-
-          <div class="section-title">مخزون حرج</div>
-          ${lowStock.length ? lowStock.slice(0,6).map(p => `
-            <div class="kv">
-              <span>${escapeHtml(p.name)} <span class="small">(${escapeHtml(p.sku || "—")})</span></span>
-              <b>${p.stock ?? 0} / min ${p.min ?? 0}</b>
-            </div>
-          `).join("<div style='height:8px'></div>") : `<div class="small">ماكو قطع تحت الحد الأدنى ✅</div>`}
-          <div class="hr"></div>
-          <a class="btn" href="#/inventory">إدارة المخزون</a>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-async function viewCheckin() {
-  const customers = await dbAPI.getAll("customers");
-  const vehicles = await dbAPI.getAll("vehicles");
-  const employees = (await dbAPI.getAll("employees")).filter(e => e.active);
-
-  const custOptions = customers
-    .sort((a,b)=> (a.name||"").localeCompare(b.name||"", "ar"))
-    .map(c => `<option value="${c.id}">${escapeHtml(c.name)} ${c.phone? "• "+escapeHtml(c.phone):""}</option>`)
-    .join("");
-
-  const vehOptions = vehicles
-    .sort((a,b)=> (a.plate||"").localeCompare(b.plate||"", "ar"))
-    .map(v => `<option value="${v.id}">${escapeHtml(v.plate || "—")} • ${escapeHtml([v.make,v.model,v.year].filter(Boolean).join(" "))}</option>`)
-    .join("");
-
-  const empOptions = employees
-    .sort((a,b)=> (a.name||"").localeCompare(b.name||"", "ar"))
-    .map(e => `<option value="${e.id}">${escapeHtml(e.name)} • ${escapeHtml(e.specialty || "—")}</option>`)
-    .join("");
-
-  return `
-    <div class="card">
-      <div class="section-title">الاستقبال</div>
-      <div class="small">اختاري زبون + سيارة + فني (اختياري) وبعدين افتحي أمر شغل.</div>
-      <div class="hr"></div>
-
-      <div class="grid2">
-        <div>
-          <label class="small">الزبون</label>
-          <select id="ciCustomer" class="input">
-            <option value="">— اختيار —</option>
-            ${custOptions}
-          </select>
-          <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn" data-act="newCustomer">+ زبون</button>
-            <a class="btn" href="#/customers">قائمة الزباين</a>
-          </div>
-        </div>
-
-        <div>
-          <label class="small">السيارة</label>
-          <select id="ciVehicle" class="input">
-            <option value="">— اختيار —</option>
-            ${vehOptions}
-          </select>
-          <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn" data-act="newVehicle">+ سيارة</button>
-            <a class="btn" href="#/vehicles">قائمة السيارات</a>
-          </div>
-        </div>
-      </div>
-
-      <div class="grid2" style="margin-top:12px">
-        <div>
-          <label class="small">الفني (اختياري)</label>
-          <select id="ciEmployee" class="input">
-            <option value="">— بدون —</option>
-            ${empOptions}
-          </select>
-        </div>
-
-        <div>
-          <label class="small">الحالة</label>
-          <select id="ciStatus" class="input">
-            <option value="OPEN">مفتوح</option>
-            <option value="WAITING_APPROVAL">بانتظار موافقة</option>
-            <option value="IN_PROGRESS">قيد الشغل</option>
-            <option value="WAITING_PARTS">انتظار قطع</option>
-            <option value="DONE">مكتمل</option>
-            <option value="DELIVERED">مستلم</option>
-          </select>
-        </div>
-      </div>
-
-      <div style="margin-top:12px">
-        <label class="small">وصف الشغل</label>
-        <textarea id="ciComplaint" class="input" placeholder="مثال: صوت بالمحرك... فحص كهرباء..."></textarea>
-      </div>
-
-      <div class="grid2" style="margin-top:12px">
-        <div>
-          <label class="small">العداد الحالي (اختياري)</label>
-          <input id="ciOdometer" class="input" inputmode="numeric" placeholder="150000" />
-        </div>
-        <div class="notice">
-          إذا الشغل تبديل دهن، روحي على صفحة <b>تبديل دهن</b> لأن بيها عداد حالي + عداد جاي وفاتورة جاهزة.
-        </div>
-      </div>
-
-      <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn btn-primary" data-act="createWO">فتح أمر شغل</button>
-      </div>
-    </div>
-  `;
-}
-
-async function viewOrders() {
-  const workOrders = await dbAPI.getAll("workOrders");
-  const customers = await dbAPI.getAll("customers");
-  const vehicles = await dbAPI.getAll("vehicles");
-  const employees = await dbAPI.getAll("employees");
-
-  const cMap = new Map(customers.map(c => [c.id,c]));
-  const vMap = new Map(vehicles.map(v => [v.id,v]));
-  const eMap = new Map(employees.map(e => [e.id,e]));
-
-  const q = (state.search || "").trim().toLowerCase();
-
-  const filtered = workOrders
-    .sort((a,b)=>b.createdAt-a.createdAt)
-    .filter(w => {
-      if (!q) return true;
-      const c = cMap.get(w.customerId);
-      const v = vMap.get(w.vehicleId);
-      const e = w.employeeId ? eMap.get(w.employeeId) : null;
-      return (
-        (w.id||"").toLowerCase().includes(q) ||
-        (w.complaint||"").toLowerCase().includes(q) ||
-        (c?.name||"").toLowerCase().includes(q) ||
-        (c?.phone||"").toLowerCase().includes(q) ||
-        (v?.plate||"").toLowerCase().includes(q) ||
-        (e?.name||"").toLowerCase().includes(q)
-      );
-    });
-
-  return `
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
-        <div>
-          <div class="section-title">أوامر الشغل</div>
-          <div class="small">اضغطي تفاصيل حتى تسوين صرف قطع + أجور + فاتورة</div>
-        </div>
-        <a class="btn btn-primary" href="#/checkin">+ استقبال</a>
-      </div>
-
-      <div class="hr"></div>
-
-      ${filtered.length ? `
-      <table class="table">
-        <thead>
-          <tr>
-            <th>الرقم</th>
-            <th>الزبون</th>
-            <th>السيارة</th>
-            <th>الفني</th>
-            <th>الحالة</th>
-            <th>تاريخ</th>
-            <th>إجراءات</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${filtered.map(w => {
-            const c = cMap.get(w.customerId);
-            const v = vMap.get(w.vehicleId);
-            const e = w.employeeId ? eMap.get(w.employeeId) : null;
-            return `
+        <div class="kv"><span>مجموع القطع</span><b>${fmtMoney(total)}</b></div>
+      `;
+      $$("[data-rmp]").forEach(b=> b.addEventListener("click", ()=>{
+        const i = Number(b.dataset.rmp);
+        parts.splice(i,1);
+        renderParts();
+      }));
+    }
+
+    function renderLabor(){
+      const total = labor.reduce((s,it)=> s+Number(it.price||0),0);
+      $("#laborList").innerHTML = `
+        <table class="table">
+          <thead><tr><th>الوصف</th><th>المبلغ</th><th></th></tr></thead>
+          <tbody>
+            ${labor.map((it,idx)=>`
               <tr class="tr">
-                <td><b>${escapeHtml(w.id)}</b><div class="small">${escapeHtml(w.serviceType || "GENERAL")}</div></td>
-                <td>${escapeHtml(c?.name || "—")}<div class="small">${escapeHtml(c?.phone || "")}</div></td>
-                <td>${escapeHtml(v?.plate || "—")}<div class="small">${escapeHtml([v?.make,v?.model,v?.year].filter(Boolean).join(" "))}</div></td>
-                <td>${escapeHtml(e?.name || "—")}<div class="small">${escapeHtml(e?.specialty || "")}</div></td>
-                <td>${pill(w.status)}</td>
-                <td class="small">${fmtDate(w.createdAt)}</td>
-                <td>
-                  <div style="display:flex;gap:8px;flex-wrap:wrap">
-                    <a class="btn" href="#/order?id=${encodeURIComponent(w.id)}">تفاصيل</a>
-                    <button class="btn" data-act="makeInvoice" data-id="${w.id}">فاتورة</button>
-                    <button class="btn btn-danger" data-act="deleteWO" data-id="${w.id}">حذف</button>
-                  </div>
-                </td>
+                <td>${escapeHtml(it.name||"")}</td>
+                <td>${fmtMoney(it.price||0)}</td>
+                <td><button class="btn btn-soft" data-rml="${idx}">حذف</button></td>
               </tr>
-            `;
-          }).join("")}
-        </tbody>
-      </table>
-      ` : `<div class="notice">ماكو أوامر مطابقة. سوي استقبال وأنشئي أمر جديد.</div>`}
-    </div>
-  `;
-}
+            `).join("")}
+          </tbody>
+        </table>
+        <div class="kv"><span>مجموع الأجور</span><b>${fmtMoney(total)}</b></div>
+      `;
+      $$("[data-rml]").forEach(b=> b.addEventListener("click", ()=>{
+        const i = Number(b.dataset.rml);
+        labor.splice(i,1);
+        renderLabor();
+      }));
+    }
 
-async function viewOrderDetails(orderId) {
-  const wo = await dbAPI.get("workOrders", orderId);
-  if (!wo) return `<div class="card"><div class="notice">ما لقيت أمر الشغل.</div></div>`;
+    renderParts(); renderLabor();
 
-  const customer = await dbAPI.get("customers", wo.customerId);
-  const vehicle = await dbAPI.get("vehicles", wo.vehicleId);
-  const employees = (await dbAPI.getAll("employees")).filter(e => e.active);
-  const parts = await dbAPI.getAll("parts");
-
-  const empOptions = [
-    `<option value="">— بدون —</option>`,
-    ...employees.sort((a,b)=>(a.name||"").localeCompare(b.name||"", "ar"))
-      .map(e => `<option value="${e.id}" ${wo.employeeId===e.id ? "selected":""}>${escapeHtml(e.name)} • ${escapeHtml(e.specialty||"")}</option>`)
-  ].join("");
-
-  const partOptions = [
-    `<option value="">— اختيار قطعة —</option>`,
-    ...parts.sort((a,b)=>(a.name||"").localeCompare(b.name||"", "ar"))
-      .map(p => `<option value="${p.id}">${escapeHtml(p.name)} • رصيد ${p.stock ?? 0} • بيع ${money(p.sell||0)}</option>`)
-  ].join("");
-
-  const partLines = Array.isArray(wo.partLines) ? wo.partLines : [];
-  const laborLines = Array.isArray(wo.laborLines) ? wo.laborLines : [];
-
-  const pMap = new Map(parts.map(p=>[p.id,p]));
-
-  const partsTotal = sum(partLines, ln => Number(ln.qty||0)*Number(ln.unit||0));
-  const laborTotal = sum(laborLines, ln => Number(ln.amount||0));
-  const total = partsTotal + laborTotal;
-
-  return `
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
-        <div>
-          <div class="section-title">تفاصيل أمر شغل</div>
-          <div class="small">${escapeHtml(wo.id)} • ${fmtDate(wo.createdAt)}</div>
-          <div class="small">الزبون: <b>${escapeHtml(customer?.name || "—")}</b> • ${escapeHtml(customer?.phone || "")}</div>
-          <div class="small">السيارة: <b>${escapeHtml(vehicle?.plate || "—")}</b> • ${escapeHtml([vehicle?.make,vehicle?.model,vehicle?.year].filter(Boolean).join(" "))}</div>
-        </div>
-
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <a class="btn" href="#/orders">رجوع</a>
-          <button class="btn btn-primary" data-act="makeInvoice" data-id="${wo.id}">إنشاء فاتورة</button>
-          <button class="btn btn-danger" data-act="deleteWO" data-id="${wo.id}">حذف</button>
-        </div>
-      </div>
-
-      <div class="hr"></div>
-
-      <div class="grid2">
-        <div class="card subcard">
-          <div class="small">الحالة</div>
-          <select class="input" data-act="setStatus" data-id="${wo.id}">
-            ${["OPEN","WAITING_APPROVAL","IN_PROGRESS","WAITING_PARTS","DONE","DELIVERED"].map(s =>
-              `<option value="${s}" ${wo.status===s?"selected":""}>${s}</option>`
-            ).join("")}
-          </select>
-
-          <div style="height:10px"></div>
-
-          <div class="small">الفني</div>
-          <select class="input" data-act="setEmployee" data-id="${wo.id}">
-            ${empOptions}
-          </select>
-
-          <div style="height:10px"></div>
-
-          <div class="small">وصف الشغل</div>
-          <div class="notice">${escapeHtml(wo.complaint || "—")}</div>
-
-          <div style="height:10px"></div>
-          <div class="kv"><span>عداد</span><b>${wo.odometer ?? "—"}</b></div>
-          <div class="kv"><span>مجموع قطع</span><b>${money(partsTotal)}</b></div>
-          <div class="kv"><span>مجموع أجور</span><b>${money(laborTotal)}</b></div>
-          <div class="kv"><span>المجموع التقريبي</span><b>${money(total)}</b></div>
-        </div>
-
-        <div class="card subcard">
-          <div class="section-title">صرف قطع من المخزون</div>
-          <div class="small">راح ينخصم الرصيد تلقائيًا</div>
-          <div class="hr"></div>
-
-          <label class="small">القطعة</label>
-          <select id="odPart" class="input">${partOptions}</select>
-
-          <div style="height:10px"></div>
-
-          <div class="grid2">
-            <div>
-              <label class="small">الكمية</label>
-              <input id="odQty" class="input" inputmode="numeric" value="1" />
-            </div>
-            <div style="display:flex;align-items:end">
-              <button class="btn btn-primary" data-act="addPartToWO" data-id="${wo.id}">صرف</button>
-            </div>
-          </div>
-
-          <div class="hr"></div>
-
-          ${partLines.length ? `
-            <div class="section-title">قطع مصروفة</div>
-            ${partLines.map((ln, idx) => {
-              const p = pMap.get(ln.partId);
-              const name = p?.name || ln.partId;
-              const lineTotal = Number(ln.qty||0)*Number(ln.unit||0);
-              return `
-                <div class="card subcard" style="margin-bottom:10px">
-                  <div style="display:flex;justify-content:space-between;gap:10px">
-                    <div>
-                      <div style="font-weight:900">${escapeHtml(name)}</div>
-                      <div class="small">كمية: ${ln.qty} • سعر: ${money(ln.unit||0)} • مجموع: <b>${money(lineTotal)}</b></div>
-                    </div>
-                    <button class="btn btn-danger" data-act="removePartLine" data-id="${wo.id}" data-idx="${idx}">إرجاع</button>
-                  </div>
-                </div>
-              `;
-            }).join("")}
-          ` : `<div class="notice">بعد ماكو قطع مصروفة لهذا الأمر.</div>`}
-        </div>
-      </div>
-
-      <div class="hr"></div>
-
-      <div class="card subcard">
-        <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
-          <div>
-            <div class="section-title">الأجور</div>
-            <div class="small">تقدرين تضيفين أكثر من سطر أجور</div>
-          </div>
-          <button class="btn btn-primary" data-act="addLabor" data-id="${wo.id}">+ إضافة أجور</button>
-        </div>
-
-        <div class="hr"></div>
-
-        ${laborLines.length ? laborLines.map((ln, idx) => `
-          <div class="card subcard" style="margin-bottom:10px">
-            <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
-              <div>
-                <div style="font-weight:900">${escapeHtml(ln.title || "أجور")}</div>
-                <div class="small">قيمة: <b>${money(ln.amount || 0)}</b></div>
-              </div>
-              <button class="btn btn-danger" data-act="removeLabor" data-id="${wo.id}" data-idx="${idx}">حذف</button>
-            </div>
-          </div>
-        `).join("") : `<div class="notice">بعد ماكو أجور مضافة.</div>`}
-      </div>
-    </div>
-  `;
-}
-
-async function viewCustomers(params) {
-  const customers = await dbAPI.getAll("customers");
-  const vehicles = await dbAPI.getAll("vehicles");
-  const workOrders = await dbAPI.getAll("workOrders");
-
-  const q = (state.search || "").trim().toLowerCase();
-
-  const vCount = new Map();
-  for (const v of vehicles) vCount.set(v.customerId, (vCount.get(v.customerId)||0)+1);
-
-  const lastVisit = new Map();
-  for (const w of workOrders) {
-    const prev = lastVisit.get(w.customerId) || 0;
-    if (w.createdAt > prev) lastVisit.set(w.customerId, w.createdAt);
-  }
-
-  const list = customers
-    .sort((a,b)=> (a.name||"").localeCompare(b.name||"", "ar"))
-    .filter(c => {
-      if (!q) return true;
-      return (c.name||"").toLowerCase().includes(q) || (c.phone||"").toLowerCase().includes(q);
+    $("#btnAddPart").addEventListener("click", ()=>{
+      const pid = $("#partSel").value;
+      const qty = Number($("#partQty").value||0);
+      const price = Number($("#partPrice").value||0);
+      if(!pid || qty<=0) return toast("اختاري قطعة وكمية", "bad");
+      const p = CACHE.inventory.get(pid);
+      parts.push({
+        partId: pid,
+        name: p?.name||"",
+        unit: p?.unit||"",
+        qty,
+        price: price || Number(p?.sell||0)
+      });
+      renderParts();
     });
 
-  return `
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
-        <div>
-          <div class="section-title">الزباين</div>
-          <div class="small">كل زبون إله سجل: سيارات + أوامر + فواتير + دهن</div>
+    $("#btnAddLabor").addEventListener("click", ()=>{
+      const name = $("#laborName").value.trim();
+      const price = Number($("#laborPrice").value||0);
+      if(!name || price<=0) return toast("أدخلي وصف ومبلغ", "bad");
+      labor.push({name, price});
+      $("#laborName").value=""; $("#laborPrice").value="0";
+      renderLabor();
+    });
+
+    $("#btnCloseEditor").addEventListener("click", ()=> box.classList.add("hidden"));
+
+    $("#fOrderEdit").addEventListener("submit", async (e)=>{
+      e.preventDefault();
+      const data = getFormData(e.target);
+      const newStatus = data.status || "open";
+      const doneDate = newStatus==="done" ? (order.doneDate || new Date().toISOString()) : "";
+
+      await updateDocSafe(ref, {
+        status: newStatus,
+        assignedTo: data.assignedTo||"",
+        problem: data.problem||"",
+        note: data.note||"",
+        parts,
+        labor,
+        doneDate
+      });
+      toast("تم الحفظ", "good");
+      if(newStatus==="done") toast("تم إكمال الأمر", "good");
+      box.classList.add("hidden");
+    });
+
+    $("#btnDeleteOrder").addEventListener("click", async ()=>{
+      if(!can("admin")) return toast("الحذف للأدمن فقط", "bad");
+      if(!confirm("حذف أمر الشغل؟")) return;
+      await deleteDocSafe(ref);
+      toast("تم الحذف", "good");
+      box.classList.add("hidden");
+    });
+
+    $("#btnMakeInvoice").addEventListener("click", ()=> createInvoiceFromOrder(order, parts, labor));
+  }
+}
+
+// ---------- Invoices from order ----------
+async function createInvoiceFromOrder(order, parts, labor){
+  if(!requireRole("staff")) return;
+
+  // compute totals
+  const partsTotal = parts.reduce((s,it)=> s+Number(it.qty||0)*Number(it.price||0), 0);
+  const laborTotal = labor.reduce((s,it)=> s+Number(it.price||0), 0);
+  const subTotal = partsTotal + laborTotal;
+  const vat = Number(SETTINGS.vatPercent||0);
+  const vatVal = subTotal*(vat/100);
+  const discount = 0;
+  const total = subTotal + vatVal - discount;
+
+  // Build items list
+  const items = [
+    ...parts.map(p=>({ type:"part", name:p.name, unit:p.unit||"قطعة", qty:Number(p.qty||0), price:Number(p.price||0), partId:p.partId||"" })),
+    ...labor.map(l=>({ type:"labor", name:l.name, unit:"خدمة", qty:1, price:Number(l.price||0) }))
+  ];
+
+  // Save invoice
+  const invNo = await nextCounter("invoiceNo");
+  const code = `${SETTINGS.invoicePrefix||"INV-"}${invNo}`;
+  const invId = await createDoc(C.invoices(), {
+    code,
+    orderId: order.id,
+    customerId: order.customerId||"",
+    customerName: order.customerName||"",
+    customerPhone: order.customerPhone||"",
+    vehicleId: order.vehicleId||"",
+    vehicleLabel: order.vehicleLabel||"",
+    date: todayISO(),
+    items,
+    subTotal,
+    vatPercent: vat,
+    vatValue: vatVal,
+    discount,
+    total,
+    note: order.note||""
+  });
+
+  // Optional: mark order done when invoiced
+  await updateDocSafe(doc(db,"orders",order.id), { status:"done", doneDate: new Date().toISOString() });
+
+  // Deduct inventory for parts
+  await deductInventoryForInvoice(items);
+
+  toast("تم إنشاء الفاتورة ✅", "good");
+  location.hash = "#/invoices?open="+invId;
+}
+
+async function deductInventoryForInvoice(items){
+  // only parts affect inventory
+  const parts = items.filter(i=> i.type==="part" && i.partId);
+  if(!parts.length) return;
+  const batch = writeBatch(db);
+  for(const it of parts){
+    const ref = doc(db, "inventory", it.partId);
+    const snap = await getDoc(ref);
+    if(!snap.exists()) continue;
+    const cur = Number(snap.data().qty||0);
+    const next = cur - Number(it.qty||0);
+    batch.update(ref, { qty: next });
+  }
+  await batch.commit();
+}
+
+// ---------- Customers ----------
+async function renderCustomers(params){
+  if(!requireRole("staff")) return;
+  const isNew = params.get("new")==="1";
+  view.innerHTML = viewHeader("الزباين", "إضافة/تعديل بيانات الزبون");
+
+  view.innerHTML += `
+    <div class="row">
+      <div class="card">
+        <div class="row-actions" style="justify-content:space-between;">
+          <div>
+            <div class="section-title">القائمة</div>
+            <div class="small">ابحثي بالاسم/الهاتف/المدينة</div>
+          </div>
+          <button id="btnNewCust" class="btn btn-primary">+ زبون</button>
         </div>
-        <button class="btn btn-primary" data-act="newCustomer">+ زبون جديد</button>
+        <div class="hr"></div>
+        <div id="custList" class="notice">... تحميل</div>
       </div>
 
-      <div class="hr"></div>
+      <div id="custEditor" class="card subcard hidden"></div>
+    </div>
+  `;
 
-      ${list.length ? `
+  $("#btnNewCust").addEventListener("click", ()=> openCustEditor(null));
+
+  onSnapshot(query(C.customers(), orderBy("createdAt","desc"), limit(400)), (snap)=>{
+    const rows=[];
+    snap.forEach(d=> rows.push({id:d.id, ...d.data()}));
+    const filtered = rows.filter(c => matchSearch(`${c.name} ${c.phone} ${c.city}`));
+
+    $("#custList").outerHTML = `<div id="custList">
+      ${filtered.map(c=>`
+        <div class="kv" style="margin:10px 0;">
+          <span><b>${escapeHtml(c.name||"")}</b><div class="small">${escapeHtml(c.phone||"")} — ${escapeHtml(c.city||"")}</div></span>
+          <button class="btn btn-soft" data-ce="${c.id}">فتح</button>
+        </div>
+      `).join("") || `<div class="notice">لا توجد نتائج</div>`}
+    </div>`;
+
+    $$("[data-ce]").forEach(b=> b.addEventListener("click", ()=>{
+      const obj = rows.find(x=>x.id===b.dataset.ce);
+      openCustEditor(obj);
+    }));
+
+    if(isNew) openCustEditor(null);
+  });
+
+  function openCustEditor(cust){
+    const box = $("#custEditor");
+    box.classList.remove("hidden");
+    if(!cust){
+      box.innerHTML = `
+        <div class="section-title">زبون جديد</div>
+        <div class="hr"></div>
+        <form id="fCustNew" class="grid3">
+          ${formRow("الاسم", input("name","","text","اسم الزبون"))}
+          ${formRow("الهاتف", input("phone","","text","07xxxxxxxxx"))}
+          ${formRow("المدينة", input("city","","text","بغداد"))}
+          <div class="row-actions" style="grid-column:1/-1;">
+            <button class="btn btn-primary" type="submit">حفظ</button>
+            <button id="btnCancel" class="btn btn-soft" type="button">إغلاق</button>
+          </div>
+        </form>
+      `;
+      $("#btnCancel").addEventListener("click", ()=> box.classList.add("hidden"));
+      $("#fCustNew").addEventListener("submit", async (e)=>{
+        e.preventDefault();
+        const data = getFormData(e.target);
+        if(!data.name) return toast("أدخلي الاسم", "bad");
+        await createDoc(C.customers(), {
+          name: data.name,
+          phone: data.phone||"",
+          city: data.city||""
+        });
+        toast("تم حفظ الزبون", "good");
+        box.classList.add("hidden");
+      });
+      return;
+    }
+
+    box.innerHTML = `
+      <div class="section-title">تعديل زبون</div>
+      <div class="small">${escapeHtml(cust.name||"")}</div>
+      <div class="hr"></div>
+      <form id="fCustEdit" class="grid3">
+        ${formRow("الاسم", input("name", cust.name||""))}
+        ${formRow("الهاتف", input("phone", cust.phone||""))}
+        ${formRow("المدينة", input("city", cust.city||""))}
+        <div class="row-actions" style="grid-column:1/-1;">
+          <button class="btn btn-primary" type="submit">حفظ</button>
+          <button id="btnDel" class="btn btn-danger" type="button">حذف</button>
+          <button id="btnClose" class="btn btn-soft" type="button">إغلاق</button>
+        </div>
+      </form>
+    `;
+    $("#btnClose").addEventListener("click", ()=> box.classList.add("hidden"));
+    $("#fCustEdit").addEventListener("submit", async (e)=>{
+      e.preventDefault();
+      const data = getFormData(e.target);
+      await updateDocSafe(doc(db,"customers",cust.id), {
+        name:data.name||"", phone:data.phone||"", city:data.city||""
+      });
+      toast("تم التحديث", "good");
+      box.classList.add("hidden");
+    });
+    $("#btnDel").addEventListener("click", async ()=>{
+      if(!can("admin")) return toast("الحذف للأدمن فقط", "bad");
+      if(!confirm("حذف الزبون؟")) return;
+      await deleteDocSafe(doc(db,"customers",cust.id));
+      toast("تم الحذف", "good");
+      box.classList.add("hidden");
+    });
+  }
+}
+
+
+// ---------- Vehicles ----------
+async function renderVehicles(params){
+  if(!requireRole("staff")) return;
+  const isNew = params.get("new")==="1";
+  view.innerHTML = viewHeader("السيارات", "ربط سيارة بزبون");
+
+  view.innerHTML += `
+    <div class="row">
+      <div class="card">
+        <div class="row-actions" style="justify-content:space-between;">
+          <div>
+            <div class="section-title">القائمة</div>
+            <div class="small">بحث بالرقم/الموديل/الزبون</div>
+          </div>
+          <button id="btnNewVeh" class="btn btn-primary">+ سيارة</button>
+        </div>
+        <div class="hr"></div>
+        <div id="vehList" class="notice">... تحميل</div>
+      </div>
+
+      <div id="vehEditor" class="card subcard hidden"></div>
+    </div>
+  `;
+
+  $("#btnNewVeh").addEventListener("click", ()=> openVehEditor(null));
+
+  onSnapshot(query(C.vehicles(), orderBy("createdAt","desc"), limit(500)), (snap)=>{
+    const rows=[];
+    snap.forEach(d=> rows.push({id:d.id, ...d.data()}));
+    const filtered = rows.filter(v=>{
+      const cust = CACHE.customers.get(v.customerId||"");
+      const label = `${v.plate} ${v.model} ${v.year||""} ${cust?.name||""}`;
+      return matchSearch(label);
+    });
+
+    $("#vehList").outerHTML = `<div id="vehList">
+      ${filtered.map(v=>{
+        const c = CACHE.customers.get(v.customerId||"");
+        return `
+          <div class="kv" style="margin:10px 0;">
+            <span><b>${escapeHtml(v.plate||"")}</b> — ${escapeHtml(v.model||"")} (${escapeHtml(v.year||"")})
+              <div class="small">${escapeHtml(c?.name||"")} — ${escapeHtml(v.color||"")}</div>
+            </span>
+            <button class="btn btn-soft" data-ve="${v.id}">فتح</button>
+          </div>
+        `;
+      }).join("") || `<div class="notice">لا توجد نتائج</div>`}
+    </div>`;
+
+    $$("[data-ve]").forEach(b=> b.addEventListener("click", ()=>{
+      const obj = rows.find(x=>x.id===b.dataset.ve);
+      openVehEditor(obj);
+    }));
+
+    if(isNew) openVehEditor(null);
+  });
+
+  function openVehEditor(veh){
+    const box = $("#vehEditor");
+    box.classList.remove("hidden");
+    const customers = Array.from(CACHE.customers.values());
+
+    if(!veh){
+      box.innerHTML = `
+        <div class="section-title">سيارة جديدة</div>
+        <div class="hr"></div>
+        <form id="fVehNew" class="grid3">
+          ${formRow("الزبون", select("customerId",
+            [{value:"",label:"— اختاري —"}, ...customers.map(c=>({value:c.id,label:`${c.name} (${c.phone||""})`}))],
+            ""))}
+          ${formRow("رقم السيارة", input("plate","","text","مثال: بغداد 12345"))}
+          ${formRow("الموديل", input("model","","text","تويوتا/كيا/..."))}
+          ${formRow("السنة", input("year","","number","2018"))}
+          ${formRow("اللون", input("color","","text","أبيض"))}
+          <div class="row-actions" style="grid-column:1/-1;">
+            <button class="btn btn-primary" type="submit">حفظ</button>
+            <button id="btnCancel" class="btn btn-soft" type="button">إغلاق</button>
+          </div>
+        </form>
+      `;
+      $("#btnCancel").addEventListener("click", ()=> box.classList.add("hidden"));
+      $("#fVehNew").addEventListener("submit", async (e)=>{
+        e.preventDefault();
+        const data = getFormData(e.target);
+        if(!data.customerId || !data.plate) return toast("اختاري زبون واكتبي رقم السيارة", "bad");
+        await createDoc(C.vehicles(), {
+          customerId: data.customerId,
+          plate: data.plate,
+          model: data.model||"",
+          year: Number(data.year||0)||"",
+          color: data.color||""
+        });
+        toast("تم حفظ السيارة", "good");
+        box.classList.add("hidden");
+      });
+      return;
+    }
+
+    box.innerHTML = `
+      <div class="section-title">تعديل سيارة</div>
+      <div class="small">${escapeHtml(veh.plate||"")} — ${escapeHtml(veh.model||"")}</div>
+      <div class="hr"></div>
+      <form id="fVehEdit" class="grid3">
+        ${formRow("الزبون", select("customerId",
+          [{value:"",label:"—"} ,...customers.map(c=>({value:c.id,label:`${c.name} (${c.phone||""})`}))],
+          veh.customerId||""))}
+        ${formRow("رقم السيارة", input("plate",veh.plate||""))}
+        ${formRow("الموديل", input("model",veh.model||""))}
+        ${formRow("السنة", input("year",veh.year||"","number"))}
+        ${formRow("اللون", input("color",veh.color||""))}
+        <div class="row-actions" style="grid-column:1/-1;">
+          <button class="btn btn-primary" type="submit">حفظ</button>
+          <button id="btnDel" class="btn btn-danger" type="button">حذف</button>
+          <button id="btnClose" class="btn btn-soft" type="button">إغلاق</button>
+        </div>
+      </form>
+    `;
+    $("#btnClose").addEventListener("click", ()=> box.classList.add("hidden"));
+    $("#fVehEdit").addEventListener("submit", async (e)=>{
+      e.preventDefault();
+      const data = getFormData(e.target);
+      await updateDocSafe(doc(db,"vehicles",veh.id), {
+        customerId:data.customerId||"",
+        plate:data.plate||"",
+        model:data.model||"",
+        year: Number(data.year||0)||"",
+        color: data.color||""
+      });
+      toast("تم التحديث", "good");
+      box.classList.add("hidden");
+    });
+    $("#btnDel").addEventListener("click", async ()=>{
+      if(!can("admin")) return toast("الحذف للأدمن فقط", "bad");
+      if(!confirm("حذف السيارة؟")) return;
+      await deleteDocSafe(doc(db,"vehicles",veh.id));
+      toast("تم الحذف", "good");
+      box.classList.add("hidden");
+    });
+  }
+}
+
+// ---------- Oil Change ----------
+async function renderOil(params){
+  if(!requireRole("staff")) return;
+  const isNew = params.get("new")==="1";
+  view.innerHTML = viewHeader("تبديل دهن", "سجل سريع لتبديل الدهن ويمكن تحويله إلى فاتورة");
+  const customers = Array.from(CACHE.customers.values());
+  const vehicles = Array.from(CACHE.vehicles.values());
+  const oils = Array.from(CACHE.inventory.values()).filter(p => (p.sku||"").toLowerCase().includes("oil") || (p.name||"").includes("دهن"));
+
+  view.innerHTML += `
+    <div class="card">
+      <div class="section-title">سجل تبديل دهن</div>
+      <div class="small">اختاري زبون وسيارة ونوع الدهن + الفلتر</div>
+      <div class="hr"></div>
+      <form id="fOil" class="grid3">
+        ${formRow("الزبون", select("customerId", [{value:"",label:"—"} ,...customers.map(c=>({value:c.id,label:`${c.name} (${c.phone||""})`}))], ""))}
+        ${formRow("السيارة", select("vehicleId", [{value:"",label:"—"} ,...vehicles.map(v=>({value:v.id,label:`${v.plate} - ${v.model||""}`}))], ""))}
+        ${formRow("الدهن", select("oilPartId", [{value:"",label:"—"} ,...oils.map(p=>({value:p.id,label:`${p.name} (متوفر:${p.qty||0})`}))], ""))}
+        ${formRow("كمية (علب)", input("oilQty","1","number"))}
+        ${formRow("فلتر زيت؟", select("filter", [{value:"no",label:"لا"},{value:"yes",label:"نعم"}], "yes"))}
+        ${formRow("سعر الخدمة", input("price","0","number","يمكن تركه 0 ليحسب من سعر الدهن"))}
+        <div class="col" style="grid-column:1/-1">
+          <div class="small">ملاحظات</div>
+          ${textarea("note","")}
+        </div>
+        <div class="row-actions" style="grid-column:1/-1;">
+          <button class="btn btn-primary" type="submit">حفظ + فاتورة</button>
+        </div>
+      </form>
+      <div class="notice" style="margin-top:12px;">سيتم خصم الدهن من المخزون تلقائيًا عند الحفظ.</div>
+    </div>
+  `;
+
+  $("#fOil").addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    const data = getFormData(e.target);
+    if(!data.customerId || !data.vehicleId || !data.oilPartId) return toast("اختاري زبون/سيارة/دهن", "bad");
+
+    const c = CACHE.customers.get(data.customerId);
+    const v = CACHE.vehicles.get(data.vehicleId);
+    const p = CACHE.inventory.get(data.oilPartId);
+    const qty = Number(data.oilQty||0);
+    const base = Number(data.price||0) || (Number(p?.sell||0)*qty);
+
+    // create an invoice directly (oil as part + labor)
+    const items = [
+      { type:"part", name:p?.name||"دهن", unit:p?.unit||"علبة", qty, price:Number(p?.sell||0), partId:p?.id||"" },
+      ...(data.filter==="yes" ? [{ type:"labor", name:"تبديل فلتر", unit:"خدمة", qty:1, price:5000 }] : []),
+      { type:"labor", name:"أجرة تبديل دهن", unit:"خدمة", qty:1, price: Math.max(0, base - Number(p?.sell||0)*qty) }
+    ].filter(it => Number(it.price||0) > 0);
+
+    const partsTotal = items.filter(i=>i.type==="part").reduce((s,it)=> s+Number(it.qty||0)*Number(it.price||0), 0);
+    const laborTotal = items.filter(i=>i.type==="labor").reduce((s,it)=> s+Number(it.price||0), 0);
+    const subTotal = partsTotal + laborTotal;
+    const vat = Number(SETTINGS.vatPercent||0);
+    const vatVal = subTotal*(vat/100);
+    const discount = 0;
+    const total = subTotal + vatVal - discount;
+
+    const invNo = await nextCounter("invoiceNo");
+    const code = `${SETTINGS.invoicePrefix||"INV-"}${invNo}`;
+    const invId = await createDoc(C.invoices(), {
+      code,
+      orderId: "",
+      customerId: data.customerId,
+      customerName: c?.name||"",
+      customerPhone: c?.phone||"",
+      vehicleId: data.vehicleId,
+      vehicleLabel: `${v?.plate||""} - ${v?.model||""}`,
+      date: todayISO(),
+      items,
+      subTotal,
+      vatPercent: vat,
+      vatValue: vatVal,
+      discount,
+      total,
+      note: data.note||""
+    });
+
+    await deductInventoryForInvoice(items);
+    toast("تم حفظ فاتورة تبديل الدهن", "good");
+    location.hash = "#/invoices?open="+invId;
+  });
+}
+
+// ---------- Inventory ----------
+async function renderInventory(params){
+  if(!requireRole("staff")) return;
+  const isNew = params.get("new")==="1";
+  view.innerHTML = viewHeader("المخزون", "إضافة قطع + ضبط الكميات والأسعار");
+
+  view.innerHTML += `
+    <div class="row">
+      <div class="card">
+        <div class="row-actions" style="justify-content:space-between;">
+          <div>
+            <div class="section-title">القائمة</div>
+            <div class="small">بحث بالاسم/sku</div>
+          </div>
+          <button id="btnNewPart" class="btn btn-primary">+ قطعة</button>
+        </div>
+        <div class="hr"></div>
+        <div id="invList" class="notice">... تحميل</div>
+      </div>
+
+      <div id="invEditor" class="card subcard hidden"></div>
+    </div>
+  `;
+
+  $("#btnNewPart").addEventListener("click", ()=> openInvEditor(null));
+
+  onSnapshot(query(C.inventory(), orderBy("createdAt","desc"), limit(800)), (snap)=>{
+    const rows=[];
+    snap.forEach(d=> rows.push({id:d.id, ...d.data()}));
+    const filtered = rows.filter(p => matchSearch(`${p.name} ${p.sku}`));
+
+    $("#invList").outerHTML = `<div id="invList">
       <table class="table">
-        <thead>
-          <tr>
-            <th>الاسم</th>
-            <th>الهاتف</th>
-            <th>عدد السيارات</th>
-            <th>آخر زيارة</th>
-            <th>إجراءات</th>
-          </tr>
-        </thead>
+        <thead><tr><th>القطعة</th><th>SKU</th><th>متوفر</th><th>بيع</th><th>حد أدنى</th><th></th></tr></thead>
         <tbody>
-          ${list.map(c => `
+          ${filtered.map(p=>`
             <tr class="tr">
-              <td><b>${escapeHtml(c.name)}</b><div class="small">${escapeHtml(c.address||"")}</div></td>
-              <td class="small">${escapeHtml(c.phone||"—")}</td>
-              <td>${vCount.get(c.id) || 0}</td>
-              <td class="small">${lastVisit.get(c.id) ? fmtDate(lastVisit.get(c.id)) : "—"}</td>
-              <td>
-                <div style="display:flex;gap:8px;flex-wrap:wrap">
-                  <a class="btn" href="#/customer?id=${encodeURIComponent(c.id)}">السجل</a>
-                  <button class="btn" data-act="editCustomer" data-id="${c.id}">تعديل</button>
-                  <button class="btn" data-act="newVehicleForCustomer" data-id="${c.id}">+ سيارة</button>
-                  <a class="btn btn-soft" href="#/oil?customerId=${encodeURIComponent(c.id)}">تبديل دهن</a>
-                  <button class="btn btn-danger" data-act="deleteCustomer" data-id="${c.id}">حذف</button>
-                </div>
-              </td>
+              <td><b>${escapeHtml(p.name||"")}</b><div class="small">${escapeHtml(p.unit||"")}</div></td>
+              <td class="small">${escapeHtml(p.sku||"")}</td>
+              <td>${escapeHtml(p.qty||0)}</td>
+              <td>${fmtMoney(p.sell||0)}</td>
+              <td>${escapeHtml(p.min||0)}</td>
+              <td><button class="btn btn-soft" data-ie="${p.id}">فتح</button></td>
             </tr>
           `).join("")}
         </tbody>
       </table>
-      ` : `<div class="notice">ماكو زباين بعد. اضغطي + زبون جديد.</div>`}
-    </div>
-  `;
+      ${filtered.length? "" : `<div class="notice">لا توجد نتائج</div>`}
+    </div>`;
+
+    $$("[data-ie]").forEach(b=> b.addEventListener("click", ()=>{
+      const obj = rows.find(x=>x.id===b.dataset.ie);
+      openInvEditor(obj);
+    }));
+
+    if(isNew) openInvEditor(null);
+  });
+
+  function openInvEditor(p){
+    const box = $("#invEditor");
+    box.classList.remove("hidden");
+    if(!p){
+      box.innerHTML = `
+        <div class="section-title">قطعة جديدة</div>
+        <div class="hr"></div>
+        <form id="fInvNew" class="grid3">
+          ${formRow("الاسم", input("name","","text","فلتر/فحمات/..."))}
+          ${formRow("SKU", input("sku","","text","رمز اختياري"))}
+          ${formRow("الوحدة", input("unit","قطعة"))}
+          ${formRow("سعر الشراء", input("buy","0","number"))}
+          ${formRow("سعر البيع", input("sell","0","number"))}
+          ${formRow("الكمية", input("qty","0","number"))}
+          ${formRow("حد أدنى", input("min","0","number"))}
+          <div class="row-actions" style="grid-column:1/-1;">
+            <button class="btn btn-primary" type="submit">حفظ</button>
+            <button id="btnClose" class="btn btn-soft" type="button">إغلاق</button>
+          </div>
+        </form>
+      `;
+      $("#btnClose").addEventListener("click", ()=> box.classList.add("hidden"));
+      $("#fInvNew").addEventListener("submit", async (e)=>{
+        e.preventDefault();
+        const data = getFormData(e.target);
+        if(!data.name) return toast("أدخلي الاسم", "bad");
+        await createDoc(C.inventory(), {
+          name:data.name, sku:data.sku||"", unit:data.unit||"قطعة",
+          buy:Number(data.buy||0), sell:Number(data.sell||0),
+          qty:Number(data.qty||0), min:Number(data.min||0)
+        });
+        toast("تم حفظ القطعة", "good");
+        box.classList.add("hidden");
+      });
+      return;
+    }
+
+    box.innerHTML = `
+      <div class="section-title">تعديل قطعة</div>
+      <div class="small">${escapeHtml(p.name||"")}</div>
+      <div class="hr"></div>
+      <form id="fInvEdit" class="grid3">
+        ${formRow("الاسم", input("name",p.name||""))}
+        ${formRow("SKU", input("sku",p.sku||""))}
+        ${formRow("الوحدة", input("unit",p.unit||"قطعة"))}
+        ${formRow("سعر الشراء", input("buy",p.buy||0,"number"))}
+        ${formRow("سعر البيع", input("sell",p.sell||0,"number"))}
+        ${formRow("الكمية", input("qty",p.qty||0,"number"))}
+        ${formRow("حد أدنى", input("min",p.min||0,"number"))}
+        <div class="row-actions" style="grid-column:1/-1;">
+          <button class="btn btn-primary" type="submit">حفظ</button>
+          <button id="btnDel" class="btn btn-danger" type="button">حذف</button>
+          <button id="btnClose" class="btn btn-soft" type="button">إغلاق</button>
+        </div>
+      </form>
+    `;
+    $("#btnClose").addEventListener("click", ()=> box.classList.add("hidden"));
+    $("#fInvEdit").addEventListener("submit", async (e)=>{
+      e.preventDefault();
+      const data = getFormData(e.target);
+      await updateDocSafe(doc(db,"inventory",p.id), {
+        name:data.name||"", sku:data.sku||"", unit:data.unit||"قطعة",
+        buy:Number(data.buy||0), sell:Number(data.sell||0),
+        qty:Number(data.qty||0), min:Number(data.min||0)
+      });
+      toast("تم التحديث", "good");
+      box.classList.add("hidden");
+    });
+    $("#btnDel").addEventListener("click", async ()=>{
+      if(!can("admin")) return toast("الحذف للأدمن فقط", "bad");
+      if(!confirm("حذف القطعة؟")) return;
+      await deleteDocSafe(doc(db,"inventory",p.id));
+      toast("تم الحذف", "good");
+      box.classList.add("hidden");
+    });
+  }
 }
 
-async function viewCustomerDetails(customerId) {
-  const c = await dbAPI.get("customers", customerId);
-  if (!c) return `<div class="card"><div class="notice">ما لقيت الزبون.</div></div>`;
+// ---------- Invoices ----------
+async function renderInvoices(params){
+  if(!requireRole("staff")) return;
+  view.innerHTML = viewHeader("الفواتير", "عرض/طباعة الفواتير وتفاصيلها");
 
-  const vehicles = (await dbAPI.getAll("vehicles")).filter(v => v.customerId === c.id);
-  const workOrders = (await dbAPI.getAll("workOrders")).filter(w => w.customerId === c.id).sort((a,b)=>b.createdAt-a.createdAt);
-  const invoices = await dbAPI.getAll("invoices");
-
-  const invByWO = new Map(invoices.map(i => [i.workOrderId, i]));
-
-  const oilInv = invoices.filter(i => i.invoiceType === "OIL")
-    .filter(i => {
-      const wo = workOrders.find(w => w.id === i.workOrderId);
-      return !!wo && wo.customerId === c.id;
-    })
-    .sort((a,b)=>b.createdAt-a.createdAt)
-    .slice(0, 10);
-
-  return `
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">
-        <div>
-          <div class="section-title">سجل الزبون</div>
-          <div class="small"><b>${escapeHtml(c.name)}</b> • ${escapeHtml(c.phone||"")}</div>
-          <div class="small">${escapeHtml(c.address||"")}</div>
-          ${c.notes ? `<div class="notice" style="margin-top:10px">${escapeHtml(c.notes)}</div>` : ""}
+  view.innerHTML += `
+    <div class="row">
+      <div class="card">
+        <div class="row-actions" style="justify-content:space-between;">
+          <div>
+            <div class="section-title">القائمة</div>
+            <div class="small">بحث بالكود/الزبون/السيارة</div>
+          </div>
+          <button id="btnNewInvoice" class="btn btn-primary">+ فاتورة يدوية</button>
         </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <a class="btn" href="#/customers">رجوع</a>
-          <button class="btn" data-act="editCustomer" data-id="${c.id}">تعديل</button>
-          <button class="btn" data-act="newVehicleForCustomer" data-id="${c.id}">+ سيارة</button>
-          <a class="btn btn-primary" href="#/oil?customerId=${encodeURIComponent(c.id)}">تبديل دهن</a>
-        </div>
+        <div class="hr"></div>
+        <div id="invList2" class="notice">... تحميل</div>
       </div>
 
-      <div class="hr"></div>
+      <div id="invEditor2" class="card subcard hidden"></div>
+    </div>
+  `;
 
-      <div class="row">
-        <div class="col">
-          <div class="card subcard">
-            <div class="section-title">سيارات الزبون</div>
-            ${vehicles.length ? vehicles.map(v => `
-              <div class="card subcard" style="margin-bottom:10px">
-                <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
-                  <div>
-                    <div style="font-weight:900">${escapeHtml(v.plate || "—")} • ${escapeHtml([v.make,v.model,v.year].filter(Boolean).join(" "))}</div>
-                    <div class="small">عداد: <b>${v.odometer ?? "—"}</b> • دهن جاي: <b>${v.nextOilOdo ?? "—"}</b></div>
-                  </div>
-                  <div style="display:flex;gap:8px;flex-wrap:wrap">
-                    <a class="btn" href="#/vehicle?id=${encodeURIComponent(v.id)}">سجل السيارة</a>
-                    <a class="btn btn-soft" href="#/oil?customerId=${encodeURIComponent(c.id)}&vehicleId=${encodeURIComponent(v.id)}">تبديل دهن</a>
-                  </div>
-                </div>
-              </div>
-            `).join("") : `<div class="notice">ماكو سيارات بعد.</div>`}
+  $("#btnNewInvoice").addEventListener("click", ()=> openInvoiceEditor(null));
+
+  onSnapshot(query(C.invoices(), orderBy("createdAt","desc"), limit(400)), (snap)=>{
+    const rows=[];
+    snap.forEach(d=> rows.push({id:d.id, ...d.data()}));
+    const filtered = rows.filter(i=> matchSearch(`${i.code} ${i.customerName} ${i.vehicleLabel}`));
+
+    $("#invList2").outerHTML = `<div id="invList2">
+      ${filtered.map(i=>`
+        <div class="kv" style="margin:10px 0;">
+          <span><b>${escapeHtml(i.code||i.id||"")}</b>
+            <div class="small">${escapeHtml(i.customerName||"")} — ${escapeHtml(i.vehicleLabel||"")} — ${escapeHtml(i.date||"")}</div>
+          </span>
+          <div class="row-actions">
+            <b>${fmtMoney(i.total||0)}</b>
+            <button class="btn btn-soft" data-inv="${i.id}">فتح</button>
           </div>
         </div>
+      `).join("") || `<div class="notice">لا توجد نتائج</div>`}
+    </div>`;
 
-        <div class="col">
-          <div class="card subcard">
-            <div class="section-title">آخر تبديلات دهن</div>
-            ${oilInv.length ? oilInv.map(inv => `
-              <div class="card subcard" style="margin-bottom:10px">
-                <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
-                  <div>
-                    <div style="font-weight:900">${fmtDay(inv.createdAt)} • فاتورة ${escapeHtml(inv.id)}</div>
-                    <div class="small">حالي: <b>${inv.oil?.currentOdo ?? "—"}</b> • جاي: <b>${inv.oil?.nextOdo ?? "—"}</b></div>
-                  </div>
-                  <div style="display:flex;gap:8px;flex-wrap:wrap">
-                    <button class="btn" data-act="printInvoice" data-id="${inv.id}">طباعة</button>
-                  </div>
-                </div>
-              </div>
-            `).join("") : `<div class="notice">بعد ماكو فواتير دهن.</div>`}
+    $$("[data-inv]").forEach(b=> b.addEventListener("click", ()=>{
+      const obj = rows.find(x=>x.id===b.dataset.inv);
+      openInvoiceEditor(obj);
+    }));
+
+    const openId = params.get("open");
+    if(openId){
+      const obj = rows.find(x=>x.id===openId);
+      if(obj) openInvoiceEditor(obj);
+    }
+  });
+
+  async function openInvoiceEditor(inv){
+    const box = $("#invEditor2");
+    box.classList.remove("hidden");
+
+    const customers = Array.from(CACHE.customers.values());
+    const vehicles = Array.from(CACHE.vehicles.values());
+
+    if(!inv){
+      box.innerHTML = `
+        <div class="section-title">فاتورة يدوية</div>
+        <div class="small">أضيفي عناصر (قطع/خدمات) ثم حفظ</div>
+        <div class="hr"></div>
+        <form id="fInvManual" class="grid3">
+          ${formRow("الزبون", select("customerId", [{value:"",label:"—"} ,...customers.map(c=>({value:c.id,label:`${c.name} (${c.phone||""})`}))], ""))}
+          ${formRow("السيارة", select("vehicleId", [{value:"",label:"—"} ,...vehicles.map(v=>({value:v.id,label:`${v.plate} - ${v.model||""}`}))], ""))}
+          ${formRow("خصم", input("discount","0","number"))}
+          <div class="col" style="grid-column:1/-1">
+            <div class="small">ملاحظة</div>
+            ${textarea("note","")}
           </div>
-        </div>
-      </div>
 
-      <div class="hr"></div>
+          <div class="col" style="grid-column:1/-1">
+            <div class="section-title">العناصر</div>
+            <div class="hr"></div>
+            <div class="row-actions">
+              <select id="manualType" class="input" style="width:160px">
+                <option value="part">قطعة</option>
+                <option value="labor">خدمة</option>
+              </select>
+              <select id="manualPart" class="input" style="min-width:260px">
+                <option value="">— اختيار قطعة —</option>
+                ${Array.from(CACHE.inventory.values()).map(p=>`<option value="${p.id}">${escapeHtml(p.name)} (متوفر:${p.qty||0})</option>`).join("")}
+              </select>
+              <input id="manualName" class="input" style="min-width:220px" placeholder="وصف" />
+              <input id="manualQty" class="input" style="width:120px" type="number" min="1" value="1" />
+              <input id="manualPrice" class="input" style="width:160px" type="number" min="0" value="0" />
+              <button id="btnAddItem" class="btn btn-soft" type="button">إضافة</button>
+            </div>
+            <div id="manualItems" style="margin-top:10px;"></div>
+          </div>
 
-      <div class="card subcard">
-        <div class="section-title">أوامر الشغل (سجل)</div>
-        ${workOrders.length ? `
+          <div class="row-actions" style="grid-column:1/-1;">
+            <button class="btn btn-primary" type="submit">حفظ</button>
+            <button id="btnClose" class="btn btn-soft" type="button">إغلاق</button>
+          </div>
+        </form>
+      `;
+
+      const items = [];
+      const renderItems = ()=>{
+        const partsTotal = items.filter(i=>i.type==="part").reduce((s,it)=> s+Number(it.qty||0)*Number(it.price||0),0);
+        const laborTotal = items.filter(i=>i.type==="labor").reduce((s,it)=> s+Number(it.qty||0)*Number(it.price||0),0);
+        $("#manualItems").innerHTML = `
           <table class="table">
-            <thead>
-              <tr><th>الرقم</th><th>الوصف</th><th>الحالة</th><th>تاريخ</th><th>فاتورة</th><th>إجراءات</th></tr>
-            </thead>
+            <thead><tr><th>النوع</th><th>الوصف</th><th>كمية</th><th>سعر</th><th>المجموع</th><th></th></tr></thead>
             <tbody>
-              ${workOrders.slice(0, 20).map(w => {
-                const inv = invByWO.get(w.id);
-                return `
-                  <tr class="tr">
-                    <td><b>${escapeHtml(w.id)}</b><div class="small">${escapeHtml(w.serviceType||"GENERAL")}</div></td>
-                    <td>${escapeHtml(w.complaint||"—")}</td>
-                    <td>${pill(w.status)}</td>
-                    <td class="small">${fmtDate(w.createdAt)}</td>
-                    <td>${inv ? `<b>${escapeHtml(inv.id)}</b><div class="small">${money(inv.total||0)}</div>` : "—"}</td>
-                    <td>
-                      <div style="display:flex;gap:8px;flex-wrap:wrap">
-                        <a class="btn" href="#/order?id=${encodeURIComponent(w.id)}">تفاصيل</a>
-                        ${inv ? `<button class="btn" data-act="printInvoice" data-id="${inv.id}">طباعة</button>` : `<button class="btn" data-act="makeInvoice" data-id="${w.id}">فاتورة</button>`}
-                      </div>
-                    </td>
-                  </tr>
-                `;
-              }).join("")}
+              ${items.map((it,idx)=>`
+                <tr class="tr">
+                  <td class="small">${it.type==="part"?"قطعة":"خدمة"}</td>
+                  <td>${escapeHtml(it.name||"")}</td>
+                  <td>${escapeHtml(it.qty||0)}</td>
+                  <td>${fmtMoney(it.price||0)}</td>
+                  <td>${fmtMoney(Number(it.qty||0)*Number(it.price||0))}</td>
+                  <td><button class="btn btn-soft" data-mi="${idx}">حذف</button></td>
+                </tr>
+              `).join("")}
             </tbody>
           </table>
-        ` : `<div class="notice">ماكو أوامر شغل مسجلة لهذا الزبون.</div>`}
+          <div class="kv"><span>مجموع القطع</span><b>${fmtMoney(partsTotal)}</b></div>
+          <div class="kv"><span>مجموع الخدمات</span><b>${fmtMoney(laborTotal)}</b></div>
+        `;
+        $$("[data-mi]").forEach(b=> b.addEventListener("click", ()=>{
+          items.splice(Number(b.dataset.mi),1);
+          renderItems();
+        }));
+      };
+
+      $("#btnAddItem").addEventListener("click", ()=>{
+        const type = $("#manualType").value;
+        const partId = $("#manualPart").value;
+        const qty = Number($("#manualQty").value||0);
+        const price = Number($("#manualPrice").value||0);
+        let name = $("#manualName").value.trim();
+
+        if(type==="part"){
+          if(!partId) return toast("اختاري قطعة", "bad");
+          const p = CACHE.inventory.get(partId);
+          name = name || (p?.name||"");
+          items.push({ type, partId, name, unit:p?.unit||"قطعة", qty, price: price || Number(p?.sell||0) });
+        }else{
+          if(!name) return toast("أدخلي وصف خدمة", "bad");
+          items.push({ type, partId:"", name, unit:"خدمة", qty: qty||1, price });
+        }
+        renderItems();
+      });
+
+      $("#btnClose").addEventListener("click", ()=> box.classList.add("hidden"));
+
+      $("#fInvManual").addEventListener("submit", async (e)=>{
+        e.preventDefault();
+        const data = getFormData(e.target);
+        if(!data.customerId || !data.vehicleId) return toast("اختاري زبون وسيارة", "bad");
+        if(!items.length) return toast("أضيفي عناصر للفاتورة", "bad");
+
+        const c = CACHE.customers.get(data.customerId);
+        const v = CACHE.vehicles.get(data.vehicleId);
+
+        const partsTotal = items.filter(i=>i.type==="part").reduce((s,it)=> s+Number(it.qty||0)*Number(it.price||0),0);
+        const laborTotal = items.filter(i=>i.type==="labor").reduce((s,it)=> s+Number(it.qty||0)*Number(it.price||0),0);
+        const subTotal = partsTotal + laborTotal;
+        const vat = Number(SETTINGS.vatPercent||0);
+        const vatVal = subTotal*(vat/100);
+        const discount = Number(data.discount||0);
+        const total = subTotal + vatVal - discount;
+
+        const invNo = await nextCounter("invoiceNo");
+        const code = `${SETTINGS.invoicePrefix||"INV-"}${invNo}`;
+        const invId = await createDoc(C.invoices(), {
+          code,
+          orderId:"",
+          customerId:data.customerId,
+          customerName:c?.name||"",
+          customerPhone:c?.phone||"",
+          vehicleId:data.vehicleId,
+          vehicleLabel:`${v?.plate||""} - ${v?.model||""}`,
+          date: todayISO(),
+          items,
+          subTotal,
+          vatPercent: vat,
+          vatValue: vatVal,
+          discount,
+          total,
+          note:data.note||""
+        });
+
+        await deductInventoryForInvoice(items.map(it=>({
+          type: it.type==="part"?"part":"labor",
+          name: it.name, unit: it.unit||"",
+          qty: Number(it.qty||0), price: Number(it.price||0),
+          partId: it.partId||it.partId||""
+        })));
+
+        toast("تم حفظ الفاتورة", "good");
+        box.classList.add("hidden");
+        location.hash = "#/invoices?open="+invId;
+      });
+
+      renderItems();
+      return;
+    }
+
+    // show invoice details
+    const items = Array.isArray(inv.items) ? inv.items : [];
+    const partsTotal = items.filter(i=>i.type==="part").reduce((s,it)=> s+Number(it.qty||0)*Number(it.price||0),0);
+    const laborTotal = items.filter(i=>i.type==="labor").reduce((s,it)=> s+Number(it.qty||0)*Number(it.price||0),0);
+
+    box.innerHTML = `
+      <div class="row-actions" style="justify-content:space-between;align-items:flex-end;">
+        <div>
+          <div class="section-title">فاتورة: ${escapeHtml(inv.code||inv.id||"")}</div>
+          <div class="small">${escapeHtml(inv.customerName||"")} — ${escapeHtml(inv.vehicleLabel||"")} — ${escapeHtml(inv.date||"")}</div>
+        </div>
+        <div class="row-actions">
+          <button id="btnPrintInv" class="btn btn-primary">طباعة</button>
+          <button id="btnClose" class="btn btn-soft">إغلاق</button>
+        </div>
       </div>
-    </div>
-  `;
-}
+      <div class="hr"></div>
 
-async function viewVehicles() {
-  const vehicles = await dbAPI.getAll("vehicles");
-  const customers = await dbAPI.getAll("customers");
-  const cMap = new Map(customers.map(c=>[c.id,c]));
+      <div class="kv"><span>مجموع القطع</span><b>${fmtMoney(partsTotal)}</b></div>
+      <div class="kv"><span>مجموع الخدمات</span><b>${fmtMoney(laborTotal)}</b></div>
+      <div class="kv"><span>الإجمالي</span><b>${fmtMoney(inv.total||0)}</b></div>
 
-  const q = (state.search || "").trim().toLowerCase();
+      <div class="hr"></div>
+      <table class="table">
+        <thead><tr><th>النوع</th><th>الوصف</th><th>كمية</th><th>سعر</th><th>المجموع</th></tr></thead>
+        <tbody>
+          ${items.map(it=>`
+            <tr class="tr">
+              <td class="small">${it.type==="part"?"قطعة":"خدمة"}</td>
+              <td>${escapeHtml(it.name||"")}</td>
+              <td>${escapeHtml(it.qty||0)}</td>
+              <td>${fmtMoney(it.price||0)}</td>
+              <td>${fmtMoney(Number(it.qty||0)*Number(it.price||0))}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
 
-  const list = vehicles
-    .sort((a,b)=> (a.plate||"").localeCompare(b.plate||"", "ar"))
-    .filter(v => {
-      if (!q) return true;
-      const c = cMap.get(v.customerId);
-      return (
-        (v.plate||"").toLowerCase().includes(q) ||
-        (v.vin||"").toLowerCase().includes(q) ||
-        (c?.name||"").toLowerCase().includes(q) ||
-        (c?.phone||"").toLowerCase().includes(q)
-      );
+      <div class="hr"></div>
+      <div class="notice">${escapeHtml(inv.note||"")}</div>
+    `;
+
+    $("#btnClose").addEventListener("click", ()=> box.classList.add("hidden"));
+    $("#btnPrintInv").addEventListener("click", ()=>{
+      openPrint(invoiceHtml(inv, items));
     });
-
-  return `
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
-        <div>
-          <div class="section-title">السيارات</div>
-          <div class="small">كل سيارة إلها سجل وتاريخ وتبديلات دهن</div>
-        </div>
-        <button class="btn btn-primary" data-act="newVehicle">+ سيارة جديدة</button>
-      </div>
-
-      <div class="hr"></div>
-
-      ${list.length ? `
-      <table class="table">
-        <thead>
-          <tr>
-            <th>اللوحة</th>
-            <th>السيارة</th>
-            <th>الزبون</th>
-            <th>عداد</th>
-            <th>دهن جاي</th>
-            <th>إجراءات</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${list.map(v => {
-            const c = cMap.get(v.customerId);
-            return `
-              <tr class="tr">
-                <td><b>${escapeHtml(v.plate || "—")}</b><div class="small">${escapeHtml(v.vin||"")}</div></td>
-                <td>${escapeHtml([v.make,v.model,v.year].filter(Boolean).join(" ") || "—")}</td>
-                <td>${escapeHtml(c?.name || "—")}<div class="small">${escapeHtml(c?.phone || "")}</div></td>
-                <td>${v.odometer ?? "—"}</td>
-                <td>${v.nextOilOdo ?? "—"}</td>
-                <td>
-                  <div style="display:flex;gap:8px;flex-wrap:wrap">
-                    <a class="btn" href="#/vehicle?id=${encodeURIComponent(v.id)}">السجل</a>
-                    <button class="btn" data-act="editVehicle" data-id="${v.id}">تعديل</button>
-                    <a class="btn btn-soft" href="#/oil?customerId=${encodeURIComponent(v.customerId)}&vehicleId=${encodeURIComponent(v.id)}">تبديل دهن</a>
-                    <button class="btn btn-danger" data-act="deleteVehicle" data-id="${v.id}">حذف</button>
-                  </div>
-                </td>
-              </tr>
-            `;
-          }).join("")}
-        </tbody>
-      </table>
-      ` : `<div class="notice">ماكو سيارات بعد.</div>`}
-    </div>
-  `;
-}
-
-async function viewVehicleDetails(vehicleId) {
-  const v = await dbAPI.get("vehicles", vehicleId);
-  if (!v) return `<div class="card"><div class="notice">ما لقيت السيارة.</div></div>`;
-
-  const c = await dbAPI.get("customers", v.customerId);
-  const workOrders = (await dbAPI.getAll("workOrders")).filter(w => w.vehicleId === v.id).sort((a,b)=>b.createdAt-a.createdAt);
-  const invoices = await dbAPI.getAll("invoices");
-  const invByWO = new Map(invoices.map(i=>[i.workOrderId,i]));
-
-  const oilInvoices = invoices
-    .filter(i => i.invoiceType === "OIL")
-    .filter(i => workOrders.some(w => w.id === i.workOrderId))
-    .sort((a,b)=>b.createdAt-a.createdAt);
-
-  return `
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:flex-start;flex-wrap:wrap">
-        <div>
-          <div class="section-title">سجل السيارة</div>
-          <div class="small"><b>${escapeHtml(v.plate || "—")}</b> • ${escapeHtml([v.make,v.model,v.year].filter(Boolean).join(" ") || "—")}</div>
-          <div class="small">الزبون: <a href="#/customer?id=${encodeURIComponent(v.customerId)}">${escapeHtml(c?.name || "—")}</a> • ${escapeHtml(c?.phone||"")}</div>
-          <div class="small">عداد: <b>${v.odometer ?? "—"}</b> • دهن جاي: <b>${v.nextOilOdo ?? "—"}</b></div>
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <a class="btn" href="#/vehicles">رجوع</a>
-          <button class="btn" data-act="editVehicle" data-id="${v.id}">تعديل</button>
-          <a class="btn btn-primary" href="#/oil?customerId=${encodeURIComponent(v.customerId)}&vehicleId=${encodeURIComponent(v.id)}">تبديل دهن</a>
-        </div>
-      </div>
-
-      <div class="hr"></div>
-
-      <div class="row">
-        <div class="col">
-          <div class="card subcard">
-            <div class="section-title">تاريخ تبديل الدهن</div>
-            ${oilInvoices.length ? oilInvoices.slice(0, 12).map(inv => `
-              <div class="card subcard" style="margin-bottom:10px">
-                <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
-                  <div>
-                    <div style="font-weight:900">${fmtDay(inv.createdAt)} • فاتورة ${escapeHtml(inv.id)}</div>
-                    <div class="small">حالي: <b>${inv.oil?.currentOdo ?? "—"}</b> • جاي: <b>${inv.oil?.nextOdo ?? "—"}</b></div>
-                  </div>
-                  <button class="btn" data-act="printInvoice" data-id="${inv.id}">طباعة</button>
-                </div>
-              </div>
-            `).join("") : `<div class="notice">ماكو تبديلات دهن مسجلة.</div>`}
-          </div>
-        </div>
-
-        <div class="col">
-          <div class="card subcard">
-            <div class="section-title">تاريخ أوامر الشغل</div>
-            ${workOrders.length ? workOrders.slice(0, 15).map(w => {
-              const inv = invByWO.get(w.id);
-              return `
-                <div class="card subcard" style="margin-bottom:10px">
-                  <div style="display:flex;justify-content:space-between;gap:10px;align-items:center">
-                    <div>
-                      <div style="font-weight:900">${escapeHtml(w.complaint || "—")}</div>
-                      <div class="small">${escapeHtml(w.id)} • ${fmtDate(w.createdAt)} • ${pill(w.status)}</div>
-                      <div class="small">فاتورة: ${inv ? `<b>${escapeHtml(inv.id)}</b> • ${money(inv.total||0)}` : "—"}</div>
-                    </div>
-                    <div style="display:flex;gap:8px;flex-wrap:wrap">
-                      <a class="btn" href="#/order?id=${encodeURIComponent(w.id)}">تفاصيل</a>
-                      ${inv ? `<button class="btn" data-act="printInvoice" data-id="${inv.id}">طباعة</button>` : `<button class="btn" data-act="makeInvoice" data-id="${w.id}">فاتورة</button>`}
-                    </div>
-                  </div>
-                </div>
-              `;
-            }).join("") : `<div class="notice">ماكو أوامر شغل للسيارة.</div>`}
-          </div>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-async function viewOil(params) {
-  const customers = await dbAPI.getAll("customers");
-  const vehicles = await dbAPI.getAll("vehicles");
-  const employees = (await dbAPI.getAll("employees")).filter(e => e.active);
-
-  // preselect from query
-  const preC = params.get("customerId") || "";
-  const preV = params.get("vehicleId") || "";
-
-  const custOptions = customers
-    .sort((a,b)=> (a.name||"").localeCompare(b.name||"", "ar"))
-    .map(c => `<option value="${c.id}" ${preC===c.id ? "selected":""}>${escapeHtml(c.name)} ${c.phone? "• "+escapeHtml(c.phone):""}</option>`)
-    .join("");
-
-  const vehOptions = vehicles
-    .sort((a,b)=> (a.plate||"").localeCompare(b.plate||"", "ar"))
-    .map(v => `<option value="${v.id}" ${preV===v.id ? "selected":""}>${escapeHtml(v.plate || "—")} • ${escapeHtml([v.make,v.model,v.year].filter(Boolean).join(" "))}</option>`)
-    .join("");
-
-  const empOptions = employees
-    .sort((a,b)=> (a.name||"").localeCompare(b.name||"", "ar"))
-    .map(e => `<option value="${e.id}">${escapeHtml(e.name)} • ${escapeHtml(e.specialty||"")}</option>`)
-    .join("");
-
-  return `
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
-        <div>
-          <div class="section-title">تبديل دهن</div>
-          <div class="small">فاتورة جاهزة للطباعة وتحتوي: العداد الحالي + العداد الجاي</div>
-        </div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn btn-primary" data-act="saveOil">حفظ + إنشاء فاتورة</button>
-        </div>
-      </div>
-
-      <div class="hr"></div>
-
-      <div class="grid2">
-        <div>
-          <label class="small">الزبون</label>
-          <select id="oilCustomer" class="input">
-            <option value="">— اختيار —</option>
-            ${custOptions}
-          </select>
-          <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn" data-act="newCustomer">+ زبون</button>
-          </div>
-        </div>
-
-        <div>
-          <label class="small">السيارة</label>
-          <select id="oilVehicle" class="input">
-            <option value="">— اختيار —</option>
-            ${vehOptions}
-          </select>
-          <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
-            <button class="btn" data-act="newVehicle">+ سيارة</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="grid2" style="margin-top:12px">
-        <div>
-          <label class="small">الفني (اختياري)</label>
-          <select id="oilEmployee" class="input">
-            <option value="">— بدون —</option>
-            ${empOptions}
-          </select>
-        </div>
-
-        <div class="notice">
-          نصيحة: خلي فترة الدهن حسب نوع الدهن واستعمال السيارة (5000 / 7000 / 10000).
-        </div>
-      </div>
-
-      <div class="hr"></div>
-
-      <div class="grid3">
-        <div>
-          <label class="small">العداد الحالي</label>
-          <input id="oilCurrentOdo" class="input" inputmode="numeric" placeholder="150000" />
-        </div>
-        <div>
-          <label class="small">فترة التبديل (كم)</label>
-          <select id="oilInterval" class="input">
-            <option value="5000">5000</option>
-            <option value="7000">7000</option>
-            <option value="10000">10000</option>
-          </select>
-        </div>
-        <div>
-          <label class="small">العداد الجاي (ينحسب تلقائي)</label>
-          <input id="oilNextOdo" class="input" inputmode="numeric" placeholder="155000" />
-        </div>
-      </div>
-
-      <div class="grid2" style="margin-top:12px">
-        <div>
-          <label class="small">نوع الدهن (اختياري)</label>
-          <input id="oilType" class="input" placeholder="مثال: 5W-30" />
-        </div>
-        <div>
-          <label class="small">خصم</label>
-          <input id="oilDiscount" class="input" inputmode="numeric" value="0" />
-        </div>
-      </div>
-
-      <div class="hr"></div>
-
-      <div class="grid3">
-        <div>
-          <label class="small">سعر الدهن</label>
-          <input id="oilPrice" class="input" inputmode="numeric" value="0" />
-        </div>
-        <div>
-          <label class="small">سعر الفلتر</label>
-          <input id="oilFilterPrice" class="input" inputmode="numeric" value="0" />
-        </div>
-        <div>
-          <label class="small">أجور الخدمة</label>
-          <input id="oilLabor" class="input" inputmode="numeric" value="0" />
-        </div>
-      </div>
-
-      <div class="grid2" style="margin-top:12px">
-        <div class="notice">
-          بعد الحفظ: راح ينحفظ العداد الحالي ويحدد العداد الجاي داخل سجل السيارة + سجل الزبون.
-        </div>
-        <div>
-          <label class="small">مدفوع</label>
-          <input id="oilPaid" class="input" inputmode="numeric" value="0" />
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-async function viewInventory() {
-  const parts = (await dbAPI.getAll("parts")).sort((a,b)=> (a.name||"").localeCompare(b.name||"", "ar"));
-  const low = parts.filter(p => Number(p.stock||0) <= Number(p.min||0));
-
-  return `
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
-        <div>
-          <div class="section-title">المخزون</div>
-          <div class="small">تقدرين تسوين صرف قطع من تفاصيل أمر الشغل</div>
-        </div>
-        <button class="btn btn-primary" data-act="newPart">+ قطعة</button>
-      </div>
-
-      <div class="hr"></div>
-      ${low.length ? `<div class="notice">⚠️ قطع تحت الحد الأدنى: ${low.length}</div><div class="hr"></div>` : ""}
-
-      ${parts.length ? `
-      <table class="table">
-        <thead>
-          <tr>
-            <th>القطعة</th>
-            <th>SKU</th>
-            <th>شراء</th>
-            <th>بيع</th>
-            <th>الرصيد</th>
-            <th>الحد الأدنى</th>
-            <th>إجراءات</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${parts.map(p => `
-            <tr class="tr">
-              <td><b>${escapeHtml(p.name)}</b></td>
-              <td class="small">${escapeHtml(p.sku || "—")}</td>
-              <td class="small">${money(p.buy || 0)}</td>
-              <td class="small">${money(p.sell || 0)}</td>
-              <td><b>${p.stock ?? 0}</b></td>
-              <td class="small">${p.min ?? 0}</td>
-              <td>
-                <div style="display:flex;gap:8px;flex-wrap:wrap">
-                  <button class="btn" data-act="stockAdd" data-id="${p.id}">+ إضافة</button>
-                  <button class="btn" data-act="stockSub" data-id="${p.id}">- صرف</button>
-                  <button class="btn btn-danger" data-act="deletePart" data-id="${p.id}">حذف</button>
-                </div>
-              </td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>
-      ` : `<div class="notice">بعد ماكو قطع. اضغطي + قطعة.</div>`}
-    </div>
-  `;
-}
-
-async function viewInvoices() {
-  const invoices = (await dbAPI.getAll("invoices")).sort((a,b)=>b.createdAt-a.createdAt);
-  const workOrders = await dbAPI.getAll("workOrders");
-  const customers = await dbAPI.getAll("customers");
-  const vehicles = await dbAPI.getAll("vehicles");
-
-  const woMap = new Map(workOrders.map(w=>[w.id,w]));
-  const cMap = new Map(customers.map(c=>[c.id,c]));
-  const vMap = new Map(vehicles.map(v=>[v.id,v]));
-
-  return `
-    <div class="card">
-      <div class="section-title">الفواتير</div>
-      <div class="small">طباعة مباشرة + مدفوع/متبقي</div>
-      <div class="hr"></div>
-
-      ${invoices.length ? `
-      <table class="table">
-        <thead>
-          <tr>
-            <th>رقم الفاتورة</th>
-            <th>النوع</th>
-            <th>الزبون</th>
-            <th>السيارة</th>
-            <th>المجموع</th>
-            <th>مدفوع</th>
-            <th>متبقي</th>
-            <th>إجراءات</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${invoices.map(inv => {
-            const wo = woMap.get(inv.workOrderId);
-            const c = wo ? cMap.get(wo.customerId) : null;
-            const v = wo ? vMap.get(wo.vehicleId) : null;
-            const rem = Math.max(0, Number(inv.total||0) - Number(inv.paid||0));
-            return `
-              <tr class="tr">
-                <td><b>${escapeHtml(inv.id)}</b><div class="small">${fmtDate(inv.createdAt)}</div></td>
-                <td>${inv.invoiceType === "OIL" ? `<span class="pill progress">تبديل دهن</span>` : `<span class="pill open">عادي</span>`}</td>
-                <td>${escapeHtml(c?.name || "—")}<div class="small">${escapeHtml(c?.phone || "")}</div></td>
-                <td>${escapeHtml(v?.plate || "—")}<div class="small">${escapeHtml([v?.make,v?.model].filter(Boolean).join(" "))}</div></td>
-                <td>${money(inv.total || 0)}</td>
-                <td>${money(inv.paid || 0)}</td>
-                <td>${money(rem)}</td>
-                <td>
-                  <div style="display:flex;gap:8px;flex-wrap:wrap">
-                    <button class="btn" data-act="invoicePay" data-id="${inv.id}">دفعة</button>
-                    <button class="btn btn-primary" data-act="printInvoice" data-id="${inv.id}">طباعة</button>
-                    <button class="btn btn-danger" data-act="deleteInvoice" data-id="${inv.id}">حذف</button>
-                  </div>
-                </td>
-              </tr>
-            `;
-          }).join("")}
-        </tbody>
-      </table>
-      ` : `<div class="notice">ماكو فواتير بعد.</div>`}
-    </div>
-  `;
-}
-
-async function viewEmployees() {
-  const employees = (await dbAPI.getAll("employees")).sort((a,b)=> (a.name||"").localeCompare(b.name||"", "ar"));
-  const active = employees.filter(e => e.active);
-  const monthlyTotal = active.filter(e=>e.salaryType==="شهري").reduce((s,e)=> s + Number(e.salaryAmount||0), 0);
-
-  return `
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
-        <div>
-          <div class="section-title">الموظفين</div>
-          <div class="small">اختصاص + راتب + تفعيل/إيقاف</div>
-        </div>
-        <button class="btn btn-primary" data-act="newEmployee">+ موظف</button>
-      </div>
-
-      <div class="hr"></div>
-
-      <div class="card subcard">
-        <div class="kv"><span>عدد الموظفين (فعّال)</span><b>${active.length}</b></div>
-        <div style="height:8px"></div>
-        <div class="kv"><span>مجموع الرواتب الشهرية (تقريبي)</span><b>${money(monthlyTotal)}</b></div>
-      </div>
-
-      <div class="hr"></div>
-
-      ${employees.length ? `
-      <table class="table">
-        <thead>
-          <tr>
-            <th>الاسم</th>
-            <th>الاختصاص</th>
-            <th>الهاتف</th>
-            <th>الراتب</th>
-            <th>الحالة</th>
-            <th>إجراءات</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${employees.map(e => `
-            <tr class="tr">
-              <td><b>${escapeHtml(e.name)}</b></td>
-              <td class="small">${escapeHtml(e.specialty || "—")}</td>
-              <td class="small">${escapeHtml(e.phone || "—")}</td>
-              <td class="small">${escapeHtml(e.salaryType || "—")} • ${money(e.salaryAmount || 0)}</td>
-              <td>${e.active ? `<span class="pill done">فعّال</span>` : `<span class="pill off">متوقف</span>`}</td>
-              <td>
-                <div style="display:flex;gap:8px;flex-wrap:wrap">
-                  <button class="btn" data-act="editEmployee" data-id="${e.id}">تعديل</button>
-                  <button class="btn" data-act="toggleEmployee" data-id="${e.id}">${e.active ? "إيقاف" : "تفعيل"}</button>
-                  <button class="btn btn-danger" data-act="deleteEmployee" data-id="${e.id}">حذف</button>
-                </div>
-              </td>
-            </tr>
-          `).join("")}
-        </tbody>
-      </table>
-      ` : `<div class="notice">بعد ماكو موظفين.</div>`}
-    </div>
-  `;
-}
-
-async function viewReports() {
-  const invoices = await dbAPI.getAll("invoices");
-  const parts = await dbAPI.getAll("parts");
-  const workOrders = await dbAPI.getAll("workOrders");
-
-  const today = new Date();
-  const startDay = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
-
-  const startMonth = new Date(today.getFullYear(), today.getMonth(), 1).getTime();
-  const endDay = startDay + 86400e3;
-
-  const todayPaid = invoices.filter(i => i.createdAt>=startDay && i.createdAt<endDay).reduce((s,i)=> s + Number(i.paid||0), 0);
-  const monthPaid = invoices.filter(i => i.createdAt>=startMonth).reduce((s,i)=> s + Number(i.paid||0), 0);
-
-  const totalRemaining = invoices.reduce((s,i)=> s + Math.max(0, Number(i.total||0)-Number(i.paid||0)), 0);
-
-  // Parts profit estimate: sum(qty*(sell-buy)) for issued part lines in workOrders
-  const pMap = new Map(parts.map(p=>[p.id,p]));
-  let partsProfit = 0;
-  for (const wo of workOrders) {
-    const lines = Array.isArray(wo.partLines) ? wo.partLines : [];
-    for (const ln of lines) {
-      const p = pMap.get(ln.partId);
-      if (!p) continue;
-      const qty = Number(ln.qty||0);
-      const sell = Number(ln.unit||0);
-      const buy = Number(p.buy||0);
-      partsProfit += qty * Math.max(0, sell - buy);
-    }
   }
-
-  const oilCountMonth = invoices.filter(i => i.invoiceType==="OIL" && i.createdAt>=startMonth).length;
-
-  return `
-    <div class="card">
-      <div class="section-title">التقارير</div>
-      <div class="small">تقارير سريعة (ممكن نوسعها أكثر بعدين)</div>
-      <div class="hr"></div>
-
-      <div class="cards">
-        <div class="card"><div class="card-title">مدفوع اليوم</div><div class="card-value">${money(todayPaid)}</div></div>
-        <div class="card"><div class="card-title">مدفوع هذا الشهر</div><div class="card-value">${money(monthPaid)}</div></div>
-        <div class="card"><div class="card-title">مبالغ متبقية (ديون)</div><div class="card-value">${money(totalRemaining)}</div></div>
-        <div class="card"><div class="card-title">عدد تبديل دهن هذا الشهر</div><div class="card-value">${oilCountMonth}</div></div>
-      </div>
-
-      <div class="hr"></div>
-
-      <div class="card subcard">
-        <div class="kv"><span>ربح قطع (تقديري)</span><b>${money(partsProfit)}</b></div>
-        <div class="small" style="margin-top:8px">
-          الربح محسوب من (بيع - شراء) للقطع المصروفة داخل أوامر الشغل.
-        </div>
-      </div>
-    </div>
-  `;
 }
 
-async function viewBackup() {
-  return `
-    <div class="card">
-      <div class="section-title">نسخ احتياطي</div>
-      <div class="small">تصدير/استيراد كل الداتا (JSON)</div>
-      <div class="hr"></div>
+// ---------- Employees ----------
+async function renderEmployees(params){
+  if(!requireRole("admin")) return;
+  const isNew = params.get("new")==="1";
+  view.innerHTML = viewHeader("الموظفين", "إدارة أسماء وأدوار الموظفين (للتعيين على أوامر الشغل)");
 
-      <div class="row">
-        <div class="col">
-          <div class="card subcard">
-            <div class="section-title">Export</div>
-            <div class="small">تنزيل نسخة احتياطية</div>
-            <div class="hr"></div>
-            <button class="btn btn-primary" data-act="export">تصدير</button>
+  view.innerHTML += `
+    <div class="row">
+      <div class="card">
+        <div class="row-actions" style="justify-content:space-between;">
+          <div>
+            <div class="section-title">القائمة</div>
+            <div class="small">بحث بالاسم/الدور</div>
           </div>
+          <button id="btnNewEmp" class="btn btn-primary">+ موظف</button>
         </div>
-
-        <div class="col">
-          <div class="card subcard">
-            <div class="section-title">Import</div>
-            <div class="small">استيراد نسخة (تستبدل الحالية)</div>
-            <div class="hr"></div>
-            <input type="file" id="importFile" class="input" accept="application/json" />
-            <div style="height:10px"></div>
-            <button class="btn" data-act="import">استيراد</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="hr"></div>
-
-      <div class="card subcard" style="border:1px solid #fecaca">
-        <div class="section-title" style="color:var(--bad)">Reset</div>
-        <div class="small">حذف كل البيانات</div>
         <div class="hr"></div>
-        <button class="btn btn-danger" data-act="reset">حذف الكل</button>
+        <div id="empList" class="notice">... تحميل</div>
       </div>
+      <div id="empEditor" class="card subcard hidden"></div>
     </div>
   `;
-}
 
-async function viewMore() {
-  return `
-    <div class="card">
-      <div class="section-title">المزيد</div>
-      <div class="small">روابط للموبايل</div>
-      <div class="hr"></div>
+  $("#btnNewEmp").addEventListener("click", ()=> openEmpEditor(null));
 
-      <div class="grid2">
-        <a class="btn" href="#/customers">الزباين</a>
-        <a class="btn" href="#/vehicles">السيارات</a>
-        <a class="btn" href="#/invoices">الفواتير</a>
-        <a class="btn" href="#/employees">الموظفين</a>
-        <a class="btn" href="#/reports">التقارير</a>
-        <a class="btn" href="#/backup">نسخ احتياطي</a>
-      </div>
+  onSnapshot(query(C.employees(), orderBy("createdAt","desc"), limit(400)), (snap)=>{
+    const rows=[]; snap.forEach(d=> rows.push({id:d.id, ...d.data()}));
+    const filtered = rows.filter(e => matchSearch(`${e.name} ${e.role}`));
 
-      <div class="hr"></div>
-      <div class="notice">
-        إذا تحبين نضيف: تصميم طباعة أحلى (شعار/هاتف/عنوان)، أو ربط تبديل الدهن بالمخزون حتى ينخصم زيت/فلتر تلقائياً.
-      </div>
-    </div>
-  `;
-}
+    $("#empList").outerHTML = `<div id="empList">
+      ${filtered.map(e=>`
+        <div class="kv" style="margin:10px 0;">
+          <span><b>${escapeHtml(e.name||"")}</b><div class="small">${escapeHtml(e.role||"")}</div></span>
+          <button class="btn btn-soft" data-ee="${e.id}">فتح</button>
+        </div>
+      `).join("") || `<div class="notice">لا توجد نتائج</div>`}
+    </div>`;
 
-/* ------------------------ Render ------------------------ */
-async function renderRoute() {
-  const { route, params } = parseHash();
-  state.route = route;
+    $$("[data-ee]").forEach(b=> b.addEventListener("click", ()=>{
+      const obj = rows.find(x=>x.id===b.dataset.ee);
+      openEmpEditor(obj);
+    }));
+    if(isNew) openEmpEditor(null);
+  });
 
-  setTitle(route);
-  setActiveNav(route);
-
-  const d = new Date();
-  $("#todayBadge").textContent = `اليوم: ${d.toLocaleDateString("ar-IQ")}`;
-
-  const view = $("#view");
-  view.innerHTML = `<div class="notice">... جاري التحميل</div>`;
-
-  let html = "";
-  if (route === "dashboard") html = await viewDashboard();
-  if (route === "checkin") html = await viewCheckin();
-  if (route === "orders") html = await viewOrders();
-  if (route === "order") html = await viewOrderDetails(params.get("id") || "");
-  if (route === "customers") html = await viewCustomers(params);
-  if (route === "customer") html = await viewCustomerDetails(params.get("id") || "");
-  if (route === "vehicles") html = await viewVehicles();
-  if (route === "vehicle") html = await viewVehicleDetails(params.get("id") || "");
-  if (route === "oil") html = await viewOil(params);
-  if (route === "inventory") html = await viewInventory();
-  if (route === "invoices") html = await viewInvoices();
-  if (route === "employees") html = await viewEmployees();
-  if (route === "reports") html = await viewReports();
-  if (route === "backup") html = await viewBackup();
-  if (route === "more") html = await viewMore();
-
-  view.innerHTML = html;
-
-  // Oil: auto-calc next odo
-  if (route === "oil") {
-    const cur = $("#oilCurrentOdo");
-    const interval = $("#oilInterval");
-    const next = $("#oilNextOdo");
-
-    const recalc = () => {
-      const c = Number(cur.value || 0);
-      const it = Number(interval.value || 5000);
-      if (c > 0) next.value = String(c + it);
-    };
-
-    cur?.addEventListener("input", recalc);
-    interval?.addEventListener("change", recalc);
-
-    // if query has vehicleId, prefill odometer & nextOil
-    const { params: ps } = parseHash();
-    const vId = ps.get("vehicleId");
-    if (vId) {
-      const v = await dbAPI.get("vehicles", vId);
-      if (v?.odometer) cur.value = String(v.odometer);
-      if (v?.nextOilOdo) next.value = String(v.nextOilOdo);
-      if (v?.odometer && !v?.nextOilOdo) recalc();
+  function openEmpEditor(emp){
+    const box = $("#empEditor");
+    box.classList.remove("hidden");
+    if(!emp){
+      box.innerHTML = `
+        <div class="section-title">موظف جديد</div>
+        <div class="hr"></div>
+        <form id="fEmpNew" class="grid3">
+          ${formRow("الاسم", input("name","","text","اسم"))}
+          ${formRow("الدور", input("role","","text","ميكانيكي/كهربائي/..."))}
+          <div class="row-actions" style="grid-column:1/-1;">
+            <button class="btn btn-primary" type="submit">حفظ</button>
+            <button id="btnClose" class="btn btn-soft" type="button">إغلاق</button>
+          </div>
+        </form>
+      `;
+      $("#btnClose").addEventListener("click", ()=> box.classList.add("hidden"));
+      $("#fEmpNew").addEventListener("submit", async (e)=>{
+        e.preventDefault();
+        const data = getFormData(e.target);
+        if(!data.name) return toast("أدخلي الاسم", "bad");
+        await createDoc(C.employees(), { name:data.name, role:data.role||"" });
+        toast("تم حفظ الموظف", "good");
+        box.classList.add("hidden");
+      });
+      return;
     }
+
+    box.innerHTML = `
+      <div class="section-title">تعديل موظف</div>
+      <div class="small">${escapeHtml(emp.name||"")}</div>
+      <div class="hr"></div>
+      <form id="fEmpEdit" class="grid3">
+        ${formRow("الاسم", input("name",emp.name||""))}
+        ${formRow("الدور", input("role",emp.role||""))}
+        <div class="row-actions" style="grid-column:1/-1;">
+          <button class="btn btn-primary" type="submit">حفظ</button>
+          <button id="btnDel" class="btn btn-danger" type="button">حذف</button>
+          <button id="btnClose" class="btn btn-soft" type="button">إغلاق</button>
+        </div>
+      </form>
+    `;
+    $("#btnClose").addEventListener("click", ()=> box.classList.add("hidden"));
+    $("#fEmpEdit").addEventListener("submit", async (e)=>{
+      e.preventDefault();
+      const data = getFormData(e.target);
+      await updateDocSafe(doc(db,"employees",emp.id), { name:data.name||"", role:data.role||"" });
+      toast("تم التحديث", "good");
+      box.classList.add("hidden");
+    });
+    $("#btnDel").addEventListener("click", async ()=>{
+      if(!confirm("حذف الموظف؟")) return;
+      await deleteDocSafe(doc(db,"employees",emp.id));
+      toast("تم الحذف", "good");
+      box.classList.add("hidden");
+    });
   }
 }
 
-/* ------------------------ Global Events ------------------------ */
-document.addEventListener("click", async (e) => {
-  const t = e.target;
+// ---------- Reports ----------
+async function renderReports(params){
+  if(!requireRole("admin")) return;
+  view.innerHTML = viewHeader("التقارير", "تقارير يومية/فترة (مبسطة)");
 
-  // Modal open/close
-  if (t?.id === "btnNew") return $("#modal").classList.remove("hidden");
-  if (t?.id === "modalClose") return $("#modal").classList.add("hidden");
-  if (t?.id === "modal") return $("#modal").classList.add("hidden");
+  view.innerHTML += `
+    <div class="card">
+      <div class="section-title">تقرير المبيعات</div>
+      <div class="small">اختاري فترة</div>
+      <div class="hr"></div>
+      <form id="fRep" class="row">
+        ${formRow("من", input("from", todayISO(),"date"))}
+        ${formRow("إلى", input("to", todayISO(),"date"))}
+        <div class="row-actions" style="grid-column:1/-1;">
+          <button class="btn btn-primary" type="submit">عرض</button>
+        </div>
+      </form>
+      <div id="repOut" class="notice" style="margin-top:12px;">—</div>
+    </div>
+  `;
 
-  // Quick actions
-  const q = t?.dataset?.quick;
-  if (q) {
-    $("#modal").classList.add("hidden");
-    if (q === "checkin") location.hash = "#/checkin";
-    if (q === "oil") location.hash = "#/oil";
-    if (q === "customer") return createCustomer();
-    if (q === "vehicle") return createVehicle();
-    if (q === "employee") return createEmployee();
-    if (q === "part") return createPart();
+  $("#fRep").addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    const data = getFormData(e.target);
+    const from = data.from||""; const to = data.to||"";
+    const snap = await getDocs(query(C.invoices(), orderBy("date","desc"), limit(800)));
+    const rows=[]; snap.forEach(d=> rows.push({id:d.id, ...d.data()}));
+    const within = rows.filter(i=> inRange((i.date||"").slice(0,10), from, to));
+    const total = within.reduce((s,i)=> s+Number(i.total||0), 0);
+    $("#repOut").textContent = `عدد الفواتير: ${within.length} — المجموع: ${fmtMoney(total)}`;
+  });
+}
+
+// ---------- Backup (Export JSON) ----------
+async function renderBackup(params){
+  if(!requireRole("admin")) return;
+  view.innerHTML = viewHeader("نسخ احتياطي", "تصدير/استيراد JSON بسيط (يدوي)");
+
+  view.innerHTML += `
+    <div class="card">
+      <div class="section-title">تصدير</div>
+      <div class="small">ينتج ملف JSON يمكن حفظه محليًا</div>
+      <div class="hr"></div>
+      <div class="row-actions">
+        <button id="btnExport" class="btn btn-primary">تصدير الآن</button>
+        <button id="btnImportHelp" class="btn btn-soft">إرشادات الاستيراد</button>
+      </div>
+      <pre id="backupOut" class="notice" style="margin-top:12px;white-space:pre-wrap;max-height:320px;overflow:auto;"></pre>
+    </div>
+  `;
+
+  $("#btnImportHelp").addEventListener("click", ()=>{
+    toast("الاستيراد غير مفعّل تلقائيًا لتفادي الأخطاء. إذا تريدينه أضيفه لك.", "good");
+  });
+
+  $("#btnExport").addEventListener("click", async ()=>{
+    const cols = ["customers","vehicles","employees","inventory","checkins","orders","invoices","users"];
+    const out = {};
+    for(const name of cols){
+      const snap = await getDocs(query(collection(db,name), limit(2000)));
+      out[name] = [];
+      snap.forEach(d=> out[name].push({id:d.id, ...d.data()}));
+    }
+    out.meta = { exportedAt: new Date().toISOString(), settings: SETTINGS };
+    const jsonStr = JSON.stringify(out, null, 2);
+    $("#backupOut").textContent = jsonStr;
+
+    // download
+    const blob = new Blob([jsonStr], {type:"application/json"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `rpm-backup-${todayISO()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+}
+
+// ---------- Settings ----------
+async function renderSettings(params){
+  if(!requireRole("admin")) return;
+  view.innerHTML = viewHeader("إعدادات الفاتورة", "الاسم/الهاتف/العنوان/الضريبة/بادئة الفاتورة");
+
+  view.innerHTML += `
+    <div class="card">
+      <div class="section-title">الإعدادات</div>
+      <div class="hr"></div>
+      <form id="fSettings" class="grid3">
+        ${formRow("اسم الورشة", input("shopName", SETTINGS.shopName||""))}
+        ${formRow("الهاتف", input("phone", SETTINGS.phone||""))}
+        ${formRow("بادئة الفاتورة", input("invoicePrefix", SETTINGS.invoicePrefix||"INV-"))}
+        <div class="col" style="grid-column:1/-1">
+          <div class="small">العنوان</div>
+          ${textarea("address", SETTINGS.address||"")}
+        </div>
+        ${formRow("ضريبة %", input("vatPercent", SETTINGS.vatPercent||0,"number"))}
+        <div class="row-actions" style="grid-column:1/-1;">
+          <button class="btn btn-primary" type="submit">حفظ</button>
+        </div>
+      </form>
+    </div>
+  `;
+
+  $("#fSettings").addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    const data = getFormData(e.target);
+    SETTINGS = {
+      shopName: data.shopName||"",
+      phone: data.phone||"",
+      address: data.address||"",
+      invoicePrefix: data.invoicePrefix||"INV-",
+      vatPercent: Number(data.vatPercent||0)
+    };
+    await setDoc(C.settings(), SETTINGS, {merge:true});
+    toast("تم حفظ الإعدادات", "good");
+  });
+}
+
+// ---------- Admin panel (users/roles) ----------
+async function renderAdmin(params){
+  if(!requireRole("admin")) return;
+  view.innerHTML = viewHeader("لوحة الأدمن", "تحديد صلاحيات المستخدمين (حسب UID)");
+
+  view.innerHTML += `
+    <div class="card">
+      <div class="section-title">المستخدمون</div>
+      <div class="small">قم بإضافة وثيقة في users/{uid} أو استخدم نموذج التعديل أدناه</div>
+      <div class="hr"></div>
+
+      <form id="fUserRole" class="grid3">
+        ${formRow("UID", input("uid","","text","UID من Firebase Auth"))}
+        ${formRow("Email", input("email","","text","اختياري"))}
+        ${formRow("Role", select("role", [{value:"viewer",label:"viewer"},{value:"staff",label:"staff"},{value:"admin",label:"admin"}], "staff"))}
+        <div class="row-actions" style="grid-column:1/-1;">
+          <button class="btn btn-primary" type="submit">حفظ الدور</button>
+        </div>
+      </form>
+
+      <div class="hr"></div>
+      <div id="usersList" class="notice">... تحميل</div>
+    </div>
+  `;
+
+  $("#fUserRole").addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    const data = getFormData(e.target);
+    if(!data.uid) return toast("أدخلي UID", "bad");
+    await setDoc(doc(db,"users",data.uid), { email:data.email||"", role:data.role||"viewer", updatedAt: serverTimestamp() }, {merge:true});
+    toast("تم حفظ الدور", "good");
+    e.target.reset();
+  });
+
+  onSnapshot(query(C.users(), limit(200)), (snap)=>{
+    const rows=[]; snap.forEach(d=> rows.push({id:d.id, ...d.data()}));
+    $("#usersList").outerHTML = `<div id="usersList">
+      ${rows.map(u=>`
+        <div class="kv" style="margin:10px 0;">
+          <span><b>${escapeHtml(u.email||"—")}</b><div class="small">UID: ${escapeHtml(u.id)} — Role: ${escapeHtml(u.role||"viewer")}</div></span>
+        </div>
+      `).join("") || `<div class="notice">لا يوجد مستخدمون</div>`}
+    </div>`;
+  });
+}
+
+// ---------- Router ----------
+const routes = {
+  "dashboard": renderDashboard,
+  "checkin": renderCheckin,
+  "orders": renderOrders,
+  "customers": renderCustomers,
+  "vehicles": renderVehicles,
+  "oil": renderOil,
+  "inventory": renderInventory,
+  "invoices": renderInvoices,
+  "employees": renderEmployees,
+  "reports": renderReports,
+  "backup": renderBackup,
+  "settings": renderSettings,
+  "admin": renderAdmin
+};
+
+function parseHash(){
+  const raw = (location.hash || "#/dashboard").slice(2);
+  const [path, qs] = raw.split("?");
+  const params = new URLSearchParams(qs||"");
+  return { path: path || "dashboard", params };
+}
+
+async function route(){
+  const {path, params} = parseHash();
+  setActiveNav(path);
+  const fn = routes[path] || renderDashboard;
+  try{
+    await fn(params);
+  }catch(err){
+    console.error(err);
+    view.innerHTML = `<div class="notice">حدث خطأ: ${escapeHtml(err.message||String(err))}</div>`;
   }
+}
 
-  // Sidebar mobile toggle
-  if (t?.id === "btnMenu") return $("#sidebar").classList.toggle("open");
-
-  const act = t?.dataset?.act;
-  const id = t?.dataset?.id;
-  const idx = t?.dataset?.idx;
-
-  if (act === "newCustomer") return createCustomer();
-  if (act === "editCustomer") return editCustomer(id);
-  if (act === "deleteCustomer") return deleteCustomer(id);
-  if (act === "newVehicle") return createVehicle();
-  if (act === "newVehicleForCustomer") return createVehicle(id);
-  if (act === "editVehicle") return editVehicle(id);
-  if (act === "deleteVehicle") return deleteVehicle(id);
-
-  if (act === "newEmployee") return createEmployee();
-  if (act === "editEmployee") return editEmployee(id);
-  if (act === "toggleEmployee") return toggleEmployee(id);
-  if (act === "deleteEmployee") return deleteEmployee(id);
-
-  if (act === "newPart") return createPart();
-  if (act === "stockAdd") return adjustStock(id, +1);
-  if (act === "stockSub") return adjustStock(id, -1);
-  if (act === "deletePart") return deletePart(id);
-
-  if (act === "createWO") return createWorkOrderFromCheckin();
-  if (act === "deleteWO") return deleteWorkOrder(id);
-  if (act === "makeInvoice") return createInvoiceForWO(id);
-
-  if (act === "invoicePay") return payInvoice(id);
-  if (act === "deleteInvoice") return deleteInvoice(id);
-  if (act === "printInvoice") return printInvoiceById(id);
-
-  if (act === "export") return exportAll();
-  if (act === "import") return importAll();
-  if (act === "reset") return resetAll();
-
-  if (act === "saveOil") return createOilChangeInvoice();
-
-  // Order detail actions (selects)
-  if (act === "setStatus") {
-    const select = t;
-    return setOrderStatus(id, select.value);
+// ---------- Init ----------
+onAuthStateChanged(auth, async (user)=>{
+  CURRENT_USER = user;
+  if(!user){
+    showAuth();
+    return;
   }
-  if (act === "setEmployee") {
-    const select = t;
-    return setOrderEmployee(id, select.value);
-  }
+  showApp();
+  userBadge.textContent = user.email || user.uid;
 
-  if (act === "addLabor") return addLaborLine(id);
-  if (act === "removeLabor") return removeLaborLine(id, Number(idx));
+  await loadSettings();
+  await ensureCounters();
+  CURRENT_ROLE = await getUserRole(user.uid);
 
-  if (act === "addPartToWO") {
-    const partId = $("#odPart").value;
-    const qty = $("#odQty").value;
-    if (!partId) return alert("اختاري قطعة.");
-    return addPartLine(id, partId, qty);
-  }
-  if (act === "removePartLine") return removePartLine(id, Number(idx));
+  // hide admin-only nav
+  $$(".nav-item").forEach(a=>{
+    if(a.dataset.route==="admin" || a.dataset.route==="employees" || a.dataset.route==="reports" || a.dataset.route==="backup" || a.dataset.route==="settings"){
+      a.style.display = can("admin") ? "" : "none";
+    }
+  });
+
+  subscribeCore();
+  route();
 });
 
-$("#globalSearch").addEventListener("input", () => {
-  state.search = $("#globalSearch").value || "";
-  const r = parseHash().route;
-  // rerender for pages where search makes sense
-  if (["orders","customers","vehicles","inventory"].includes(r)) renderRoute();
-});
-
-$("#btnSeed").addEventListener("click", seedDemo);
-window.addEventListener("hashchange", () => { $("#sidebar").classList.remove("open"); renderRoute(); });
-
-/* ------------------------ Init ------------------------ */
-(async function init() {
-  await openDB();
-  if (!location.hash) location.hash = "#/dashboard";
-  renderRoute();
-})();
+window.route = route;
+window.addEventListener("hashchange", route);
+route();
