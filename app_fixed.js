@@ -3,13 +3,12 @@
 // ضعي apiKey الخاص بمشروعك داخل firebaseConfig.
 
 const firebaseConfig = {
-  apiKey: "AIzaSyC0p4cqNHuqZs9_gNuKLl7nEY0MqRXbf_A",
+  apiKey: "PUT_YOUR_API_KEY_HERE",
   authDomain: "rpm574.firebaseapp.com",
-  databaseURL: "https://rpm574-default-rtdb.firebaseio.com",
   projectId: "rpm574",
   storageBucket: "rpm574.firebasestorage.app",
   messagingSenderId: "150918603525",
-  appId: "1:150918603525:web:fe1d0fbe5c4505936c4d6c"
+  appId: "1:150918603525:web:95c93b1498d869d46c4d6c",
 };
 
 let auth, db;
@@ -1042,4 +1041,3 @@ function bindAll(){
   }
   showAuth(true);
 })();
-
