@@ -69,6 +69,29 @@ const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 const el = (tag, attrs = {}, children = []) => {
   const n = document.createElement(tag);
+
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") n.className = v;
+    else if (k === "html") n.innerHTML = v ?? "";
+    else if (k === "style") n.style.cssText = v ?? "";
+    else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== null) n.setAttribute(k, String(v));
+  }
+
+  // يدعم: string/number/boolean/Node/arrays/nested arrays ويتجاهل null/undefined/false
+  const flat = (arr) => arr.flat ? arr.flat(Infinity) : [].concat(...arr);
+  const list = Array.isArray(children) ? flat(children) : [children];
+
+  for (const c of list) {
+    if (c === null || c === undefined || c === false) continue;
+    if (c instanceof Node) n.appendChild(c);
+    else n.appendChild(document.createTextNode(String(c)));
+  }
+
+  return n;
+};
+
+  const n = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs || {})) {
     if (k === "class") n.className = v;
     else if (k === "html") n.innerHTML = v;
@@ -2517,4 +2540,5 @@ init();
      }
    }
 */
+
 
