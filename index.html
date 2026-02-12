@@ -4,48 +4,25 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#0b1220" />
-  <title>RPM — إدارة الورشة</title>
+  <title>RPM — Workshop</title>
   <link rel="stylesheet" href="./styles.css" />
 </head>
-
 <body>
   <div class="appShell">
     <aside class="sidebar" id="sidebar">
       <div class="brand">
         <div class="brandMark">
           <span class="dot"></span>
-          <span class="txt">RPM</span>
+          <span class="txt" id="brandName">RPM</span>
         </div>
-        <div class="brandSub">نظام إدارة الورشة</div>
+        <div class="brandSub" id="brandSub">نظام إدارة الورشة — Firestore</div>
       </div>
 
-      <nav class="nav">
-        <button class="navItem" data-route="#/dashboard">
-          <span class="ico">🏠</span><span>لوحة التحكم</span>
-        </button>
-        <button class="navItem" data-route="#/customers">
-          <span class="ico">👤</span><span>الزبائن</span>
-        </button>
-        <button class="navItem" data-route="#/cars">
-          <span class="ico">🚗</span><span>السيارات</span>
-        </button>
-        <button class="navItem" data-route="#/workorders">
-          <span class="ico">🧰</span><span>أوامر العمل</span>
-        </button>
-        <button class="navItem" data-route="#/invoices">
-          <span class="ico">🧾</span><span>الفواتير</span>
-        </button>
-        <button class="navItem" data-route="#/reports">
-          <span class="ico">📊</span><span>التقارير</span>
-        </button>
-        <button class="navItem" data-route="#/settings">
-          <span class="ico">⚙️</span><span>الإعدادات</span>
-        </button>
-      </nav>
+      <nav class="nav" id="nav"></nav>
 
       <div class="sideFoot">
-        <div class="pill" id="netPill">⏳ جاري التهيئة</div>
-        <div class="muted small" id="buildInfo">Front-end فقط + Firebase</div>
+        <div class="pill" id="netPill">⏳ تهيئة...</div>
+        <div class="muted small" id="userPill">—</div>
       </div>
     </aside>
 
@@ -58,7 +35,7 @@
         </div>
 
         <div class="topActions">
-          <button class="btn" id="btnQuickAdd">+ إضافة سريعة</button>
+          <button class="btn" id="btnQuickAdd">+ إضافة</button>
           <button class="iconBtn" id="btnSync" title="تحديث">⟳</button>
           <button class="iconBtn" id="btnUser" title="الحساب">👤</button>
         </div>
@@ -66,13 +43,7 @@
 
       <main class="view" id="view"></main>
 
-      <footer class="mobileNav mobileOnly">
-        <button data-route="#/dashboard">🏠</button>
-        <button data-route="#/customers">👤</button>
-        <button data-route="#/invoices">🧾</button>
-        <button data-route="#/reports">📊</button>
-        <button data-route="#/settings">⚙️</button>
-      </footer>
+      <footer class="mobileNav mobileOnly" id="mobileNav"></footer>
     </div>
   </div>
 
