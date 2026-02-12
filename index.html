@@ -4,34 +4,12 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>RPM — Workshop ERP</title>
-  <meta name="theme-color" content="#0b1220" />
   <link rel="stylesheet" href="styles.css" />
-
-  <!-- Font (optional) -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;800&display=swap" rel="stylesheet">
+  <meta name="theme-color" content="#0b1220" />
 </head>
 
 <body>
-  <noscript>
-    <div style="padding:16px; font-family:system-ui; direction:rtl;">
-      هذا التطبيق يحتاج JavaScript ليعمل.
-    </div>
-  </noscript>
-
-  <div id="app">
-    <div class="boot">
-      <div class="bootCard">
-        <div class="logoMark">RPM</div>
-        <div class="bootText">
-          <div class="bootTitle">جارِ تشغيل النظام…</div>
-          <div class="bootSub">Workshop ERP</div>
-        </div>
-        <div class="bootBar"><span></span></div>
-      </div>
-    </div>
-  </div>
+  <div id="app"></div>
 
   <!-- Toast -->
   <div id="toastHost" class="toastHost" aria-live="polite" aria-atomic="true"></div>
@@ -39,6 +17,7 @@
   <!-- Modal Host -->
   <div id="modalHost" class="modalHost hidden"></div>
 
+  <!-- IMPORTANT: must be module -->
   <script type="module" src="app.js"></script>
 </body>
 </html>
