@@ -3,69 +3,37 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>نظام الوليم RPM</title>
-  <link rel="stylesheet" href="styles.css" />
+  <title>RPM - نظام الورشة</title>
+  <link rel="stylesheet" href="styles_new.css" />
+  <!-- Firebase (v9 compat) عبر CDN -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
 </head>
 <body>
-  <!-- Auth Screen -->
-  <div id="authScreen" class="auth-screen">
-    <div class="auth-card">
-      <div class="auth-title">نظام الوليم RPM</div>
-      <div class="auth-sub">تسجيل الدخول</div>
-
-      <label class="small">البريد الإلكتروني</label>
-      <input id="loginEmail" class="input" type="email" autocomplete="username" placeholder="name@example.com" />
-
-      <label class="small" style="margin-top:10px;">كلمة المرور</label>
-      <input id="loginPass" class="input" type="password" autocomplete="current-password" placeholder="••••••••" />
-
-      <div class="row-actions" style="margin-top:12px;">
-        <button id="btnLogin" class="btn btn-primary">دخول</button>
-        <button id="btnLoginDemo" class="btn btn-soft" title="للاختبار">بيانات تجريبية</button>
-      </div>
-
-      <div class="notice" style="margin-top:12px;">
-        ملاحظة: فعّلي Email/Password من Firebase Auth. أول حساب تُنشئينه كأدمن عبر Firestore (أو استخدمي زر “تهيئة أول أدمن” بعد الدخول).
-      </div>
-
-      <div class="row-actions" style="margin-top:12px;">
-        <button id="btnBootstrapAdmin" class="btn">تهيئة أول أدمن</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- App Shell -->
-  <div id="appShell" class="app hidden">
-    <aside id="sidebar" class="sidebar">
+  <div class="app-shell">
+    <aside class="sidebar" id="sidebar">
       <div class="brand">
-        <div class="brand-title">RPM</div>
-        <div class="brand-sub">نظام الوليم</div>
+        <div class="brand-logo">RPM</div>
+        <div class="brand-sub">حسن الوليم</div>
       </div>
 
-      <nav class="nav">
-        <a class="nav-item active" data-route="dashboard" href="#/dashboard">لوحة التحكم</a>
-        <a class="nav-item" data-route="checkin" href="#/checkin">الاستقبال</a>
-        <a class="nav-item" data-route="orders" href="#/orders">أوامر الشغل</a>
-        <a class="nav-item" data-route="customers" href="#/customers">الزباين</a>
-        <a class="nav-item" data-route="vehicles" href="#/vehicles">السيارات</a>
-        <a class="nav-item" data-route="oil" href="#/oil">تبديل دهن</a>
-        <a class="nav-item" data-route="inventory" href="#/inventory">المخزون</a>
-        <a class="nav-item" data-route="invoices" href="#/invoices">الفواتير</a>
-        <a class="nav-item" data-route="employees" href="#/employees">الموظفين</a>
-        <a class="nav-item" data-route="reports" href="#/reports">التقارير</a>
-        <a class="nav-item" data-route="backup" href="#/backup">نسخ احتياطي</a>
-
-        <div class="nav-sep"></div>
-
-        <a class="nav-item" data-route="settings" href="#/settings">إعدادات الفاتورة</a>
-        <a class="nav-item" data-route="admin" href="#/admin">لوحة الأدمن</a>
+      <nav class="nav" id="nav">
+        <button class="nav-item active" data-route="dashboard">لوحة التحكم</button>
+        <button class="nav-item" data-route="reception">الاستقبال</button>
+        <button class="nav-item" data-route="workorders">أمر تشغيلي</button>
+        <button class="nav-item" data-route="customers">الزبائن</button>
+        <button class="nav-item" data-route="cars">السيارات</button>
+        <button class="nav-item" data-route="admin" id="adminNav">إعدادات الأدمن</button>
       </nav>
 
       <div class="sidebar-footer">
-        <div class="small" id="userBadge">—</div>
-        <div class="row-actions" style="margin-top:10px;">
-          <button id="btnNew" class="btn btn-primary">+</button>
-          <button id="btnLogout" class="btn btn-soft">خروج</button>
+        <div class="userbox">
+          <div class="userbox-label">الحساب:</div>
+          <div class="userbox-value" id="userEmail">غير مسجل</div>
+        </div>
+        <div class="sidebar-actions">
+          <button class="btn btn-ghost" id="btnSignOut">تسجيل خروج</button>
         </div>
       </div>
     </aside>
@@ -73,57 +41,369 @@
     <main class="main">
       <header class="topbar">
         <div class="topbar-left">
-          <button id="btnMenu" class="iconbtn" aria-label="menu">☰</button>
-          <div>
-            <div id="pageTitle" class="page-title">لوحة التحكم</div>
-            <div id="todayBadge" class="small">—</div>
-          </div>
+          <button class="btn btn-ghost mobile-only" id="btnToggleSidebar">☰</button>
+          <h1 class="title" id="pageTitle">لوحة التحكم</h1>
         </div>
-
         <div class="topbar-right">
-          <input id="globalSearch" class="input search" placeholder="بحث..." />
-          <button id="btnSeed" class="btn btn-soft" title="بيانات تجريبية">Seed</button>
+          <span class="badge" id="roleBadge">زائر</span>
+          <span class="badge badge-ok" id="firebaseBadge">Firebase: غير مرتبط</span>
         </div>
       </header>
 
-      <section id="view" class="view">
-        <div class="notice">... جاري التحميل</div>
+      <!-- شاشة تسجيل الدخول -->
+      <section class="card auth-card" id="authCard">
+        <h2>تسجيل الدخول</h2>
+        <p class="muted">سجلي دخولك حتى تشتغل كل الميزات (Firebase Auth).</p>
+        <div class="grid2">
+          <div>
+            <label>البريد الإلكتروني</label>
+            <input id="loginEmail" type="email" placeholder="name@email.com" />
+          </div>
+          <div>
+            <label>كلمة المرور</label>
+            <input id="loginPassword" type="password" placeholder="••••••••" />
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn" id="btnLogin">دخول</button>
+          <button class="btn btn-secondary" id="btnRegister">إنشاء حساب</button>
+        </div>
+        <div class="hint">
+          <div>ملاحظة: الأدمن يتحدد من Firestore داخل <code>users/{uid}</code> بحقل <code>role</code> = <code>admin</code>.</div>
+        </div>
+        <div class="msg" id="authMsg"></div>
       </section>
 
-      <div class="tabs">
-        <a class="tab active" data-route="dashboard" href="#/dashboard">الرئيسية</a>
-        <a class="tab" data-route="orders" href="#/orders">أوامر</a>
-        <a class="tab" data-route="customers" href="#/customers">زباين</a>
-        <a class="tab" data-route="vehicles" href="#/vehicles">سيارات</a>
-        <a class="tab" data-route="more" href="#/more">المزيد</a>
-      </div>
+      <!-- الصفحات -->
+      <section class="page" id="page-dashboard">
+        <div class="cards">
+          <div class="card">
+            <h3>ملخص سريع</h3>
+            <ul class="kpi">
+              <li><span>الزبائن</span><b id="kpiCustomers">—</b></li>
+              <li><span>السيارات</span><b id="kpiCars">—</b></li>
+              <li><span>الطلبات المفتوحة</span><b id="kpiOpenOrders">—</b></li>
+            </ul>
+            <div class="muted">تتحدّث تلقائياً من Firestore.</div>
+          </div>
+
+          <div class="card">
+            <h3>بحث سريع</h3>
+            <p class="muted">اكتبي رقم لوحة سيارة لمعرفة الزبون، أو اسم/هاتف للعثور على سيارة.</p>
+            <div class="row">
+              <input id="quickSearch" placeholder="بحث: لوحة / هاتف / اسم" />
+              <button class="btn" id="btnQuickSearch">بحث</button>
+            </div>
+            <div class="results" id="quickResults"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="page hidden" id="page-reception">
+        <div class="card">
+          <h2>الاستقبال</h2>
+          <p class="muted">اختاري زبون بالبحث أو أدخليه يدويًا. وبنفس الطريقة للسيارة.</p>
+
+          <div class="split">
+            <div>
+              <h3>الزبون</h3>
+              <div class="row">
+                <input id="rxCustomerSearch" placeholder="بحث زبون: اسم / هاتف / لوحة" />
+                <button class="btn btn-secondary" id="rxCustomerClear">تفريغ</button>
+              </div>
+              <div class="results" id="rxCustomerResults"></div>
+
+              <div class="grid2">
+                <div>
+                  <label>اسم الزبون (إجباري)</label>
+                  <input id="rxCustomerName" placeholder="مثال: أحمد علي" />
+                </div>
+                <div>
+                  <label>هاتف الزبون</label>
+                  <input id="rxCustomerPhone" placeholder="07xxxxxxxxx" />
+                </div>
+              </div>
+              <div class="muted small">إذا اخترتِ زبون من البحث، يمتلأ الحقل تلقائياً، وتكدرين تعدّلينه.</div>
+            </div>
+
+            <div>
+              <h3>السيارة</h3>
+              <div class="row">
+                <input id="rxCarSearch" placeholder="بحث سيارة: لوحة / ماركة / اسم صاحب" />
+                <button class="btn btn-secondary" id="rxCarClear">تفريغ</button>
+              </div>
+              <div class="results" id="rxCarResults"></div>
+
+              <div class="grid2">
+                <div>
+                  <label>رقم اللوحة</label>
+                  <input id="rxPlate" placeholder="مثال: بغداد 12345" />
+                </div>
+                <div>
+                  <label>الماركة / الموديل</label>
+                  <input id="rxCarModel" placeholder="Toyota Camry" />
+                </div>
+              </div>
+              <div class="grid2">
+                <div>
+                  <label>سنة الصنع</label>
+                  <input id="rxCarYear" type="number" placeholder="2020" />
+                </div>
+                <div>
+                  <label>ملاحظات</label>
+                  <input id="rxNotes" placeholder="وصف سريع" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="row">
+            <button class="btn" id="btnCreateReception">إنشاء استقبال</button>
+            <div class="msg" id="rxMsg"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>آخر عمليات الاستقبال (10)</h3>
+          <div class="table" id="rxTable"></div>
+        </div>
+      </section>
+
+      <section class="page hidden" id="page-workorders">
+        <div class="card">
+          <h2>أمر تشغيلي</h2>
+          <p class="muted">نفس منطق الاستقبال + اختيار قسم.</p>
+
+          <div class="split">
+            <div>
+              <h3>الزبون</h3>
+              <div class="row">
+                <input id="woCustomerSearch" placeholder="بحث زبون: اسم / هاتف / لوحة" />
+                <button class="btn btn-secondary" id="woCustomerClear">تفريغ</button>
+              </div>
+              <div class="results" id="woCustomerResults"></div>
+
+              <div class="grid2">
+                <div>
+                  <label>اسم الزبون (إجباري)</label>
+                  <input id="woCustomerName" />
+                </div>
+                <div>
+                  <label>هاتف الزبون</label>
+                  <input id="woCustomerPhone" />
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <h3>السيارة</h3>
+              <div class="row">
+                <input id="woCarSearch" placeholder="بحث سيارة: لوحة / ماركة / اسم صاحب" />
+                <button class="btn btn-secondary" id="woCarClear">تفريغ</button>
+              </div>
+              <div class="results" id="woCarResults"></div>
+
+              <div class="grid2">
+                <div>
+                  <label>رقم اللوحة</label>
+                  <input id="woPlate" />
+                </div>
+                <div>
+                  <label>الماركة / الموديل</label>
+                  <input id="woCarModel" />
+                </div>
+              </div>
+              <div class="grid2">
+                <div>
+                  <label>سنة الصنع</label>
+                  <input id="woCarYear" type="number" />
+                </div>
+                <div>
+                  <label>القسم</label>
+                  <select id="woDept"></select>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="grid3">
+            <div>
+              <label>أجرة العمل</label>
+              <input id="woLabor" type="number" placeholder="0" />
+            </div>
+            <div>
+              <label>قطع الغيار</label>
+              <input id="woParts" type="number" placeholder="0" />
+            </div>
+            <div>
+              <label>الإجمالي</label>
+              <input id="woTotal" type="number" placeholder="0" disabled />
+            </div>
+          </div>
+
+          <div class="row">
+            <input id="woNotes" placeholder="ملاحظات الأمر التشغيلي" />
+          </div>
+
+          <div class="row">
+            <button class="btn" id="btnCreateWorkOrder">إنشاء أمر تشغيلي</button>
+            <div class="msg" id="woMsg"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h3>آخر أوامر التشغيل (10)</h3>
+          <div class="table" id="woTable"></div>
+        </div>
+      </section>
+
+      <section class="page hidden" id="page-customers">
+        <div class="card">
+          <h2>الزبائن</h2>
+          <div class="row">
+            <input id="custSearch" placeholder="بحث: اسم / هاتف / لوحة سيارة" />
+            <button class="btn" id="btnCustSearch">بحث</button>
+            <button class="btn btn-secondary" id="btnCustNew">زبون جديد</button>
+          </div>
+          <div class="results" id="custResults"></div>
+
+          <div class="divider"></div>
+
+          <h3 id="custFormTitle">إضافة/تعديل زبون</h3>
+          <div class="grid2">
+            <div>
+              <label>الاسم</label>
+              <input id="custName" />
+            </div>
+            <div>
+              <label>الهاتف</label>
+              <input id="custPhone" />
+            </div>
+          </div>
+          <div class="row">
+            <button class="btn" id="btnCustSave">حفظ</button>
+            <button class="btn btn-ghost" id="btnCustDelete">حذف</button>
+            <div class="msg" id="custMsg"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="page hidden" id="page-cars">
+        <div class="card">
+          <h2>السيارات</h2>
+          <div class="row">
+            <input id="carSearch" placeholder="بحث: لوحة / ماركة / اسم صاحب / هاتف" />
+            <button class="btn" id="btnCarSearch">بحث</button>
+            <button class="btn btn-secondary" id="btnCarNew">سيارة جديدة</button>
+          </div>
+          <div class="results" id="carResults"></div>
+
+          <div class="divider"></div>
+
+          <h3 id="carFormTitle">إضافة/تعديل سيارة</h3>
+          <div class="grid2">
+            <div>
+              <label>رقم اللوحة</label>
+              <input id="carPlate" />
+            </div>
+            <div>
+              <label>الماركة / الموديل</label>
+              <input id="carModel" />
+            </div>
+          </div>
+          <div class="grid2">
+            <div>
+              <label>سنة الصنع</label>
+              <input id="carYear" type="number" />
+            </div>
+            <div>
+              <label>المالك (بحث)</label>
+              <input id="carOwnerSearch" placeholder="اسم / هاتف" />
+            </div>
+          </div>
+          <div class="results" id="carOwnerResults"></div>
+          <div class="row">
+            <button class="btn" id="btnCarSave">حفظ</button>
+            <button class="btn btn-ghost" id="btnCarDelete">حذف</button>
+            <div class="msg" id="carMsg"></div>
+          </div>
+          <div class="muted small">يمكن ربط السيارة بزبون موجود أو إنشاء زبون جديد من صفحة الزبائن.</div>
+        </div>
+      </section>
+
+      <section class="page hidden" id="page-admin">
+        <div class="card">
+          <h2>إعدادات الأدمن</h2>
+          <p class="muted">إضافة/حذف أقسام + رواتب الموظفين + إظهار/إخفاء صفحات النظام.</p>
+          <div class="msg" id="adminMsg"></div>
+        </div>
+
+        <div class="cards">
+          <div class="card">
+            <h3>الأقسام</h3>
+            <div class="row">
+              <input id="deptName" placeholder="اسم القسم" />
+              <button class="btn" id="btnDeptAdd">إضافة</button>
+            </div>
+            <div class="table" id="deptTable"></div>
+          </div>
+
+          <div class="card">
+            <h3>إظهار/إخفاء الصفحات</h3>
+            <div class="grid2" id="sectionsBox"></div>
+            <div class="row">
+              <button class="btn" id="btnSaveSections">حفظ الإعدادات</button>
+              <span class="muted small">يتم حفظها في Firestore: <code>uiConfig/main</code></span>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3>رواتب الموظفين</h3>
+            <div class="grid2">
+              <div>
+                <label>اسم الموظف</label>
+                <input id="empName" />
+              </div>
+              <div>
+                <label>هاتف</label>
+                <input id="empPhone" />
+              </div>
+            </div>
+            <div class="grid3">
+              <div>
+                <label>نوع الراتب</label>
+                <select id="empType">
+                  <option value="monthly">شهري</option>
+                  <option value="daily">يومي</option>
+                  <option value="hourly">بالساعة</option>
+                </select>
+              </div>
+              <div>
+                <label>قيمة الراتب</label>
+                <input id="empAmount" type="number" placeholder="0" />
+              </div>
+              <div>
+                <label>ملاحظات</label>
+                <input id="empNotes" placeholder="اختياري" />
+              </div>
+            </div>
+            <div class="row">
+              <button class="btn" id="btnEmpSave">حفظ</button>
+              <button class="btn btn-ghost" id="btnEmpDelete">حذف</button>
+            </div>
+            <div class="table" id="empTable"></div>
+          </div>
+        </div>
+      </section>
+
+      <footer class="footer muted">
+        <span>RPM Workshop System</span>
+        <span>•</span>
+        <span id="buildInfo">v0.1</span>
+      </footer>
     </main>
   </div>
 
-  <!-- Quick Actions Modal -->
-  <div id="modal" class="modal hidden">
-    <div class="modal-card">
-      <div class="modal-head">
-        <div>
-          <div class="section-title">إضافة سريعة</div>
-          <div class="small">اختاري إجراء</div>
-        </div>
-        <button id="modalClose" class="iconbtn">✕</button>
-      </div>
-
-      <div class="grid2" style="margin-top:10px;">
-        <button class="btn" data-quick="checkin">استقبال</button>
-        <button class="btn" data-quick="oil">تبديل دهن</button>
-        <button class="btn" data-quick="customer">+ زبون</button>
-        <button class="btn" data-quick="vehicle">+ سيارة</button>
-        <button class="btn" data-quick="employee">+ موظف</button>
-        <button class="btn" data-quick="part">+ قطعة</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="toast" class="toast hidden"></div>
-
-  <script type="module" src="app.js"></script>
+  <script src="app_new.js"></script>
 </body>
 </html>
