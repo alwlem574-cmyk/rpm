@@ -1,31 +1,52 @@
-/**
- * RPM Workshop ERP (3 files فقط)
- * - Frontend SPA يعمل على GitHub Pages
- * - Firebase Auth + Firestore
- *
- * قبل التشغيل:
- * 1) Firebase Console -> Authentication -> Email/Password = Enabled
- * 2) Firebase Console -> Firestore Database = Enabled
- * 3) ضع firebaseConfig بالأسفل
- *
- * ملاحظة أمنية:
- * هذا الكود يطبّق صلاحيات على الواجهة.
- * للأمان الحقيقي لازم Firestore Rules (أرفقتها لك داخل تعليق في الأسفل).
- */
+/* RPM — Workshop ERP (Firestore-first)
+   =========================================================
+   ✅ Features:
+   - SPA hash router (GitHub Pages friendly)
+   - Auth (email/password)
+   - Roles & Permissions (admin/manager/tech/viewer + custom overrides)
+   - Orders (work orders) + Auto-create Customer & Car
+   - Oil Change page (fast workflow) + update car KM next
+   - Invoices CRUD + invoice numbering via meta/invoiceCounter (transaction)
+   - Invoice Templates CRUD + live preview + print
+   - Admin: Users, Employees, Departments, Settings, UI Pages (editable without touching code)
+   - Reads/writes from Firestore collections you listed:
+     cars, customers, departments, employees, invoiceTemplates, invoices,
+     meta, orders, settings, uiConfig, users
+
+   ⚠️ IMPORTANT:
+   - Put your apiKey below.
+   - Ensure Firestore rules allow according to roles (client-side checks are NOT enough).
+*/
 
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
 import {
-  getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, updateProfile
+  getAuth,
+  onAuthStateChanged,
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  sendPasswordResetEmail,
+  signOut,
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 import {
-  getFirestore, collection, doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc,
-  getDocs, query, where, orderBy, limit, serverTimestamp, writeBatch,
-  runTransaction, increment
+  getFirestore,
+  collection,
+  doc,
+  getDoc,
+  setDoc,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  serverTimestamp,
+  query,
+  where,
+  orderBy,
+  limit,
+  getDocs,
+  onSnapshot,
+  runTransaction,
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
-/* =========================
-   Firebase Config (ضعه هنا)
-========================= */
+/* ---------- Firebase Config (fill apiKey!) ---------- */
 const firebaseConfig = {
   apiKey: "AIzaSyC0p4cqNHuqZs9_gNuKLl7nEY0MqRXbf_A",
   authDomain: "rpm574.firebaseapp.com",
@@ -36,2906 +57,2463 @@ const firebaseConfig = {
   appId: "1:150918603525:web:fe1d0fbe5c4505936c4d6c"
 };
 
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-
-/* =========================
-   Helpers
-========================= */
-const $ = (sel, root=document) => root.querySelector(sel);
-const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
-const uid = () => Math.random().toString(16).slice(2) + Date.now().toString(16);
-const pad = (n, w=6) => String(n).padStart(w, "0");
-const nowISO = () => new Date().toISOString().slice(0,19).replace("T"," ");
-const money = (v, currency="IQD") => {
-  const x = Number(v||0);
-  try { return new Intl.NumberFormat("ar-IQ",{maximumFractionDigits:0}).format(x) + " " + currency; }
-  catch { return x + " " + currency; }
-};
-const escapeHtml = (s="") => String(s)
-  .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
-  .replaceAll('"',"&quot;").replaceAll("'","&#039;");
-
-function toast(title, message=""){
-  const host = $("#toastHost");
-  const el = document.createElement("div");
-  el.className = "toast";
-  el.innerHTML = `<div class="t">${escapeHtml(title)}</div><div class="m">${escapeHtml(message)}</div>`;
-  host.appendChild(el);
-  setTimeout(()=> el.remove(), 4200);
-}
-
-function modal({title, bodyHTML, footerHTML, onMount}){
-  const host = $("#modalHost");
-  host.classList.remove("hidden");
-  host.innerHTML = `
-    <div class="modal" role="dialog" aria-modal="true">
-      <div class="modalHeader">
-        <div>
-          <div class="modalTitle">${escapeHtml(title||"")}</div>
-          <div class="smallMuted">${escapeHtml(nowISO())}</div>
-        </div>
-        <button class="btn ghost small" data-x>إغلاق</button>
-      </div>
-      <div class="modalBody">${bodyHTML||""}</div>
-      <div class="modalFooter">${footerHTML||""}</div>
-    </div>`;
-  host.addEventListener("click", (e)=>{
-    if(e.target === host) closeModal();
-    if(e.target?.dataset?.x != null) closeModal();
-  }, { once:false });
-
-  const closeModal = () => { host.classList.add("hidden"); host.innerHTML=""; window.removeEventListener("keydown", onEsc); };
-  const onEsc = (e)=>{ if(e.key==="Escape") closeModal(); };
-  window.addEventListener("keydown", onEsc);
-
-  onMount?.(host, closeModal);
-  return closeModal;
-}
-
-function htmlToText(s=""){ return String(s).replace(/<[^>]*>/g," ").replace(/\s+/g," ").trim(); }
-
-function hashRoute(){
-  const h = location.hash.replace(/^#\/?/,"");
-  const [path, qs] = h.split("?");
-  const params = Object.fromEntries(new URLSearchParams(qs||"").entries());
-  return { path: path || "dashboard", params };
-}
-
-async function safeConfirm(msg){
-  return confirm(msg);
-}
-
-/* =========================
-   App State
-========================= */
-const State = {
-  user: null,
-  profile: null,      // users/{uid}
-  role: "guest",
-  settings: null,     // settings/app
-  templates: [],      // invoiceTemplates
-  customPages: [],    // customPages
-};
-
-/* =========================
-   Firestore Helpers
-========================= */
-async function getOne(ref){
-  const snap = await getDoc(ref);
-  return snap.exists() ? { id:snap.id, ...snap.data() } : null;
-}
-async function listCol(colName, {whereArr=[], orderArr=null, lim=200}={}){
-  let qy = collection(db, colName);
-  const clauses = [];
-  for(const w of whereArr) clauses.push(where(...w));
-  if(orderArr) clauses.push(orderBy(...orderArr));
-  clauses.push(limit(lim));
-  const qq = query(qy, ...clauses);
-  const sn = await getDocs(qq);
-  return sn.docs.map(d => ({ id:d.id, ...d.data() }));
-}
-async function addCol(colName, data){
-  const ref = await addDoc(collection(db, colName), { ...data, createdAt: serverTimestamp(), updatedAt: serverTimestamp() });
-  return ref.id;
-}
-async function setDocId(colName, id, data, merge=true){
-  await setDoc(doc(db, colName, id), { ...data, updatedAt: serverTimestamp() }, { merge });
-}
-async function upd(colName, id, data){
-  await updateDoc(doc(db, colName, id), { ...data, updatedAt: serverTimestamp() });
-}
-async function del(colName, id){
-  await deleteDoc(doc(db, colName, id));
-}
-
-async function audit(action, entity, entityId, before=null, after=null){
-  try{
-    const by = State.user?.uid || "unknown";
-    await addDoc(collection(db, "auditLogs"), {
-      action, entity, entityId,
-      by,
-      before, after,
-      at: serverTimestamp(),
-      email: State.user?.email || ""
-    });
-  }catch(e){ /* ignore */ }
-}
-
-/* =========================
-   Settings & Seed
-========================= */
-const DEFAULT_SETTINGS = {
-  workshopName: "RPM Workshop",
-  phone: "",
-  address: "",
+const APP = {
+  name: "RPM",
+  subtitle: "Workshop ERP",
   currency: "IQD",
-  taxRate: 0,                 // نسبة (مثلاً 5)
-  invoicePrefix: "INV",
-  woPrefix: "WO",
-  numberWidth: 6,
-  stockConsumePolicy: "invoice_create", // invoice_create | invoice_paid
-  defaultInvoiceTemplateId: "default_ar",
+  version: "2026.02.12",
 };
 
-const DEFAULT_TEMPLATES = [
-  {
-    id: "default_ar",
-    name: "قالب عربي — عام",
-    css: `
-      body{font-family:Tahoma,Arial;direction:rtl;padding:18px}
-      h2{margin:0 0 6px 0}
-      .muted{color:#555;font-size:12px}
-      hr{border:0;border-top:1px solid #ddd;margin:12px 0}
-      .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-      table{width:100%;border-collapse:collapse;margin-top:10px}
-      th,td{border-bottom:1px solid #eee;padding:8px 10px;text-align:right}
-      th{background:#f7f7f7}
-      .sum{margin-top:12px;display:flex;justify-content:flex-start}
-      .sum div{min-width:240px}
-    `.trim(),
-    html: `
-      <h2>فاتورة خدمة — {{workshopName}}</h2>
-      <div class="muted">رقم الفاتورة: <b>{{invoiceNo}}</b> • التاريخ: {{date}}</div>
-      <hr/>
-      <div class="grid">
-        <div>
-          <h3 style="margin:0 0 6px 0;font-size:14px">الزبون</h3>
-          <div>الاسم: <b>{{customerName}}</b></div>
-          <div>الهاتف: {{customerPhone}}</div>
-        </div>
-        <div>
-          <h3 style="margin:0 0 6px 0;font-size:14px">السيارة</h3>
-          <div>اللوحة: <b>{{plate}}</b></div>
-          <div>الموديل: {{carModel}}</div>
-          <div>السنة: {{carYear}}</div>
-          <div>كم: {{km}}</div>
-        </div>
-      </div>
-
-      <hr/>
-      <h3 style="margin:0 0 6px 0;font-size:14px">تفاصيل الخدمات والقطع</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>النوع</th>
-            <th>الوصف</th>
-            <th>الكمية</th>
-            <th>سعر الوحدة</th>
-            <th>المجموع</th>
-          </tr>
-        </thead>
-        <tbody>
-          {{#items}}
-          <tr>
-            <td>{{type}}</td>
-            <td>{{name}}</td>
-            <td>{{qty}}</td>
-            <td>{{price}}</td>
-            <td>{{lineTotal}}</td>
-          </tr>
-          {{/items}}
-        </tbody>
-      </table>
-
-      <div class="sum">
-        <div>
-          <div>المجموع: <b>{{subTotal}}</b></div>
-          <div>خصم: {{discount}}</div>
-          <div>ضريبة: {{tax}}</div>
-          <div style="margin-top:8px;font-size:16px">الإجمالي: <b>{{grandTotal}}</b></div>
-          <div class="muted" style="margin-top:8px">ملاحظات: {{notes}}</div>
-        </div>
-      </div>
-    `.trim()
-  },
-  {
-    id: "oil_change_ar",
-    name: "قالب عربي — تبديل دهن",
-    css: `
-      body{font-family:Tahoma,Arial;direction:rtl;padding:18px}
-      h2{margin:0 0 6px 0}
-      .muted{color:#555;font-size:12px}
-      .tag{display:inline-block;padding:4px 10px;border-radius:999px;background:#f2f2ff;border:1px solid #c7c7ff;font-size:12px}
-      hr{border:0;border-top:1px solid #ddd;margin:12px 0}
-      .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-      table{width:100%;border-collapse:collapse;margin-top:10px}
-      th,td{border-bottom:1px solid #eee;padding:8px 10px;text-align:right}
-      th{background:#f7f7f7}
-    `.trim(),
-    html: `
-      <h2>فاتورة خدمة — تبديل دهن</h2>
-      <div class="muted">رقم الفاتورة: <b>{{invoiceNo}}</b> • التاريخ: {{date}} • <span class="tag">RPM</span></div>
-      <hr/>
-
-      <div class="grid">
-        <div>
-          <h3 style="margin:0 0 6px 0;font-size:14px">الزبون</h3>
-          <div>الاسم: <b>{{customerName}}</b></div>
-          <div>الهاتف: {{customerPhone}}</div>
-        </div>
-        <div>
-          <h3 style="margin:0 0 6px 0;font-size:14px">السيارة</h3>
-          <div>اللوحة: <b>{{plate}}</b></div>
-          <div>الموديل: {{carModel}}</div>
-          <div>كم: {{km}}</div>
-        </div>
-      </div>
-
-      <hr/>
-      <table>
-        <thead>
-          <tr>
-            <th>النوع</th>
-            <th>الوصف</th>
-            <th>الكمية</th>
-            <th>سعر الوحدة</th>
-            <th>المجموع</th>
-          </tr>
-        </thead>
-        <tbody>
-          {{#items}}
-          <tr>
-            <td>{{type}}</td>
-            <td>{{name}}</td>
-            <td>{{qty}}</td>
-            <td>{{price}}</td>
-            <td>{{lineTotal}}</td>
-          </tr>
-          {{/items}}
-        </tbody>
-      </table>
-
-      <hr/>
-      <div style="font-size:16px">الإجمالي: <b>{{grandTotal}}</b></div>
-      <div class="muted" style="margin-top:6px">ملاحظات: {{notes}}</div>
-    `.trim()
+/* ---------- DOM Helpers ---------- */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+const el = (tag, attrs = {}, children = []) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") n.className = v;
+    else if (k === "html") n.innerHTML = v;
+    else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
+    else if (v !== undefined && v !== null) n.setAttribute(k, v);
   }
-];
+  for (const c of (children || [])) n.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+  return n;
+};
 
-async function ensureSeed(){
-  // settings/app
-  const sRef = doc(db, "settings", "app");
-  const s = await getOne(sRef);
-  if(!s){
-    await setDoc(sRef, { ...DEFAULT_SETTINGS, createdAt: serverTimestamp(), updatedAt: serverTimestamp() }, { merge:true });
-  }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // invoiceTemplates seed
-  const existing = await listCol("invoiceTemplates", { lim: 50 });
-  if(existing.length === 0){
-    const batch = writeBatch(db);
-    for(const t of DEFAULT_TEMPLATES){
-      batch.set(doc(db, "invoiceTemplates", t.id), { name:t.name, html:t.html, css:t.css, builtIn:true, createdAt:serverTimestamp(), updatedAt:serverTimestamp() }, { merge:true });
-    }
-    await batch.commit();
-  }
+/* ---------- Toast ---------- */
+const toastHost = () => $("#toastHost");
+function toast(title, msg = "", type = "ok") {
+  const t = el("div", { class: `toast ${type}` }, [
+    el("div", { class: "t" }, [title]),
+    msg ? el("div", { class: "s" }, [msg]) : el("div")
+  ]);
+  toastHost()?.appendChild(t);
+  setTimeout(() => t.remove(), 4200);
 }
 
-/* =========================
-   Auth & User Profile
-========================= */
-async function loadProfile(uid){
-  const pRef = doc(db, "users", uid);
-  let p = await getOne(pRef);
-  if(!p){
-    // أول مستخدم يسجّل دخول/يسوي حساب نخليه Admin تلقائياً إذا ماكو أي user docs
-    const anyUsers = await listCol("users", { lim: 2 });
-    const role = anyUsers.length === 0 ? "admin" : "staff";
-    p = {
-      id: uid,
-      uid,
-      email: State.user?.email || "",
-      name: State.user?.displayName || "",
-      role,
-      isActive: true,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp()
-    };
-    await setDoc(pRef, p, { merge:true });
-  }
-  return p;
-}
+/* ---------- Modal ---------- */
+const modalHost = () => $("#modalHost");
+function openModal(title, bodyNode, actions = []) {
+  const host = modalHost();
+  host.classList.remove("hidden");
+  host.innerHTML = "";
 
-/* =========================
-   Numbering (WO & Invoice)
-========================= */
-async function nextNumber(kind){
-  // kind: "invoice" | "wo" | "po"
-  const key = kind + "Counter";
-  const sRef = doc(db, "settings", "app");
-  const res = await runTransaction(db, async (tx)=>{
-    const snap = await tx.get(sRef);
-    const data = snap.exists() ? snap.data() : { ...DEFAULT_SETTINGS };
-    const current = Number(data[key] || 0) + 1;
-    tx.set(sRef, { [key]: current, updatedAt: serverTimestamp() }, { merge:true });
-    return { current, data };
-  });
-  const year = new Date().getFullYear();
-  const w = Number(res.data.numberWidth || 6);
-  const prefix =
-    kind === "invoice" ? (res.data.invoicePrefix||"INV") :
-    kind === "wo" ? (res.data.woPrefix||"WO") :
-    "PO";
-  return `${prefix}-${year}-${pad(res.current, w)}`;
-}
-
-/* =========================
-   Upsert Customer + Vehicle (من أمر الشغل)
-========================= */
-async function upsertCustomerAndVehicle({customerName, customerPhone, plate, carModel, carYear, vin, km}){
-  let customerId = null;
-
-  // 1) حاول بالهاتف
-  if(customerPhone){
-    const hit = await listCol("customers", { whereArr: [["phone","==",customerPhone]], lim: 1 });
-    if(hit[0]) customerId = hit[0].id;
-  }
-
-  // 2) إذا ماكو، أنشئ زبون جديد
-  if(!customerId){
-    customerId = await addCol("customers", {
-      name: customerName || "زبون جديد",
-      phone: customerPhone || "",
-      note: "",
-      createdBy: State.user?.uid || ""
-    });
-    await audit("create", "customers", customerId, null, { name:customerName, phone:customerPhone });
-  } else {
-    // تحديث بسيط للاسم إذا تغيّر
-    await upd("customers", customerId, { name: customerName || "" });
-  }
-
-  // Vehicle: حاول باللوحة ضمن نفس الزبون
-  let vehicleId = null;
-  if(plate){
-    const vh = await listCol("vehicles", { whereArr: [["customerId","==",customerId], ["plate","==",plate]], lim: 1 });
-    if(vh[0]) vehicleId = vh[0].id;
-  }
-  if(!vehicleId){
-    vehicleId = await addCol("vehicles", {
-      customerId,
-      plate: plate || "",
-      model: carModel || "",
-      year: carYear || "",
-      vin: vin || "",
-      km: Number(km||0),
-      createdBy: State.user?.uid || ""
-    });
-    await audit("create", "vehicles", vehicleId, null, { plate, model:carModel });
-  } else {
-    await upd("vehicles", vehicleId, {
-      model: carModel || "",
-      year: carYear || "",
-      vin: vin || "",
-      km: Number(km||0),
-    });
-  }
-
-  return { customerId, vehicleId };
-}
-
-/* =========================
-   Templates Engine (Mini Mustache)
-   - supports {{key}}
-   - supports {{#items}}...{{/items}} list
-========================= */
-function renderTemplate(html, data){
-  let out = html;
-
-  // list block
-  out = out.replace(/\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g, (_, key, inner)=>{
-    const arr = data[key];
-    if(!Array.isArray(arr) || arr.length===0) return "";
-    return arr.map(item=>{
-      let chunk = inner;
-      chunk = chunk.replace(/\{\{(\w+)\}\}/g, (m,k)=> escapeHtml(item?.[k] ?? ""));
-      return chunk;
-    }).join("");
-  });
-
-  // scalars
-  out = out.replace(/\{\{(\w+)\}\}/g, (_, k)=> escapeHtml(data[k] ?? ""));
-  return out;
-}
-
-/* =========================
-   UI Shell
-========================= */
-const ROOT = $("#app");
-
-function iconDot(){ return `<span class="pill" style="padding:4px 8px">•</span>`; }
-
-function requireAdmin(){
-  if(State.role !== "admin"){
-    toast("صلاحية غير كافية", "هذه الصفحة للأدمن فقط.");
-    location.hash = "#/dashboard";
-    return false;
-  }
-  return true;
-}
-
-function pageLayout({title, subtitle, actionsHTML=""}){
-  return `
-    <div class="topbar">
-      <div class="left">
-        <div>
-          <div class="h1">${escapeHtml(title||"")}</div>
-          <div class="meta">${escapeHtml(subtitle||"")}</div>
-        </div>
-      </div>
-      <div class="btnRow">${actionsHTML}</div>
-    </div>
-    <div id="pageBody" class="main"></div>
-  `;
-}
-
-/* =========================
-   Router + Pages Registry
-   - يدعم Custom Pages من Firestore بدون تعديل ملفات لاحقاً
-========================= */
-const BuiltinPages = [
-  { id:"dashboard", title:"لوحة التحكم", hint:"ملخص سريع", adminOnly:false },
-  { id:"workorders", title:"أوامر الشغل", hint:"إنشاء + متابعة + تحويل لفاتورة", adminOnly:false },
-  { id:"invoices", title:"الفواتير", hint:"تعديل + طباعة + قوالب", adminOnly:false },
-  { id:"inventory", title:"المخزون", hint:"قطع الغيار + تنبيه نفاد", adminOnly:false },
-  { id:"purchases", title:"المشتريات", hint:"فاتورة شراء + تحديث مخزون", adminOnly:false },
-  { id:"suppliers", title:"الموردين", hint:"إدارة الموردين", adminOnly:false },
-  { id:"customers", title:"الزبائن والسيارات", hint:"إدارة عامة", adminOnly:false },
-  { id:"reports", title:"التقارير", hint:"مبيعات + مخزون", adminOnly:false },
-  { id:"users", title:"المستخدمين والصلاحيات", hint:"Admin فقط", adminOnly:true },
-  { id:"templates", title:"قوالب الفواتير", hint:"محرر + معاينة", adminOnly:true },
-  { id:"pages", title:"صفحات إضافية", hint:"إنشاء صفحات بدون تعديل الكود", adminOnly:true },
-  { id:"audit", title:"سجل التدقيق", hint:"من عدّل ماذا؟", adminOnly:true },
-  { id:"settings", title:"الإعدادات", hint:"ترقيم + ضريبة + سياسة مخزون", adminOnly:true },
-];
-
-function navHTML(){
-  const r = hashRoute().path;
-  const show = (p)=> !p.adminOnly || State.role==="admin";
-  const links = BuiltinPages.filter(show).map(p=>{
-    const active = r===p.id ? "active" : "";
-    return `<a class="${active}" href="#/${p.id}">
-      <span>${escapeHtml(p.title)}<br><small>${escapeHtml(p.hint||"")}</small></span>
-      <span>${iconDot()}</span>
-    </a>`;
-  }).join("");
-
-  const custom = (State.customPages||[])
-    .filter(p => (p.visibility||"admin") === "admin" ? (State.role==="admin") : true)
-    .map(p=>{
-      const active = r===`page/${p.slug}` ? "active" : "";
-      return `<a class="${active}" href="#/page/${encodeURIComponent(p.slug)}">
-        <span>${escapeHtml(p.title)}<br><small>صفحة مخصصة</small></span>
-        <span>${iconDot()}</span>
-      </a>`;
-    }).join("");
-
-  return `
-    <div class="sidebar">
-      <div class="brand">
-        <div class="logo">
-          <div style="width:36px;height:36px;border-radius:14px;background:rgba(124,92,255,.2);border:1px solid rgba(124,92,255,.35);display:flex;align-items:center;justify-content:center;font-weight:950">RPM</div>
-          <div>
-            <div class="title">${escapeHtml(State.settings?.workshopName || "RPM")}</div>
-            <div class="sub">Workshop ERP • ${escapeHtml(State.role)}</div>
-          </div>
-        </div>
-        <span class="badge">⛽🛠️</span>
-      </div>
-
-      <div class="nav">
-        ${links}
-        ${custom ? `<hr/>${custom}` : ""}
-      </div>
-
-      <div class="sidebarFooter">
-        <div class="badge">المستخدم: ${escapeHtml(State.user?.email||"")}</div>
-        <div class="btnRow">
-          <button class="btn small ghost" id="btnRefresh">تحديث</button>
-          <button class="btn small danger" id="btnLogout">تسجيل خروج</button>
-        </div>
-      </div>
-    </div>
-  `;
-}
-
-function shellHTML(){
-  return `
-    <div class="shell">
-      ${navHTML()}
-      <div class="main">
-        <div id="routeOutlet"></div>
-      </div>
-    </div>
-  `;
-}
-
-async function renderShell(){
-  ROOT.innerHTML = shellHTML();
-  $("#btnLogout").onclick = async ()=>{ await signOut(auth); };
-  $("#btnRefresh").onclick = async ()=>{ await bootstrap(true); };
-}
-
-async function route(){
-  const { path, params } = hashRoute();
-
-  // custom page route
-  if(path.startsWith("page/")){
-    const slug = decodeURIComponent(path.slice(5));
-    await renderCustomPage(slug);
-    setActiveNav();
-    return;
-  }
-
-  switch(path){
-    case "dashboard": await renderDashboard(); break;
-    case "workorders": await renderWorkOrders(); break;
-    case "invoices": await renderInvoices(); break;
-    case "inventory": await renderInventory(); break;
-    case "purchases": await renderPurchases(); break;
-    case "suppliers": await renderSuppliers(); break;
-    case "customers": await renderCustomers(); break;
-    case "reports": await renderReports(); break;
-    case "users": await renderUsers(); break;
-    case "templates": await renderTemplates(); break;
-    case "pages": await renderPagesManager(); break;
-    case "audit": await renderAudit(); break;
-    case "settings": await renderSettings(); break;
-    default:
-      location.hash = "#/dashboard";
-  }
-  setActiveNav();
-}
-
-function setActiveNav(){
-  const r = hashRoute().path;
-  $$(".nav a").forEach(a=>{
-    const href = a.getAttribute("href")||"";
-    const clean = href.replace(/^#\/?/,"");
-    a.classList.toggle("active", clean === r);
-  });
-}
-
-/* =========================
-   Login UI
-========================= */
-function loginUI(){
-  ROOT.innerHTML = `
-    <div class="loginShell">
-      <div class="loginCard">
-        <div class="loginTitle">RPM — تسجيل الدخول</div>
-        <div class="loginSub">Email/Password (Firebase Auth)</div>
-        <hr/>
-        <label>البريد</label>
-        <input class="input" id="email" placeholder="admin@rpm.com" />
-        <label>كلمة المرور</label>
-        <input class="input" id="pass" type="password" placeholder="••••••••" />
-        <label>اسم (اختياري لأول حساب)</label>
-        <input class="input" id="name" placeholder="قمر" />
-        <div class="btnRow" style="margin-top:12px">
-          <button class="btn primary" id="btnLogin">دخول</button>
-          <button class="btn ghost" id="btnCreate">إنشاء حساب</button>
-        </div>
-        <div class="smallMuted" style="margin-top:10px">
-          إذا هذا أول حساب يتسجّل: يتعيّن تلقائياً <b>Admin</b>.
-        </div>
-      </div>
-    </div>
-  `;
-
-  $("#btnLogin").onclick = async ()=>{
-    const email = $("#email").value.trim();
-    const pass = $("#pass").value;
-    try{
-      await signInWithEmailAndPassword(auth, email, pass);
-    }catch(e){
-      toast("فشل الدخول", e.message);
-    }
+  const close = () => {
+    host.classList.add("hidden");
+    host.innerHTML = "";
   };
 
-  $("#btnCreate").onclick = async ()=>{
-    const email = $("#email").value.trim();
-    const pass = $("#pass").value;
-    const name = $("#name").value.trim();
-    try{
-      const cred = await createUserWithEmailAndPassword(auth, email, pass);
-      if(name) await updateProfile(cred.user, { displayName: name });
-      toast("تم إنشاء الحساب", "الآن يمكنك الدخول.");
-    }catch(e){
-      toast("فشل إنشاء الحساب", e.message);
-    }
-  };
-}
-
-/* =========================
-   Bootstrap
-========================= */
-async function bootstrap(force=false){
-  if(!State.user) return;
-
-  await ensureSeed();
-
-  // settings
-  State.settings = await getOne(doc(db,"settings","app")) || { ...DEFAULT_SETTINGS };
-
-  // profile
-  State.profile = await loadProfile(State.user.uid);
-  State.role = State.profile?.role || "staff";
-
-  // templates
-  State.templates = await listCol("invoiceTemplates", { orderArr:["name","asc"], lim: 200 });
-
-  // custom pages
-  State.customPages = await listCol("customPages", { orderArr:["title","asc"], lim: 200 });
-
-  await renderShell();
-  await route();
-}
-
-/* =========================
-   Components
-========================= */
-function statusPill(status){
-  const s = status || "open";
-  if(["done","closed","paid"].includes(s)) return `<span class="pill ok">${escapeHtml(s)}</span>`;
-  if(["waiting_parts","waiting_approval"].includes(s)) return `<span class="pill warn">${escapeHtml(s)}</span>`;
-  if(["cancelled","void"].includes(s)) return `<span class="pill bad">${escapeHtml(s)}</span>`;
-  return `<span class="pill">${escapeHtml(s)}</span>`;
-}
-
-function tableHTML({columns, rows}){
-  const thead = `<tr>${columns.map(c=>`<th>${escapeHtml(c.label)}</th>`).join("")}</tr>`;
-  const tbody = rows.map(r=>`<tr>${columns.map(c=>`<td>${c.render ? c.render(r) : escapeHtml(r[c.key] ?? "")}</td>`).join("")}</tr>`).join("");
-  return `<div class="tableWrap"><table><thead>${thead}</thead><tbody>${tbody}</tbody></table></div>`;
-}
-
-function twoCols(a,b){
-  return `<div class="row"><div class="col-6">${a}</div><div class="col-6">${b}</div></div>`;
-}
-
-function calcInvoiceTotals(items, discount=0, taxRate=0){
-  const sub = items.reduce((s,it)=> s + (Number(it.qty||0)*Number(it.price||0)), 0);
-  const disc = Number(discount||0);
-  const tax = Math.round((Math.max(sub-disc,0) * Number(taxRate||0)) / 100);
-  const grand = Math.max(sub - disc + tax, 0);
-  return { subTotal: sub, discount: disc, tax, grandTotal: grand };
-}
-
-/* =========================
-   Dashboard
-========================= */
-async function renderDashboard(){
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title: "لوحة التحكم",
-    subtitle: "ملخص سريع — أوامر شغل، فواتير، مخزون",
-    actionsHTML: `<button class="btn primary" id="newWO">أمر شغل جديد</button>`
+  host.addEventListener("click", (e) => {
+    if (e.target === host) close();
   });
-  $("#newWO").onclick = ()=> openWorkOrderEditor();
 
-  const body = $("#pageBody");
-
-  const [wos, inv, invItems, lowStock] = await Promise.all([
-    listCol("workOrders", { orderArr:["updatedAt","desc"], lim: 10 }),
-    listCol("invoices", { orderArr:["updatedAt","desc"], lim: 10 }),
-    listCol("invoices", { orderArr:["updatedAt","desc"], lim: 50 }),
-    listCol("inventoryItems", { orderArr:["updatedAt","desc"], lim: 300 }),
+  const head = el("div", { class: "modalHead" }, [
+    el("b", {}, [title]),
+    el("div", { class: "actions" }, [
+      ...actions,
+      el("button", { class: "btn ghost", onclick: close }, ["إغلاق"])
+    ])
   ]);
 
-  const totalSales = invItems.reduce((s,i)=> s + Number(i?.totals?.grandTotal||0), 0);
-  const low = lowStock.filter(x => Number(x.stock||0) <= Number(x.minStock||0));
+  const modal = el("div", { class: "modal" }, [
+    head,
+    el("div", { class: "modalBody" }, [bodyNode]),
+  ]);
 
-  body.innerHTML = `
-    <div class="grid">
-      <div class="card" style="grid-column:span 4">
-        <div class="cardHeader">
-          <div>
-            <div class="cardTitle">أوامر شغل (آخر 10)</div>
-            <div class="cardDesc">تتبع الحالات مباشرة</div>
-          </div>
-        </div>
-        <div class="smallMuted">آخر تحديث</div>
-        <div style="margin-top:10px;display:flex;flex-direction:column;gap:8px">
-          ${wos.map(x=>`
-            <a href="#/workorders" style="text-decoration:none">
-              <div class="pill" style="justify-content:space-between;width:100%">
-                <span><b>${escapeHtml(x.woNo||x.id)}</b> • ${escapeHtml(x.customerSnapshot?.name||"")}</span>
-                <span>${htmlToText(statusPill(x.status))}</span>
-              </div>
-            </a>
-          `).join("") || `<div class="smallMuted">لا يوجد بيانات.</div>`}
-        </div>
-      </div>
-
-      <div class="card" style="grid-column:span 4">
-        <div class="cardHeader">
-          <div>
-            <div class="cardTitle">الفواتير (آخر 10)</div>
-            <div class="cardDesc">تعديل + طباعة + مدفوعات</div>
-          </div>
-        </div>
-        <div class="smallMuted">إجمالي آخر 50 فاتورة: <b>${money(totalSales, State.settings.currency)}</b></div>
-        <div style="margin-top:10px;display:flex;flex-direction:column;gap:8px">
-          ${inv.map(x=>`
-            <a href="#/invoices" style="text-decoration:none">
-              <div class="pill" style="justify-content:space-between;width:100%">
-                <span><b>${escapeHtml(x.invoiceNo||x.id)}</b> • ${escapeHtml(x.customerSnapshot?.name||"")}</span>
-                <span><b>${money(x?.totals?.grandTotal||0, State.settings.currency)}</b></span>
-              </div>
-            </a>
-          `).join("") || `<div class="smallMuted">لا يوجد بيانات.</div>`}
-        </div>
-      </div>
-
-      <div class="card" style="grid-column:span 4">
-        <div class="cardHeader">
-          <div>
-            <div class="cardTitle">تنبيه المخزون</div>
-            <div class="cardDesc">الأصناف القريبة من النفاد</div>
-          </div>
-          <div class="btnRow">
-            <a class="btn small ghost" href="#/inventory">فتح المخزون</a>
-          </div>
-        </div>
-        ${low.length ? `
-          <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">
-            ${low.slice(0,10).map(x=>`
-              <div class="pill warn" style="justify-content:space-between;width:100%">
-                <span>${escapeHtml(x.name||"")}</span>
-                <span>المتوفر: <b>${escapeHtml(String(x.stock||0))}</b></span>
-              </div>
-            `).join("")}
-          </div>
-        ` : `<div class="smallMuted">لا توجد تنبيهات حالياً ✅</div>`}
-      </div>
-
-      <div class="card" style="grid-column:span 12">
-        <div class="cardHeader">
-          <div>
-            <div class="cardTitle">اختصارات</div>
-            <div class="cardDesc">أوامر شغل + فواتير + قوالب + صفحات</div>
-          </div>
-        </div>
-        <div class="btnRow">
-          <button class="btn primary" id="dashNewWO">أمر شغل جديد</button>
-          <a class="btn ghost" href="#/invoices">إدارة الفواتير</a>
-          <a class="btn ghost" href="#/templates">قوالب الفواتير</a>
-          <a class="btn ghost" href="#/pages">صفحات إضافية</a>
-          <a class="btn ghost" href="#/settings">الإعدادات</a>
-        </div>
-      </div>
-    </div>
-  `;
-  $("#dashNewWO").onclick = ()=> openWorkOrderEditor();
+  host.appendChild(modal);
+  return { close };
 }
 
-/* =========================
-   Work Orders
-========================= */
-async function renderWorkOrders(){
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"أوامر الشغل",
-    subtitle:"إنشاء الزبون والسيارة تلقائياً + حالات + تحويل لفاتورة",
-    actionsHTML: `
-      <button class="btn primary" id="newWO">أمر شغل جديد</button>
-      <button class="btn ghost" id="refreshWO">تحديث</button>
-    `
+/* ---------- Format ---------- */
+function tsToDate(v) {
+  if (!v) return null;
+  if (v instanceof Date) return v;
+  if (typeof v === "string") return new Date(v);
+  if (typeof v === "number") return new Date(v);
+  if (typeof v === "object" && typeof v.toDate === "function") return v.toDate(); // Firestore Timestamp
+  return null;
+}
+function fmtDate(v) {
+  const d = tsToDate(v);
+  if (!d) return "-";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function fmtMoney(n) {
+  const x = Number(n || 0);
+  return x.toLocaleString("ar-IQ") + " " + APP.currency;
+}
+function safeStr(x) { return (x ?? "").toString(); }
+
+/* ---------- Tiny Template Engine (supports {{var}} + {{#items}}...{{/items}} ) ---------- */
+function renderTemplate(tpl, data) {
+  if (!tpl) return "";
+  // loops
+  tpl = tpl.replace(/\{\{#(\w+)\}\}([\s\S]*?)\{\{\/\1\}\}/g, (_, key, inner) => {
+    const arr = data?.[key];
+    if (!Array.isArray(arr)) return "";
+    return arr.map(item => renderTemplate(inner, { ...data, ...item })).join("");
   });
 
-  $("#newWO").onclick = ()=> openWorkOrderEditor();
-  $("#refreshWO").onclick = ()=> renderWorkOrders();
+  // variables
+  tpl = tpl.replace(/\{\{(\w+)\}\}/g, (_, key) => {
+    const v = data?.[key];
+    return v === undefined || v === null ? "" : String(v);
+  });
 
-  const body = $("#pageBody");
-  body.innerHTML = `<div class="card"><div class="cardTitle">تحميل...</div></div>`;
+  return tpl;
+}
 
-  const rows = await listCol("workOrders", { orderArr:["updatedAt","desc"], lim: 200 });
+/* ---------- Permissions ---------- */
+const ROLE_MATRIX = {
+  admin:   { readAll: true, writeAll: true, manageUsers: true, manageSettings: true, delete: true },
+  manager: { readAll: true, writeAll: true, manageUsers: false, manageSettings: false, delete: false },
+  tech:    { readAll: false, writeAll: false, techOrders: true, delete: false },
+  viewer:  { readAll: true, writeAll: false, delete: false },
+};
 
-  body.innerHTML = `
-    <div class="card">
-      <div class="cardHeader">
-        <div>
-          <div class="cardTitle">قائمة أوامر الشغل</div>
-          <div class="cardDesc">اضغط تعديل لفتح كل التفاصيل</div>
-        </div>
-        <div style="min-width:320px">
-          <input class="input" id="woSearch" placeholder="بحث: رقم أمر، اسم زبون، لوحة..." />
-        </div>
-      </div>
-      <div id="woTable"></div>
-    </div>
-  `;
+function hasPerm(userProfile, perm) {
+  if (!userProfile) return false;
+  const role = userProfile.role || "viewer";
+  const base = ROLE_MATRIX[role] || ROLE_MATRIX.viewer;
+  const overrides = userProfile.permissions || {};
+  if (overrides[perm] === true) return true;
+  if (overrides[perm] === false) return false;
+  return !!base[perm];
+}
 
-  const render = (filter="")=>{
-    const f = filter.trim().toLowerCase();
-    const data = !f ? rows : rows.filter(x=>{
-      const t = [
-        x.woNo, x.status,
-        x.customerSnapshot?.name, x.customerSnapshot?.phone,
-        x.vehicleSnapshot?.plate, x.vehicleSnapshot?.model
-      ].join(" ").toLowerCase();
-      return t.includes(f);
+/* ---------- App State ---------- */
+const state = {
+  app: null,
+  auth: null,
+  db: null,
+  user: null,          // firebase user
+  profile: null,       // users/{uid}
+  settings: null,      // settings/app
+  uiConfig: null,      // uiConfig/app
+  unsub: [],
+};
+
+/* ---------- Firestore Access Layer ---------- */
+const C = {
+  cars: "cars",
+  customers: "customers",
+  departments: "departments",
+  employees: "employees",
+  invoiceTemplates: "invoiceTemplates",
+  invoices: "invoices",
+  meta: "meta",
+  orders: "orders",
+  settings: "settings",
+  uiConfig: "uiConfig",
+  users: "users",
+};
+
+async function getSettings() {
+  const ref = doc(state.db, C.settings, "app");
+  const snap = await getDoc(ref);
+  if (!snap.exists()) return null;
+  return { id: snap.id, ...snap.data() };
+}
+async function ensureDefaults() {
+  // settings/app
+  const sRef = doc(state.db, C.settings, "app");
+  const sSnap = await getDoc(sRef);
+  if (!sSnap.exists()) {
+    await setDoc(sRef, {
+      workshopName: "RPM",
+      workshopPhone: "",
+      workshopAddress: "",
+      invoicePrefix: "RPM-",
+      invoicePadding: 6,
+      taxPercent: 0,
+      defaultTemplateId: "",
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
     });
+  }
 
-    $("#woTable").innerHTML = tableHTML({
-      columns:[
-        { label:"رقم", render:r=> `<b>${escapeHtml(r.woNo||r.id)}</b><div class="smallMuted">${escapeHtml(r.vehicleSnapshot?.plate||"")}</div>` },
-        { label:"الزبون", render:r=> `${escapeHtml(r.customerSnapshot?.name||"")}<div class="smallMuted">${escapeHtml(r.customerSnapshot?.phone||"")}</div>` },
-        { label:"السيارة", render:r=> `${escapeHtml(r.vehicleSnapshot?.model||"")}<div class="smallMuted">${escapeHtml(String(r.vehicleSnapshot?.year||""))}</div>` },
-        { label:"الحالة", render:r=> statusPill(r.status) },
-        { label:"الإجراء", render:r=> `
-          <div class="btnRow">
-            <button class="btn small ghost" data-edit="${r.id}">تعديل</button>
-            <button class="btn small success" data-inv="${r.id}">تحويل لفاتورة</button>
-            <button class="btn small danger" data-del="${r.id}">حذف</button>
-          </div>
-        ` }
+  // uiConfig/app
+  const uRef = doc(state.db, C.uiConfig, "app");
+  const uSnap = await getDoc(uRef);
+  if (!uSnap.exists()) {
+    await setDoc(uRef, {
+      brandName: "RPM",
+      nav: [
+        { slug: "dashboard", title: "لوحة التحكم", icon: "📊", roles: ["admin","manager","tech","viewer"] },
+        { slug: "orders", title: "أوامر الشغل", icon: "🧾", roles: ["admin","manager","tech"] },
+        { slug: "oil", title: "تبديل دهن", icon: "🛢️", roles: ["admin","manager","tech"] },
+        { slug: "invoices", title: "الفواتير", icon: "🧾", roles: ["admin","manager"] },
+        { slug: "templates", title: "قوالب الفواتير", icon: "🧩", roles: ["admin","manager"] },
+        { slug: "customers", title: "الزبائن", icon: "👤", roles: ["admin","manager","tech"] },
+        { slug: "cars", title: "السيارات", icon: "🚗", roles: ["admin","manager","tech"] },
+        { slug: "employees", title: "الموظفون", icon: "👷", roles: ["admin","manager"] },
+        { slug: "departments", title: "الأقسام", icon: "🏷️", roles: ["admin","manager"] },
+        { slug: "users", title: "صلاحيات المستخدمين", icon: "🛡️", roles: ["admin"] },
+        { slug: "ui", title: "صفحات مخصّصة", icon: "🧱", roles: ["admin"] },
+        { slug: "settings", title: "الإعدادات", icon: "⚙️", roles: ["admin"] },
       ],
-      rows:data
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
     });
+  }
 
-    // bind actions
-    $$("button[data-edit]").forEach(b=> b.onclick = ()=> openWorkOrderEditor(rows.find(x=>x.id===b.dataset.edit)));
-    $$("button[data-inv]").forEach(b=> b.onclick = ()=> createInvoiceFromWO(rows.find(x=>x.id===b.dataset.inv)));
-    $$("button[data-del]").forEach(b=> b.onclick = async ()=>{
-      if(!await safeConfirm("حذف أمر الشغل؟")) return;
-      const before = rows.find(x=>x.id===b.dataset.del) || null;
-      await del("workOrders", b.dataset.del);
-      await audit("delete","workOrders", b.dataset.del, before, null);
-      toast("تم الحذف", "تم حذف أمر الشغل.");
-      renderWorkOrders();
-    });
-  };
+  // invoice counter
+  const mRef = doc(state.db, C.meta, "invoiceCounter");
+  const mSnap = await getDoc(mRef);
+  if (!mSnap.exists()) {
+    await setDoc(mRef, { next: 1, updatedAt: serverTimestamp() });
+  }
 
-  render();
-  $("#woSearch").oninput = (e)=> render(e.target.value);
-}
-
-function emptyChecklist(){
-  return {
-    oil:"", coolant:"", brakes:"", tires:"", battery:"", scan:"", notes:""
-  };
-}
-
-function emptyWO(){
-  return {
-    woNo: "",
-    status: "open",
-    customerSnapshot: { name:"", phone:"" },
-    vehicleSnapshot: { plate:"", model:"", year:"", vin:"", km:0 },
-    checklist: emptyChecklist(),
-    laborItems: [],
-    partsItems: [],
-    notes: "",
-  };
-}
-
-function itemRowEditor(items, {type}){
-  const rows = items.map((it, idx)=>`
-    <div class="row" style="align-items:end;border:1px solid var(--line);border-radius:16px;padding:10px;margin-top:10px">
-      <div class="col-6">
-        <label>الوصف</label>
-        <input class="input" data-k="name" data-i="${idx}" value="${escapeHtml(it.name||"")}" placeholder="${type==="part"?"مثال: فلتر زيت":"مثال: أجرة تبديل دهن"}"/>
-      </div>
-      <div class="col-2">
-        <label>الكمية</label>
-        <input class="input" data-k="qty" data-i="${idx}" type="number" value="${escapeHtml(String(it.qty||1))}"/>
-      </div>
-      <div class="col-2">
-        <label>سعر الوحدة</label>
-        <input class="input" data-k="price" data-i="${idx}" type="number" value="${escapeHtml(String(it.price||0))}"/>
-      </div>
-      <div class="col-2">
-        <label>إجراء</label>
-        <button class="btn small danger" data-delitem="${idx}">حذف</button>
-      </div>
-      ${type==="part" ? `
-        <div class="col-12 smallMuted">اختياري: ربط بالمخزون داخل الفاتورة (عند التحويل/التعديل)</div>
-      ` : ``}
-    </div>
-  `).join("");
-
-  return `
-    <div>
-      ${rows || `<div class="smallMuted">لا يوجد عناصر. أضف عنصر.</div>`}
-      <div class="btnRow" style="margin-top:10px">
-        <button class="btn small ghost" data-additem>+ إضافة</button>
-      </div>
-    </div>
-  `;
-}
-
-function openWorkOrderEditor(existing=null){
-  const data = existing ? JSON.parse(JSON.stringify(existing)) : emptyWO();
-
-  const close = modal({
-    title: existing ? `تعديل أمر شغل: ${existing.woNo||existing.id}` : "أمر شغل جديد",
-    bodyHTML: `
-      <div class="row">
-        <div class="col-8">
-          <div class="card" style="padding:12px">
-            <div class="cardTitle">بيانات الزبون + السيارة (تنشأ تلقائياً)</div>
-            <div class="cardDesc">اكتب اسم الزبون والسيارة — عند الحفظ سيتم إنشاء/تحديث الزبون والسيارة تلقائياً</div>
-
-            <div class="row">
-              <div class="col-6">
-                <label>اسم الزبون</label>
-                <input class="input" id="cName" value="${escapeHtml(data.customerSnapshot?.name||"")}" placeholder="مثال: علي أحمد" />
-              </div>
-              <div class="col-6">
-                <label>هاتف الزبون</label>
-                <input class="input" id="cPhone" value="${escapeHtml(data.customerSnapshot?.phone||"")}" placeholder="07xxxxxxxxx" />
-              </div>
-              <div class="col-3">
-                <label>لوحة السيارة</label>
-                <input class="input" id="plate" value="${escapeHtml(data.vehicleSnapshot?.plate||"")}" placeholder="مثال: بغداد 12345" />
-              </div>
-              <div class="col-3">
-                <label>الموديل</label>
-                <input class="input" id="carModel" value="${escapeHtml(data.vehicleSnapshot?.model||"")}" placeholder="Camry / Accent..." />
-              </div>
-              <div class="col-3">
-                <label>السنة</label>
-                <input class="input" id="carYear" value="${escapeHtml(String(data.vehicleSnapshot?.year||""))}" placeholder="2020" />
-              </div>
-              <div class="col-3">
-                <label>كم</label>
-                <input class="input" id="km" type="number" value="${escapeHtml(String(data.vehicleSnapshot?.km||0))}" />
-              </div>
-              <div class="col-6">
-                <label>VIN (اختياري)</label>
-                <input class="input" id="vin" value="${escapeHtml(String(data.vehicleSnapshot?.vin||""))}" />
-              </div>
-              <div class="col-6">
-                <label>الحالة</label>
-                <select class="input" id="status">
-                  ${["open","diagnosis","waiting_approval","waiting_parts","in_progress","done","closed","cancelled"].map(s=>
-                    `<option ${data.status===s?"selected":""} value="${s}">${s}</option>`
-                  ).join("")}
-                </select>
-              </div>
-            </div>
+  // default invoice template (only if none exists)
+  const tQ = query(collection(state.db, C.invoiceTemplates), limit(1));
+  const tS = await getDocs(tQ);
+  if (tS.empty) {
+    await addDoc(collection(state.db, C.invoiceTemplates), {
+      name: "فاتورة — افتراضي",
+      css: `
+        body{ font-family: Tahoma, Arial; direction: rtl; padding:18px; }
+        h2{ margin:0 0 6px 0; }
+        hr{ margin:10px 0; }
+        .grid{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+        .box h3{ margin:0 0 6px 0; font-size:14px; }
+        table{ width:100%; border-collapse:collapse; margin-top:12px; }
+        th,td{ border:1px solid #ddd; padding:8px; text-align:right; }
+        th{ background:#f5f5f5; }
+        .tot{ margin-top:10px; display:flex; justify-content:flex-end; gap:16px; }
+      `,
+      html: `
+        <h2>فاتورة خدمة — {{serviceTitle}}</h2>
+        <div style="color:#555; font-size:12px">رقم الفاتورة: <b>{{invoiceNo}}</b> • التاريخ: {{date}}</div>
+        <hr/>
+        <div class="grid">
+          <div class="box">
+            <h3>الزبون</h3>
+            <div>الاسم: <b>{{customerName}}</b></div>
+            <div>الهاتف: {{customerPhone}}</div>
           </div>
-
-          <div class="card" style="padding:12px;margin-top:14px">
-            <div class="cardTitle">Checklist سريع</div>
-            <div class="row">
-              <div class="col-4"><label>زيت</label><input class="input" id="ck_oil" value="${escapeHtml(data.checklist?.oil||"")}"/></div>
-              <div class="col-4"><label>تبريد</label><input class="input" id="ck_coolant" value="${escapeHtml(data.checklist?.coolant||"")}"/></div>
-              <div class="col-4"><label>فرامل</label><input class="input" id="ck_brakes" value="${escapeHtml(data.checklist?.brakes||"")}"/></div>
-              <div class="col-4"><label>إطارات</label><input class="input" id="ck_tires" value="${escapeHtml(data.checklist?.tires||"")}"/></div>
-              <div class="col-4"><label>بطارية</label><input class="input" id="ck_battery" value="${escapeHtml(data.checklist?.battery||"")}"/></div>
-              <div class="col-4"><label>فحص كمبيوتر</label><input class="input" id="ck_scan" value="${escapeHtml(data.checklist?.scan||"")}"/></div>
-              <div class="col-12"><label>ملاحظات checklist</label><textarea class="input" id="ck_notes">${escapeHtml(data.checklist?.notes||"")}</textarea></div>
-            </div>
-          </div>
-
-          <div class="card" style="padding:12px;margin-top:14px">
-            <div class="cardTitle">ملاحظات عامة</div>
-            <textarea class="input" id="notes">${escapeHtml(data.notes||"")}</textarea>
+          <div class="box">
+            <h3>السيارة</h3>
+            <div>اللوحة: <b>{{plate}}</b></div>
+            <div>الموديل: {{carModel}}</div>
+            <div>السنة: {{year}}</div>
           </div>
         </div>
 
-        <div class="col-4">
-          <div class="card" style="padding:12px">
-            <div class="cardTitle">أجور العمل (Labor)</div>
-            <div id="laborEditor"></div>
-          </div>
+        <table>
+          <thead>
+            <tr><th>الوصف</th><th>الكمية</th><th>السعر</th><th>المجموع</th></tr>
+          </thead>
+          <tbody>
+            {{#items}}
+              <tr>
+                <td>{{desc}}</td>
+                <td>{{qty}}</td>
+                <td>{{priceFmt}}</td>
+                <td>{{lineTotalFmt}}</td>
+              </tr>
+            {{/items}}
+          </tbody>
+        </table>
 
-          <div class="card" style="padding:12px;margin-top:14px">
-            <div class="cardTitle">قطع (Parts)</div>
-            <div class="cardDesc">يمكن تركها تقديرية هنا — تُعتمد وتخصم من المخزون داخل الفاتورة</div>
-            <div id="partsEditor"></div>
-          </div>
+        <div class="tot">
+          <div>المجموع: <b>{{totalFmt}}</b></div>
         </div>
-      </div>
-    `,
-    footerHTML: `
-      <button class="btn primary" id="saveWO">حفظ</button>
-      ${existing ? `<button class="btn success" id="toInvoice">تحويل لفاتورة</button>` : ""}
-      <button class="btn ghost" data-x>إغلاق</button>
-    `,
-    onMount: (host, closeModal)=>{
-      const laborWrap = $("#laborEditor", host);
-      const partsWrap = $("#partsEditor", host);
-
-      const renderItems = ()=>{
-        laborWrap.innerHTML = itemRowEditor(data.laborItems, {type:"labor"});
-        partsWrap.innerHTML = itemRowEditor(data.partsItems, {type:"part"});
-
-        // labor bind
-        $$("[data-additem]", laborWrap).forEach(btn=>{
-          btn.onclick = ()=>{
-            data.laborItems.push({ type:"labor", name:"", qty:1, price:0 });
-            renderItems();
-          };
-        });
-        $$("[data-delitem]", laborWrap).forEach(btn=>{
-          btn.onclick = ()=>{
-            data.laborItems.splice(Number(btn.dataset.delitem), 1);
-            renderItems();
-          };
-        });
-        $$("input[data-k]", laborWrap).forEach(inp=>{
-          inp.oninput = ()=>{
-            const i = Number(inp.dataset.i);
-            const k = inp.dataset.k;
-            data.laborItems[i][k] = (k==="qty"||k==="price") ? Number(inp.value||0) : inp.value;
-            data.laborItems[i].type = "labor";
-          };
-        });
-
-        // parts bind
-        $$("[data-additem]", partsWrap).forEach(btn=>{
-          btn.onclick = ()=>{
-            data.partsItems.push({ type:"part", name:"", qty:1, price:0, inventoryItemId:"" });
-            renderItems();
-          };
-        });
-        $$("[data-delitem]", partsWrap).forEach(btn=>{
-          btn.onclick = ()=>{
-            data.partsItems.splice(Number(btn.dataset.delitem), 1);
-            renderItems();
-          };
-        });
-        $$("input[data-k]", partsWrap).forEach(inp=>{
-          inp.oninput = ()=>{
-            const i = Number(inp.dataset.i);
-            const k = inp.dataset.k;
-            data.partsItems[i][k] = (k==="qty"||k==="price") ? Number(inp.value||0) : inp.value;
-            data.partsItems[i].type = "part";
-          };
-        });
-      };
-      renderItems();
-
-      $("#saveWO", host).onclick = async ()=>{
-        try{
-          // collect fields
-          data.customerSnapshot = {
-            name: $("#cName", host).value.trim(),
-            phone: $("#cPhone", host).value.trim()
-          };
-          data.vehicleSnapshot = {
-            plate: $("#plate", host).value.trim(),
-            model: $("#carModel", host).value.trim(),
-            year: $("#carYear", host).value.trim(),
-            vin: $("#vin", host).value.trim(),
-            km: Number($("#km", host).value||0),
-          };
-          data.status = $("#status", host).value;
-
-          data.checklist = {
-            oil: $("#ck_oil", host).value.trim(),
-            coolant: $("#ck_coolant", host).value.trim(),
-            brakes: $("#ck_brakes", host).value.trim(),
-            tires: $("#ck_tires", host).value.trim(),
-            battery: $("#ck_battery", host).value.trim(),
-            scan: $("#ck_scan", host).value.trim(),
-            notes: $("#ck_notes", host).value.trim(),
-          };
-          data.notes = $("#notes", host).value;
-
-          // upsert customer & vehicle
-          const { customerId, vehicleId } = await upsertCustomerAndVehicle({
-            customerName: data.customerSnapshot.name,
-            customerPhone: data.customerSnapshot.phone,
-            plate: data.vehicleSnapshot.plate,
-            carModel: data.vehicleSnapshot.model,
-            carYear: data.vehicleSnapshot.year,
-            vin: data.vehicleSnapshot.vin,
-            km: data.vehicleSnapshot.km,
-          });
-
-          data.customerId = customerId;
-          data.vehicleId = vehicleId;
-
-          if(!existing){
-            data.woNo = await nextNumber("wo");
-            const newId = await addCol("workOrders", {
-              ...data,
-              createdBy: State.user?.uid || "",
-              createdByEmail: State.user?.email || ""
-            });
-            await audit("create","workOrders", newId, null, data);
-            toast("تم الحفظ", `أمر شغل جديد: ${data.woNo}`);
-          }else{
-            const before = existing;
-            await upd("workOrders", existing.id, data);
-            await audit("update","workOrders", existing.id, before, data);
-            toast("تم التحديث", `أمر شغل: ${existing.woNo||existing.id}`);
-          }
-
-          closeModal();
-          renderWorkOrders();
-        }catch(e){
-          toast("خطأ", e.message);
-        }
-      };
-
-      if(existing){
-        $("#toInvoice", host).onclick = async ()=>{
-          await $("#saveWO", host).onclick?.();
-          // بعد الحفظ، افتح تحويل
-          closeModal();
-          // refresh list then convert by latest? بسيط: افتح صفحة الفواتير
-          toast("جاهز للتحويل", "افتح الفواتير أو حوّل من الجدول.");
-        };
-      }
-    }
-  });
-}
-
-/* =========================
-   Create Invoice from WO
-========================= */
-async function createInvoiceFromWO(wo){
-  if(!wo) return;
-
-  try{
-    const woFresh = await getOne(doc(db,"workOrders", wo.id));
-    if(!woFresh){ toast("غير موجود", "تعذر إيجاد أمر الشغل."); return; }
-
-    const invoiceNo = await nextNumber("invoice");
-    const templateId = State.settings?.defaultInvoiceTemplateId || "default_ar";
-    const items = [
-      ...(woFresh.laborItems||[]).map(x=>({ type:"خدمة", name:x.name||"", qty:Number(x.qty||1), price:Number(x.price||0), inventoryItemId:"" })),
-      ...(woFresh.partsItems||[]).map(x=>({ type:"قطعة", name:x.name||"", qty:Number(x.qty||1), price:Number(x.price||0), inventoryItemId:x.inventoryItemId||"" })),
-    ].filter(x => x.name || x.price);
-
-    const totals = calcInvoiceTotals(items, 0, Number(State.settings?.taxRate||0));
-
-    const invData = {
-      invoiceNo,
-      status: "unpaid",
-      workOrderId: woFresh.id,
-      woNo: woFresh.woNo || "",
-      customerId: woFresh.customerId || "",
-      vehicleId: woFresh.vehicleId || "",
-      customerSnapshot: woFresh.customerSnapshot || {},
-      vehicleSnapshot: woFresh.vehicleSnapshot || {},
-      items,
-      discount: 0,
-      taxRate: Number(State.settings?.taxRate||0),
-      totals,
-      payments: [],
-      notes: woFresh.notes || "",
-      templateId,
-      createdBy: State.user?.uid || "",
-      createdByEmail: State.user?.email || ""
-    };
-
-    // سياسة خصم المخزون
-    if((State.settings?.stockConsumePolicy||"invoice_create") === "invoice_create"){
-      await consumeStockForInvoiceItems(invData.items);
-    }
-
-    const invId = await addCol("invoices", invData);
-    await audit("create","invoices", invId, null, invData);
-
-    toast("تم إنشاء فاتورة", invoiceNo);
-    location.hash = "#/invoices";
-  }catch(e){
-    toast("خطأ", e.message);
+      `,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+      isDefault: true,
+    });
   }
 }
 
-async function consumeStockForInvoiceItems(items){
-  // يخصم فقط العناصر التي تحمل inventoryItemId أو التي يمكن مطابقتها بالاسم (اختياري)
-  const parts = items.filter(x => (x.type==="قطعة" || String(x.type).includes("قط")) && Number(x.qty||0) > 0);
-  if(parts.length === 0) return;
+/* ---------- Invoice No generator (transaction) ---------- */
+async function nextInvoiceNo() {
+  const settings = state.settings || {};
+  const prefix = settings.invoicePrefix || "RPM-";
+  const pad = Number(settings.invoicePadding || 6);
 
-  await runTransaction(db, async (tx)=>{
-    for(const it of parts){
-      let invId = it.inventoryItemId || "";
-      if(!invId) continue; // الخصم فقط عندما مرتبط
-      const ref = doc(db,"inventoryItems", invId);
-      const snap = await tx.get(ref);
-      if(!snap.exists()) continue;
-      const data = snap.data();
-      const current = Number(data.stock||0);
-      const need = Number(it.qty||0);
-      if(current < need){
-        throw new Error(`المخزون غير كافٍ: ${data.name||invId} (المتوفر ${current})`);
-      }
-      tx.update(ref, { stock: current - need, updatedAt: serverTimestamp() });
-    }
+  const counterRef = doc(state.db, C.meta, "invoiceCounter");
+  const invoiceNo = await runTransaction(state.db, async (tx) => {
+    const snap = await tx.get(counterRef);
+    const next = snap.exists() ? Number(snap.data().next || 1) : 1;
+    const no = prefix + String(next).padStart(pad, "0");
+    tx.set(counterRef, { next: next + 1, updatedAt: serverTimestamp() }, { merge: true });
+    return no;
   });
+
+  return invoiceNo;
 }
 
-/* =========================
-   Invoices (Edit + Templates + Print)
-========================= */
-async function renderInvoices(){
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"الفواتير",
-    subtitle:"تعديل + معاينة + طباعة + مدفوعات + ربط بالمخزون",
-    actionsHTML: `
-      <button class="btn ghost" id="refreshInv">تحديث</button>
-    `
+/* ---------- Ensure Customer & Car (auto-create) ---------- */
+async function ensureCustomerAndCar({ customerName, customerPhone, plate, model, year }) {
+  const name = safeStr(customerName).trim();
+  const phone = safeStr(customerPhone).trim();
+  const carPlate = safeStr(plate).trim();
+  const carModel = safeStr(model).trim();
+  const carYear = year ? Number(year) : null;
+
+  if (!name || !phone) throw new Error("اسم الزبون ورقم الهاتف مطلوبين");
+  if (!carPlate) throw new Error("لوحة السيارة مطلوبة");
+
+  // Find / create customer by phone
+  let customerId = null;
+  {
+    const q1 = query(collection(state.db, C.customers), where("phone", "==", phone), limit(1));
+    const s1 = await getDocs(q1);
+    if (!s1.empty) {
+      const d = s1.docs[0];
+      customerId = d.id;
+      // keep name updated softly
+      const curName = safeStr(d.data().name || d.data().customerName);
+      if (curName !== name) await updateDoc(doc(state.db, C.customers, customerId), { name, updatedAt: serverTimestamp() });
+    } else {
+      const ref = await addDoc(collection(state.db, C.customers), {
+        name,
+        phone,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      customerId = ref.id;
+    }
+  }
+
+  // Find / create car by plate (unique-ish)
+  let carId = null;
+  {
+    const q2 = query(collection(state.db, C.cars), where("plate", "==", carPlate), limit(1));
+    const s2 = await getDocs(q2);
+    if (!s2.empty) {
+      const d = s2.docs[0];
+      carId = d.id;
+      // merge update (don’t overwrite blindly)
+      await updateDoc(doc(state.db, C.cars, carId), {
+        customerId,
+        customerName: name,
+        customerPhone: phone,
+        model: carModel || d.data().model || "",
+        year: carYear || d.data().year || null,
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      const ref = await addDoc(collection(state.db, C.cars), {
+        customerId,
+        customerName: name,
+        customerPhone: phone,
+        plate: carPlate,
+        model: carModel,
+        year: carYear,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      carId = ref.id;
+    }
+  }
+
+  return { customerId, carId };
+}
+
+/* ---------- UI: Router ---------- */
+function route() {
+  const h = (location.hash || "#/dashboard").replace("#/", "");
+  const [slug, id] = h.split("/");
+  return { slug: slug || "dashboard", id: id || null };
+}
+function navTo(slug, id = null) {
+  location.hash = `#/${slug}${id ? "/" + id : ""}`;
+}
+
+/* ---------- Render: Auth ---------- */
+function renderAuth() {
+  const root = $("#app");
+  root.innerHTML = "";
+
+  const email = el("input", { class: "input", type: "email", placeholder: "البريد الإلكتروني" });
+  const pass = el("input", { class: "input", type: "password", placeholder: "كلمة المرور" });
+
+  const btnLogin = el("button", {
+    class: "btn primary",
+    onclick: async () => {
+      try {
+        btnLogin.disabled = true;
+        await signInWithEmailAndPassword(state.auth, email.value.trim(), pass.value);
+        toast("تم تسجيل الدخول", "أهلاً بك", "ok");
+      } catch (e) {
+        toast("فشل تسجيل الدخول", e?.message || "تحقق من البيانات", "bad");
+      } finally {
+        btnLogin.disabled = false;
+      }
+    }
+  }, ["تسجيل الدخول"]);
+
+  const btnReset = el("button", {
+    class: "btn ghost",
+    onclick: async () => {
+      const v = email.value.trim();
+      if (!v) return toast("اكتب البريد أولاً", "", "warn");
+      try {
+        await sendPasswordResetEmail(state.auth, v);
+        toast("تم إرسال رابط إعادة التعيين", "تحقق من بريدك", "ok");
+      } catch (e) {
+        toast("تعذر الإرسال", e?.message || "", "bad");
+      }
+    }
+  }, ["نسيت كلمة المرور"]);
+
+  const card = el("div", { class: "authCard" }, [
+    el("div", { class: "authHead" }, [
+      el("div", { class: "badgeLogo" }, ["RPM"]),
+      el("div", {}, [
+        el("b", {}, ["تسجيل الدخول"]),
+        el("span", {}, ["ورشـة صيانة سيارات — نظام إدارة شامل"])
+      ])
+    ]),
+    el("div", { class: "field" }, [el("label", {}, ["البريد الإلكتروني"]), email]),
+    el("div", { class: "field" }, [el("label", {}, ["كلمة المرور"]), pass]),
+    el("div", { class: "actions" }, [btnLogin, btnReset]),
+    el("hr", { class: "hr" }),
+    el("div", { class: "muted" }, [
+      "إذا أول مرة تستخدمين النظام: سجّلي مستخدم من Firebase Console أو فعّلي إنشاء مستخدم من الأدمن لاحقاً."
+    ])
+  ]);
+
+  root.appendChild(el("div", { class: "authWrap" }, [card]));
+}
+
+/* ---------- Render: Shell ---------- */
+function iconText(x) { return x || "•"; }
+
+function canSeeNavItem(item) {
+  const role = state.profile?.role || "viewer";
+  const roles = item.roles || ["admin","manager","tech","viewer"];
+  return roles.includes(role);
+}
+
+function renderShell() {
+  const root = $("#app");
+  root.innerHTML = "";
+
+  const sidebar = el("aside", { class: "sidebar", id: "sidebar" }, []);
+  const main = el("main", { class: "main" }, []);
+  const shell = el("div", { class: "shell" }, [sidebar, main]);
+  root.appendChild(shell);
+
+  // Sidebar content
+  const brand = el("div", { class: "brand" }, [
+    el("div", { class: "brandLeft" }, [
+      el("div", { class: "brandBadge" }, ["RPM"]),
+      el("div", {}, [
+        el("div", { class: "brandTitle" }, [state.uiConfig?.brandName || APP.name]),
+        el("div", { class: "brandSub" }, [APP.subtitle]),
+      ])
+    ]),
+    el("button", { class: "btn ghost", id: "btnCloseSide", onclick: () => sidebar.classList.remove("open") }, ["✕"])
+  ]);
+  sidebar.appendChild(brand);
+
+  const nav = el("nav", { class: "nav", id: "nav" }, []);
+  sidebar.appendChild(nav);
+
+  const userLine = el("div", { class: "userLine" }, [
+    el("div", { class: "userMeta" }, [
+      el("b", {}, [state.user?.email || ""]),
+      el("span", {}, [`الدور: ${state.profile?.role || "viewer"}`]),
+    ]),
+    el("button", { class: "btn ghost", onclick: () => signOut(state.auth) }, ["خروج"])
+  ]);
+
+  sidebar.appendChild(el("div", { class: "sideFoot" }, [userLine]));
+
+  // Build nav
+  const items = (state.uiConfig?.nav || []).filter(canSeeNavItem);
+  for (const it of items) {
+    const a = el("a", {
+      href: `#/${it.slug}`,
+      onclick: () => { if (window.innerWidth <= 980) sidebar.classList.remove("open"); }
+    }, [
+      el("span", {}, [`${iconText(it.icon)} ${it.title}`]),
+      it.tag ? el("span", { class: "tag" }, [it.tag]) : el("span")
+    ]);
+    nav.appendChild(a);
+  }
+
+  // Mobile open
+  const topbar = el("div", { class: "topbar" }, [
+    el("div", { class: "topbarRow" }, [
+      el("div", {}, [
+        el("div", { class: "hTitle", id: "pageTitle" }, ["..."]),
+        el("div", { class: "hSub", id: "pageSub" }, [""]),
+      ]),
+      el("div", { class: "actions" }, [
+        el("button", { class: "btn ghost", onclick: () => sidebar.classList.add("open") }, ["☰"]),
+        el("button", { class: "btn primary", onclick: () => navTo("orders") }, ["+ أمر شغل"]),
+        el("button", { class: "btn ok", onclick: () => navTo("oil") }, ["+ تبديل دهن"]),
+      ])
+    ])
+  ]);
+
+  main.appendChild(topbar);
+  main.appendChild(el("div", { id: "page" }, []));
+
+  refreshActiveNav();
+  renderRoute();
+}
+
+function refreshActiveNav() {
+  const { slug } = route();
+  $$(".nav a").forEach(a => a.classList.toggle("active", a.getAttribute("href") === `#/${slug}`));
+}
+
+/* ---------- Page Helpers ---------- */
+function setPageHeader(title, sub = "") {
+  $("#pageTitle").textContent = title;
+  $("#pageSub").textContent = sub;
+}
+
+/* ---------- Live Queries (unsubscribe safe) ---------- */
+function clearLive() {
+  for (const u of state.unsub) try { u(); } catch {}
+  state.unsub = [];
+}
+
+/* =========================================================
+   PAGES
+========================================================= */
+
+async function pageDashboard() {
+  setPageHeader("لوحة التحكم", "نظرة سريعة على الورشة");
+
+  const wrap = el("div", { class: "grid cols3" }, []);
+
+  const cardKpis = el("div", { class: "card" }, [
+    el("h3", {}, ["مؤشرات اليوم"]),
+    el("div", { class: "muted" }, ["آخر 24 ساعة (تقريباً)"]),
+    el("hr", { class: "hr" }),
+    el("div", { class: "grid cols3" }, [
+      kpiBox("أوامر جديدة", "..."),
+      kpiBox("فواتير", "..."),
+      kpiBox("إيراد", "..."),
+    ])
+  ]);
+
+  const cardQuick = el("div", { class: "card" }, [
+    el("h3", {}, ["إجراءات سريعة"]),
+    el("div", { class: "actions" }, [
+      el("button", { class: "btn primary", onclick: () => navTo("orders") }, ["أوامر الشغل"]),
+      el("button", { class: "btn ok", onclick: () => navTo("oil") }, ["تبديل دهن"]),
+      el("button", { class: "btn", onclick: () => navTo("invoices") }, ["الفواتير"]),
+      hasPerm(state.profile, "manageUsers")
+        ? el("button", { class: "btn", onclick: () => navTo("users") }, ["صلاحيات المستخدمين"])
+        : el("span"),
+    ])
+  ]);
+
+  const cardLive = el("div", { class: "card" }, [
+    el("h3", {}, ["أحدث أوامر الشغل"]),
+    el("div", { class: "muted" }, ["عرض مباشر — آخر 20 أمر"]),
+    el("div", { html: "<div class='muted'>جارِ التحميل…</div>" , style:"margin-top:10px;" })
+  ]);
+
+  wrap.appendChild(cardKpis);
+  wrap.appendChild(cardQuick);
+  wrap.appendChild(cardLive);
+
+  // Live orders
+  const listHost = cardLive.lastChild;
+  clearLive();
+  const q1 = query(collection(state.db, C.orders), orderBy("createdAt", "desc"), limit(20));
+  const unsub = onSnapshot(q1, (snap) => {
+    const rows = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    listHost.innerHTML = "";
+    listHost.appendChild(renderOrdersTable(rows, { compact: true }));
+  }, (err) => {
+    listHost.innerHTML = "";
+    listHost.appendChild(el("div", { class:"muted" }, [
+      "فشل قراءة البيانات. تأكد من Firestore Rules ووجود صلاحيات.",
+      " ",
+      String(err?.message || err)
+    ]));
   });
-  $("#refreshInv").onclick = ()=> renderInvoices();
+  state.unsub.push(unsub);
 
-  const body = $("#pageBody");
-  body.innerHTML = `<div class="card"><div class="cardTitle">تحميل...</div></div>`;
+  // KPI counts (simple getDocs)
+  try {
+    const invQ = query(collection(state.db, C.invoices), orderBy("createdAt","desc"), limit(50));
+    const ordQ = query(collection(state.db, C.orders), orderBy("createdAt","desc"), limit(50));
+    const [invS, ordS] = await Promise.all([getDocs(invQ), getDocs(ordQ)]);
+    const invCount = invS.size;
+    const ordCount = ordS.size;
+    const revenue = invS.docs.reduce((a,d)=>a+Number(d.data().total||0),0);
 
-  const rows = await listCol("invoices", { orderArr:["updatedAt","desc"], lim: 250 });
+    const kpis = $$(".kpi .n", cardKpis);
+    if (kpis[0]) kpis[0].textContent = ordCount.toString();
+    if (kpis[1]) kpis[1].textContent = invCount.toString();
+    if (kpis[2]) kpis[2].textContent = (Number(revenue||0).toLocaleString("ar-IQ")) + " " + APP.currency;
+  } catch (e) {
+    // ignore
+  }
 
-  body.innerHTML = `
-    <div class="card">
-      <div class="cardHeader">
-        <div>
-          <div class="cardTitle">قائمة الفواتير</div>
-          <div class="cardDesc">يمكنك تعديل الفاتورة، اختيار قالب، أو طباعة PDF</div>
-        </div>
-        <div style="min-width:320px">
-          <input class="input" id="invSearch" placeholder="بحث: رقم فاتورة، زبون، لوحة..." />
-        </div>
-      </div>
-      <div id="invTable"></div>
-    </div>
-  `;
+  return wrap;
+}
+function kpiBox(label, value) {
+  return el("div", { class:"kpi" }, [
+    el("div", { class:"n" }, [value]),
+    el("div", { class:"l" }, [label]),
+  ]);
+}
 
-  const render = (filter="")=>{
-    const f = filter.trim().toLowerCase();
-    const data = !f ? rows : rows.filter(x=>{
-      const t = [
-        x.invoiceNo, x.status,
-        x.customerSnapshot?.name, x.customerSnapshot?.phone,
-        x.vehicleSnapshot?.plate, x.vehicleSnapshot?.model,
-      ].join(" ").toLowerCase();
-      return t.includes(f);
-    });
+/* ---------- Orders Page ---------- */
+async function pageOrders() {
+  setPageHeader("أوامر الشغل", "إنشاء / تعديل / متابعة");
 
-    $("#invTable").innerHTML = tableHTML({
-      columns:[
-        { label:"رقم", render:r=> `<b>${escapeHtml(r.invoiceNo||r.id)}</b><div class="smallMuted">WO: ${escapeHtml(r.woNo||"")}</div>` },
-        { label:"الزبون", render:r=> `${escapeHtml(r.customerSnapshot?.name||"")}<div class="smallMuted">${escapeHtml(r.customerSnapshot?.phone||"")}</div>` },
-        { label:"السيارة", render:r=> `${escapeHtml(r.vehicleSnapshot?.plate||"")}<div class="smallMuted">${escapeHtml(r.vehicleSnapshot?.model||"")}</div>` },
-        { label:"الإجمالي", render:r=> `<b>${money(r?.totals?.grandTotal||0, State.settings.currency)}</b>` },
-        { label:"الحالة", render:r=> statusPill(r.status) },
-        { label:"إجراء", render:r=> `
-          <div class="btnRow">
-            <button class="btn small ghost" data-edit="${r.id}">تعديل</button>
-            <button class="btn small success" data-print="${r.id}">طباعة</button>
-            <button class="btn small danger" data-del="${r.id}">حذف</button>
-          </div>
-        ` },
-      ],
-      rows:data
-    });
+  const host = el("div", { class:"grid", style:"gap:16px" }, []);
 
-    $$("button[data-edit]").forEach(b=> b.onclick = async ()=>{
-      const inv = rows.find(x=>x.id===b.dataset.edit);
-      openInvoiceEditor(inv);
-    });
-    $$("button[data-print]").forEach(b=> b.onclick = async ()=>{
-      const inv = rows.find(x=>x.id===b.dataset.print);
-      await printInvoice(inv.id);
-    });
-    $$("button[data-del]").forEach(b=> b.onclick = async ()=>{
-      if(!await safeConfirm("حذف الفاتورة؟")) return;
-      const before = rows.find(x=>x.id===b.dataset.del) || null;
-      await del("invoices", b.dataset.del);
-      await audit("delete","invoices", b.dataset.del, before, null);
-      toast("تم الحذف", "تم حذف الفاتورة.");
-      renderInvoices();
-    });
+  const top = el("div", { class:"card" }, [
+    el("h3", {}, ["قائمة أوامر الشغل"]),
+    el("div", { class:"muted" }, ["فلترة سريعة + إنشاء أمر جديد"]),
+    el("hr", { class:"hr" }),
+  ]);
+
+  const search = el("input", { class:"input", placeholder:"بحث: اسم/هاتف/لوحة/موديل…" });
+  const status = el("select", {}, [
+    el("option", { value:"" }, ["كل الحالات"]),
+    el("option", { value:"open" }, ["مفتوح"]),
+    el("option", { value:"inProgress" }, ["قيد العمل"]),
+    el("option", { value:"done" }, ["مكتمل"]),
+    el("option", { value:"cancelled" }, ["ملغي"]),
+  ]);
+
+  const btnNew = el("button", { class:"btn primary", onclick: () => openOrderEditor() }, ["+ أمر شغل جديد"]);
+  const btnRefresh = el("button", { class:"btn ghost", onclick: () => loadOnce() }, ["تحديث"]);
+
+  top.appendChild(el("div", { class:"row" }, [
+    el("div", { class:"field" }, [el("label", {}, ["بحث"]), search]),
+    el("div", { class:"field" }, [el("label", {}, ["الحالة"]), status]),
+    el("div", { class:"actions", style:"align-items:flex-end; padding-top:18px" }, [btnNew, btnRefresh]),
+  ]));
+
+  const tableBox = el("div", { class:"card" }, [
+    el("div", { class:"muted" }, ["جارِ التحميل…"]),
+  ]);
+
+  host.appendChild(top);
+  host.appendChild(tableBox);
+
+  async function loadOnce() {
+    tableBox.innerHTML = "";
+    tableBox.appendChild(el("div", { class:"muted" }, ["جارِ التحميل…"]));
+    try {
+      const q1 = query(collection(state.db, C.orders), orderBy("createdAt","desc"), limit(120));
+      const s1 = await getDocs(q1);
+      const rows = s1.docs.map(d => ({ id:d.id, ...d.data() }));
+      render(rows);
+    } catch (e) {
+      tableBox.innerHTML = "";
+      tableBox.appendChild(el("div", { class:"muted" }, ["فشل التحميل: ", String(e?.message || e)]));
+    }
+  }
+
+  function render(rows) {
+    const q = search.value.trim();
+    const st = status.value;
+
+    let filtered = rows;
+    if (st) filtered = filtered.filter(x => (x.status || "open") === st);
+    if (q) {
+      filtered = filtered.filter(x => {
+        const s = `${x.customerName||""} ${x.customerPhone||""} ${x.carPlate||x.plate||""} ${x.carModel||x.model||""}`.toLowerCase();
+        return s.includes(q.toLowerCase());
+      });
+    }
+
+    tableBox.innerHTML = "";
+    tableBox.appendChild(renderOrdersTable(filtered, {
+      onOpen: (id) => openOrderEditor(id)
+    }));
+  }
+
+  search.addEventListener("input", () => loadOnce());
+  status.addEventListener("change", () => loadOnce());
+
+  await loadOnce();
+  return host;
+}
+
+function statusBadge(s) {
+  const v = s || "open";
+  const map = {
+    open: { t:"مفتوح", c:"warn" },
+    inProgress: { t:"قيد العمل", c:"warn" },
+    done: { t:"مكتمل", c:"ok" },
+    cancelled: { t:"ملغي", c:"bad" },
+  };
+  const m = map[v] || { t:v, c:"" };
+  return el("span", { class:`badge ${m.c}` }, [m.t]);
+}
+
+function renderOrdersTable(rows, opts={}) {
+  const onOpen = opts.onOpen || ((id)=>navTo("orders", id));
+  const compact = !!opts.compact;
+
+  const tbl = el("table", { class:"table" }, [
+    el("thead", {}, [
+      el("tr", {}, [
+        el("th", {}, ["التاريخ"]),
+        el("th", {}, ["الزبون"]),
+        el("th", {}, ["السيارة"]),
+        el("th", {}, ["الحالة"]),
+        el("th", {}, ["إجراءات"]),
+      ])
+    ]),
+    el("tbody")
+  ]);
+
+  const tb = tbl.querySelector("tbody");
+
+  if (!rows.length) {
+    tb.appendChild(el("tr", {}, [
+      el("td", { colspan:"5", style:"text-align:center; color:rgba(234,240,255,.7)" }, ["لا يوجد بيانات"])
+    ]));
+    return tbl;
+  }
+
+  for (const r of rows) {
+    const car = r.carPlate || r.plate || "-";
+    const model = r.carModel || r.model || "";
+    const c = `${car}${model ? " — " + model : ""}`;
+
+    const actions = el("div", { class:"actions" }, [
+      el("button", { class:"btn", onclick: () => onOpen(r.id) }, ["فتح"]),
+      !compact && hasPerm(state.profile, "delete")
+        ? el("button", { class:"btn bad", onclick: () => deleteOrder(r.id) }, ["حذف"])
+        : el("span")
+    ]);
+
+    tb.appendChild(el("tr", {}, [
+      el("td", {}, [fmtDate(r.createdAt)]),
+      el("td", {}, [
+        el("div", {}, [el("b", {}, [r.customerName || "-"])]),
+        el("div", { class:"muted", style:"font-size:12px" }, [r.customerPhone || ""])
+      ]),
+      el("td", {}, [c]),
+      el("td", {}, [statusBadge(r.status)]),
+      el("td", {}, [actions]),
+    ]));
+  }
+  return tbl;
+}
+
+async function deleteOrder(id) {
+  if (!confirm("تأكيد حذف أمر الشغل؟")) return;
+  try {
+    await deleteDoc(doc(state.db, C.orders, id));
+    toast("تم الحذف", "أمر الشغل", "ok");
+    renderRoute();
+  } catch (e) {
+    toast("تعذر الحذف", e?.message || "", "bad");
+  }
+}
+
+/* ---------- Order Editor ---------- */
+async function openOrderEditor(orderId=null) {
+  const isNew = !orderId;
+  const data = isNew ? {
+    type: "general",
+    status: "open",
+    customerName: "",
+    customerPhone: "",
+    plate: "",
+    model: "",
+    year: "",
+    notes: "",
+    services: [],
+    parts: [],
+  } : await (async ()=>{
+    const s = await getDoc(doc(state.db, C.orders, orderId));
+    return s.exists() ? { id:s.id, ...s.data() } : null;
+  })();
+
+  if (!data) return toast("غير موجود", "لم يتم العثور على أمر الشغل", "warn");
+
+  const title = isNew ? "أمر شغل جديد" : "تعديل أمر شغل";
+
+  const fName = el("input", { class:"input", value: data.customerName || "" });
+  const fPhone = el("input", { class:"input", value: data.customerPhone || "" });
+
+  const fPlate = el("input", { class:"input", value: data.carPlate || data.plate || "" });
+  const fModel = el("input", { class:"input", value: data.carModel || data.model || "" });
+  const fYear  = el("input", { class:"input", type:"number", value: data.carYear || data.year || "" });
+
+  const fStatus = el("select", {}, [
+    el("option", { value:"open" }, ["مفتوح"]),
+    el("option", { value:"inProgress" }, ["قيد العمل"]),
+    el("option", { value:"done" }, ["مكتمل"]),
+    el("option", { value:"cancelled" }, ["ملغي"]),
+  ]);
+  fStatus.value = data.status || "open";
+
+  const fNotes = el("textarea", {}, [data.notes || ""]);
+
+  // Services list (simple)
+  const serviceName = el("input", { class:"input", placeholder:"اسم الخدمة (مثال: تصليح مكابح)" });
+  const servicePrice = el("input", { class:"input", type:"number", placeholder:"سعر الخدمة" });
+  const btnAddService = el("button", { class:"btn", onclick: () => {
+    const n = serviceName.value.trim(); const p = Number(servicePrice.value||0);
+    if (!n) return;
+    data.services = data.services || [];
+    data.services.push({ name:n, price:p });
+    serviceName.value=""; servicePrice.value="";
+    renderServices();
+  }}, ["إضافة خدمة"]);
+
+  const servicesBox = el("div", {}, []);
+  function renderServices() {
+    servicesBox.innerHTML = "";
+    const list = (data.services || []);
+    if (!list.length) {
+      servicesBox.appendChild(el("div", { class:"muted" }, ["لا توجد خدمات بعد."]));
+      return;
+    }
+    const t = el("table", { class:"table" }, [
+      el("thead", {}, [el("tr", {}, [el("th", {}, ["الخدمة"]), el("th", {}, ["السعر"]), el("th", {}, [""])])]),
+      el("tbody")
+    ]);
+    for (let i=0;i<list.length;i++){
+      const s = list[i];
+      t.querySelector("tbody").appendChild(el("tr", {}, [
+        el("td", {}, [s.name]),
+        el("td", {}, [fmtMoney(s.price||0)]),
+        el("td", {}, [
+          el("button", { class:"btn bad", onclick: () => { list.splice(i,1); renderServices(); }}, ["حذف"])
+        ])
+      ]));
+    }
+    servicesBox.appendChild(t);
+  }
+
+  // Parts list
+  const partName = el("input", { class:"input", placeholder:"قطعة / وصف" });
+  const partQty = el("input", { class:"input", type:"number", placeholder:"الكمية", value:"1" });
+  const partPrice = el("input", { class:"input", type:"number", placeholder:"السعر" });
+  const btnAddPart = el("button", { class:"btn", onclick: () => {
+    const n = partName.value.trim(); const q = Number(partQty.value||1); const p=Number(partPrice.value||0);
+    if (!n) return;
+    data.parts = data.parts || [];
+    data.parts.push({ name:n, qty:q, price:p });
+    partName.value=""; partQty.value="1"; partPrice.value="";
+    renderParts();
+  }}, ["إضافة قطعة"]);
+
+  const partsBox = el("div", {}, []);
+  function renderParts() {
+    partsBox.innerHTML = "";
+    const list = (data.parts || []);
+    if (!list.length) {
+      partsBox.appendChild(el("div", { class:"muted" }, ["لا توجد قطع بعد."]));
+      return;
+    }
+    const t = el("table", { class:"table" }, [
+      el("thead", {}, [el("tr", {}, [el("th", {}, ["القطعة"]), el("th", {}, ["كمية"]), el("th", {}, ["سعر"]), el("th", {}, [""])])]),
+      el("tbody")
+    ]);
+    for (let i=0;i<list.length;i++){
+      const p = list[i];
+      t.querySelector("tbody").appendChild(el("tr", {}, [
+        el("td", {}, [p.name]),
+        el("td", {}, [String(p.qty||1)]),
+        el("td", {}, [fmtMoney(p.price||0)]),
+        el("td", {}, [
+          el("button", { class:"btn bad", onclick: () => { list.splice(i,1); renderParts(); }}, ["حذف"])
+        ])
+      ]));
+    }
+    partsBox.appendChild(t);
+  }
+
+  renderServices();
+  renderParts();
+
+  const calcTotal = () => {
+    const s = (data.services||[]).reduce((a,x)=>a+Number(x.price||0),0);
+    const p = (data.parts||[]).reduce((a,x)=>a+(Number(x.price||0)*Number(x.qty||1)),0);
+    return s+p;
   };
 
-  render();
-  $("#invSearch").oninput = (e)=> render(e.target.value);
-}
+  const totalBox = el("div", { class:"card" }, [
+    el("h3", {}, ["المجموع التقريبي"]),
+    el("div", { class:"kpi" }, [
+      el("div", { class:"n", id:"orderTotal" }, [fmtMoney(calcTotal())]),
+      el("div", { class:"l" }, ["خدمات + قطع"])
+    ])
+  ]);
 
-function openInvoiceEditor(existing){
-  const data = JSON.parse(JSON.stringify(existing||{}));
-  data.items = Array.isArray(data.items) ? data.items : [];
-  data.discount = Number(data.discount||0);
-  data.taxRate = Number(data.taxRate ?? State.settings.taxRate ?? 0);
+  function refreshTotal(){
+    $("#orderTotal", totalBox).textContent = fmtMoney(calcTotal());
+  }
 
-  const close = modal({
-    title: `تعديل فاتورة: ${data.invoiceNo||data.id}`,
-    bodyHTML: `
-      <div class="row">
-        <div class="col-7">
-          <div class="card" style="padding:12px">
-            <div class="cardTitle">البيانات الأساسية</div>
-            <div class="row">
-              <div class="col-6">
-                <label>الحالة</label>
-                <select class="input" id="invStatus">
-                  ${["unpaid","partial","paid","void"].map(s=>`<option ${data.status===s?"selected":""} value="${s}">${s}</option>`).join("")}
-                </select>
-              </div>
-              <div class="col-6">
-                <label>قالب الفاتورة</label>
-                <select class="input" id="tpl">
-                  ${State.templates.map(t=>`<option ${data.templateId===t.id?"selected":""} value="${t.id}">${escapeHtml(t.name||t.id)}</option>`).join("")}
-                </select>
-              </div>
-              <div class="col-6">
-                <label>خصم</label>
-                <input class="input" id="discount" type="number" value="${escapeHtml(String(data.discount||0))}"/>
-              </div>
-              <div class="col-6">
-                <label>ضريبة (%)</label>
-                <input class="input" id="taxRate" type="number" value="${escapeHtml(String(data.taxRate||0))}"/>
-              </div>
-              <div class="col-12">
-                <label>ملاحظات</label>
-                <textarea class="input" id="invNotes">${escapeHtml(data.notes||"")}</textarea>
-              </div>
-            </div>
-          </div>
+  const body = el("div", { class:"grid", style:"gap:14px" }, [
+    el("div", { class:"card" }, [
+      el("h3", {}, ["بيانات الزبون والسيارة (صفحة واحدة)"]),
+      el("div", { class:"row" }, [
+        el("div", { class:"field" }, [el("label", {}, ["اسم الزبون"]), fName]),
+        el("div", { class:"field" }, [el("label", {}, ["الهاتف"]), fPhone]),
+      ]),
+      el("div", { class:"row" }, [
+        el("div", { class:"field" }, [el("label", {}, ["اللوحة"]), fPlate]),
+        el("div", { class:"field" }, [el("label", {}, ["الموديل"]), fModel]),
+        el("div", { class:"field" }, [el("label", {}, ["السنة"]), fYear]),
+      ]),
+      el("div", { class:"row" }, [
+        el("div", { class:"field" }, [el("label", {}, ["الحالة"]), fStatus]),
+      ]),
+      el("div", { class:"field" }, [el("label", {}, ["ملاحظات"]), fNotes]),
+    ]),
 
-          <div class="card" style="padding:12px;margin-top:14px">
-            <div class="cardHeader">
-              <div>
-                <div class="cardTitle">عناصر الفاتورة</div>
-                <div class="cardDesc">يمكن ربط القطعة بالمخزون لضمان الخصم الصحيح</div>
-              </div>
-              <div class="btnRow">
-                <button class="btn small ghost" id="addService">+ خدمة</button>
-                <button class="btn small ghost" id="addPart">+ قطعة</button>
-              </div>
-            </div>
-            <div id="itemsArea"></div>
-          </div>
+    el("div", { class:"card" }, [
+      el("h3", {}, ["الخدمات"]),
+      el("div", { class:"row" }, [
+        el("div", { class:"field" }, [el("label", {}, ["خدمة"]), serviceName]),
+        el("div", { class:"field" }, [el("label", {}, ["سعر"]), servicePrice]),
+        el("div", { class:"actions", style:"align-items:flex-end; padding-top:18px" }, [btnAddService]),
+      ]),
+      servicesBox
+    ]),
 
-          <div class="card" style="padding:12px;margin-top:14px">
-            <div class="cardTitle">المدفوعات</div>
-            <div class="cardDesc">سلفة/دفعة/شبكة/تحويل</div>
-            <div id="payArea"></div>
-          </div>
-        </div>
+    el("div", { class:"card" }, [
+      el("h3", {}, ["القطع / قطع الغيار"]),
+      el("div", { class:"row" }, [
+        el("div", { class:"field" }, [el("label", {}, ["الوصف"]), partName]),
+        el("div", { class:"field" }, [el("label", {}, ["الكمية"]), partQty]),
+        el("div", { class:"field" }, [el("label", {}, ["السعر"]), partPrice]),
+        el("div", { class:"actions", style:"align-items:flex-end; padding-top:18px" }, [btnAddPart]),
+      ]),
+      partsBox
+    ]),
 
-        <div class="col-5">
-          <div class="card" style="padding:12px">
-            <div class="cardHeader">
-              <div>
-                <div class="cardTitle">معاينة الفاتورة (Live)</div>
-                <div class="cardDesc">يتحدث فوراً عند التعديل</div>
-              </div>
-              <div class="btnRow">
-                <button class="btn small success" id="btnPrint">طباعة</button>
-              </div>
-            </div>
-            <div class="tableWrap" style="min-width:auto">
-              <div id="preview" style="background:#fff;color:#111;border-radius:16px;padding:10px"></div>
-            </div>
-          </div>
+    totalBox
+  ]);
 
-          <div class="card" style="padding:12px;margin-top:14px">
-            <div class="cardTitle">ملخص</div>
-            <div id="sumBox"></div>
-          </div>
-        </div>
-      </div>
-    `,
-    footerHTML: `
-      <button class="btn primary" id="saveInv">حفظ</button>
-      <button class="btn ghost" data-x>إغلاق</button>
-    `,
-    onMount: async (host, closeModal)=>{
-      // load inventory once for linking
-      const invItems = await listCol("inventoryItems", { orderArr:["name","asc"], lim: 500 });
+  // auto total update
+  const mo = new MutationObserver(refreshTotal);
+  mo.observe(servicesBox, { childList:true, subtree:true });
+  mo.observe(partsBox, { childList:true, subtree:true });
 
-      const renderItems = ()=>{
-        const wrap = $("#itemsArea", host);
-        wrap.innerHTML = data.items.map((it, idx)=>{
-          const isPart = String(it.type||"").includes("قط");
-          return `
-            <div class="row" style="align-items:end;border:1px solid var(--line);border-radius:16px;padding:10px;margin-top:10px">
-              <div class="col-3">
-                <label>النوع</label>
-                <select class="input" data-k="type" data-i="${idx}">
-                  ${["خدمة","قطعة"].map(t=>`<option ${(it.type===t)?"selected":""} value="${t}">${t}</option>`).join("")}
-                </select>
-              </div>
-              <div class="col-5">
-                <label>الوصف</label>
-                <input class="input" data-k="name" data-i="${idx}" value="${escapeHtml(it.name||"")}"/>
-              </div>
-              <div class="col-2">
-                <label>كمية</label>
-                <input class="input" data-k="qty" data-i="${idx}" type="number" value="${escapeHtml(String(it.qty||1))}"/>
-              </div>
-              <div class="col-2">
-                <label>سعر</label>
-                <input class="input" data-k="price" data-i="${idx}" type="number" value="${escapeHtml(String(it.price||0))}"/>
-              </div>
+  const btnSave = el("button", { class:"btn primary", onclick: async () => {
+    try {
+      btnSave.disabled = true;
 
-              <div class="col-8">
-                <label>ربط بالمخزون (للقطع فقط)</label>
-                <select class="input" data-k="inventoryItemId" data-i="${idx}" ${isPart ? "" : "disabled"}>
-                  <option value="">— بدون ربط —</option>
-                  ${invItems.map(x=>`<option ${(it.inventoryItemId===x.id)?"selected":""} value="${x.id}">${escapeHtml(x.name||"")} • متوفر:${escapeHtml(String(x.stock||0))}</option>`).join("")}
-                </select>
-              </div>
-              <div class="col-4">
-                <label>إجراء</label>
-                <div class="btnRow">
-                  <button class="btn small danger" data-del="${idx}">حذف</button>
-                </div>
-              </div>
-            </div>
-          `;
-        }).join("") || `<div class="smallMuted">لا توجد عناصر.</div>`;
-
-        // bind
-        $$("[data-del]", host).forEach(b=> b.onclick = ()=>{
-          data.items.splice(Number(b.dataset.del), 1);
-          refreshAll();
-        });
-
-        $$("input[data-k], select[data-k]", host).forEach(el=>{
-          el.oninput = ()=>{
-            const i = Number(el.dataset.i);
-            const k = el.dataset.k;
-            const v = (k==="qty"||k==="price") ? Number(el.value||0) : el.value;
-            data.items[i][k] = v;
-            refreshAll();
-          };
-        });
-      };
-
-      const renderPayments = ()=>{
-        data.payments = Array.isArray(data.payments) ? data.payments : [];
-        const wrap = $("#payArea", host);
-        const sumPaid = data.payments.reduce((s,p)=> s + Number(p.amount||0), 0);
-
-        wrap.innerHTML = `
-          <div class="pill" style="justify-content:space-between;width:100%">
-            <span>المدفوع</span>
-            <span><b>${money(sumPaid, State.settings.currency)}</b></span>
-          </div>
-
-          ${data.payments.map((p,idx)=>`
-            <div class="row" style="align-items:end;border:1px solid var(--line);border-radius:16px;padding:10px;margin-top:10px">
-              <div class="col-4">
-                <label>النوع</label>
-                <select class="input" data-pk="method" data-pi="${idx}">
-                  ${["cash","card","transfer","other"].map(m=>`<option ${(p.method===m)?"selected":""} value="${m}">${m}</option>`).join("")}
-                </select>
-              </div>
-              <div class="col-4">
-                <label>المبلغ</label>
-                <input class="input" data-pk="amount" data-pi="${idx}" type="number" value="${escapeHtml(String(p.amount||0))}"/>
-              </div>
-              <div class="col-4">
-                <label>ملاحظة</label>
-                <input class="input" data-pk="note" data-pi="${idx}" value="${escapeHtml(String(p.note||""))}"/>
-              </div>
-              <div class="col-12">
-                <button class="btn small danger" data-pdel="${idx}">حذف دفعة</button>
-              </div>
-            </div>
-          `).join("")}
-
-          <div class="btnRow" style="margin-top:10px">
-            <button class="btn small ghost" id="addPay">+ إضافة دفعة</button>
-          </div>
-        `;
-
-        $("#addPay", host).onclick = ()=>{
-          data.payments.push({ method:"cash", amount:0, note:"" });
-          refreshAll();
-        };
-
-        $$("button[data-pdel]", host).forEach(b=> b.onclick = ()=>{
-          data.payments.splice(Number(b.dataset.pdel), 1);
-          refreshAll();
-        });
-
-        $$("input[data-pk], select[data-pk]", host).forEach(el=>{
-          el.oninput = ()=>{
-            const i = Number(el.dataset.pi);
-            const k = el.dataset.pk;
-            data.payments[i][k] = (k==="amount") ? Number(el.value||0) : el.value;
-            refreshAll();
-          };
-        });
-      };
-
-      const renderPreview = ()=>{
-        const tplId = $("#tpl", host).value;
-        const tpl = State.templates.find(t=>t.id===tplId) || State.templates[0];
-
-        const items = data.items.map(it=>{
-          const lt = Number(it.qty||0)*Number(it.price||0);
-          return {
-            type: it.type || "",
-            name: it.name || "",
-            qty: String(it.qty||0),
-            price: money(it.price||0, State.settings.currency),
-            lineTotal: money(lt, State.settings.currency),
-          };
-        });
-
-        const totals = calcInvoiceTotals(data.items, Number($("#discount", host).value||0), Number($("#taxRate", host).value||0));
-        const payload = {
-          workshopName: State.settings.workshopName || "RPM",
-          invoiceNo: data.invoiceNo || "",
-          date: nowISO(),
-          customerName: data.customerSnapshot?.name || "",
-          customerPhone: data.customerSnapshot?.phone || "",
-          plate: data.vehicleSnapshot?.plate || "",
-          carModel: data.vehicleSnapshot?.model || "",
-          carYear: data.vehicleSnapshot?.year || "",
-          km: String(data.vehicleSnapshot?.km||0),
-          items,
-          subTotal: money(totals.subTotal, State.settings.currency),
-          discount: money(totals.discount, State.settings.currency),
-          tax: money(totals.tax, State.settings.currency),
-          grandTotal: money(totals.grandTotal, State.settings.currency),
-          notes: $("#invNotes", host).value || "",
-        };
-
-        const html = renderTemplate(tpl.html||"", payload);
-        $("#preview", host).innerHTML = `
-          <style>${tpl.css||""}</style>
-          <div>${html}</div>
-        `;
-
-        $("#sumBox", host).innerHTML = `
-          <div class="pill" style="justify-content:space-between;width:100%">
-            <span>المجموع</span><span><b>${money(totals.subTotal, State.settings.currency)}</b></span>
-          </div>
-          <div class="pill" style="justify-content:space-between;width:100%;margin-top:8px">
-            <span>خصم</span><span><b>${money(totals.discount, State.settings.currency)}</b></span>
-          </div>
-          <div class="pill" style="justify-content:space-between;width:100%;margin-top:8px">
-            <span>ضريبة</span><span><b>${money(totals.tax, State.settings.currency)}</b></span>
-          </div>
-          <div class="pill ok" style="justify-content:space-between;width:100%;margin-top:8px">
-            <span>الإجمالي</span><span><b>${money(totals.grandTotal, State.settings.currency)}</b></span>
-          </div>
-        `;
-      };
-
-      const refreshAll = ()=>{
-        // sync header fields
-        data.status = $("#invStatus", host).value;
-        data.templateId = $("#tpl", host).value;
-        data.discount = Number($("#discount", host).value||0);
-        data.taxRate = Number($("#taxRate", host).value||0);
-        data.notes = $("#invNotes", host).value;
-
-        renderItems();
-        renderPayments();
-        renderPreview();
-      };
-
-      $("#addService", host).onclick = ()=>{
-        data.items.push({ type:"خدمة", name:"", qty:1, price:0, inventoryItemId:"" });
-        refreshAll();
-      };
-      $("#addPart", host).onclick = ()=>{
-        data.items.push({ type:"قطعة", name:"", qty:1, price:0, inventoryItemId:"" });
-        refreshAll();
-      };
-
-      $("#btnPrint", host).onclick = async ()=>{ await printInvoice(data.id); };
-
-      // bind top fields
-      ["invStatus","tpl","discount","taxRate","invNotes"].forEach(id=>{
-        $("#"+id, host).oninput = ()=> renderPreview();
+      // auto-create customer & car
+      const { customerId, carId } = await ensureCustomerAndCar({
+        customerName: fName.value,
+        customerPhone: fPhone.value,
+        plate: fPlate.value,
+        model: fModel.value,
+        year: fYear.value,
       });
 
-      refreshAll();
-
-      $("#saveInv", host).onclick = async ()=>{
-        try{
-          const before = existing;
-          const totals = calcInvoiceTotals(data.items, data.discount, data.taxRate);
-
-          // إذا سياسة الخصم عند paid: عند تغيير للحالة paid نخصم المخزون
-          const policy = (State.settings?.stockConsumePolicy||"invoice_create");
-          const becamePaid = policy==="invoice_paid" && before.status!=="paid" && data.status==="paid";
-          if(becamePaid){
-            await consumeStockForInvoiceItems(data.items);
-          }
-
-          data.totals = totals;
-          await upd("invoices", data.id, data);
-          await audit("update","invoices", data.id, before, data);
-
-          toast("تم الحفظ", `فاتورة: ${data.invoiceNo}`);
-          closeModal();
-          renderInvoices();
-        }catch(e){
-          toast("خطأ", e.message);
-        }
-      };
-    }
-  });
-}
-
-async function printInvoice(invoiceId){
-  const inv = await getOne(doc(db,"invoices", invoiceId));
-  if(!inv){ toast("غير موجود","تعذر إيجاد الفاتورة."); return; }
-  const tpl = State.templates.find(t=>t.id===inv.templateId) || State.templates[0];
-  const items = (inv.items||[]).map(it=>{
-    const lt = Number(it.qty||0)*Number(it.price||0);
-    return {
-      type: it.type || "",
-      name: it.name || "",
-      qty: String(it.qty||0),
-      price: money(it.price||0, State.settings.currency),
-      lineTotal: money(lt, State.settings.currency),
-    };
-  });
-  const payload = {
-    workshopName: State.settings.workshopName || "RPM",
-    invoiceNo: inv.invoiceNo || "",
-    date: nowISO(),
-    customerName: inv.customerSnapshot?.name || "",
-    customerPhone: inv.customerSnapshot?.phone || "",
-    plate: inv.vehicleSnapshot?.plate || "",
-    carModel: inv.vehicleSnapshot?.model || "",
-    carYear: inv.vehicleSnapshot?.year || "",
-    km: String(inv.vehicleSnapshot?.km||0),
-    items,
-    subTotal: money(inv?.totals?.subTotal||0, State.settings.currency),
-    discount: money(inv?.totals?.discount||0, State.settings.currency),
-    tax: money(inv?.totals?.tax||0, State.settings.currency),
-    grandTotal: money(inv?.totals?.grandTotal||0, State.settings.currency),
-    notes: inv.notes || "",
-  };
-
-  const html = renderTemplate(tpl.html||"", payload);
-
-  const w = window.open("", "_blank");
-  w.document.write(`
-    <!doctype html><html lang="ar" dir="rtl">
-    <head><meta charset="utf-8"/><title>${escapeHtml(inv.invoiceNo||"Invoice")}</title>
-    <style>${tpl.css||""}</style></head>
-    <body>${html}
-      <script>window.onload=()=>{window.print();}</script>
-    </body></html>
-  `);
-  w.document.close();
-}
-
-/* =========================
-   Inventory
-========================= */
-async function renderInventory(){
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"المخزون",
-    subtitle:"قطع الغيار + تنبيه نفاد + ربط مع الفواتير",
-    actionsHTML: `
-      <button class="btn primary" id="newItem">إضافة صنف</button>
-      <button class="btn ghost" id="refreshInvn">تحديث</button>
-    `
-  });
-  $("#refreshInvn").onclick = ()=> renderInventory();
-  $("#newItem").onclick = ()=> openInventoryEditor();
-
-  const body = $("#pageBody");
-  body.innerHTML = `<div class="card"><div class="cardTitle">تحميل...</div></div>`;
-
-  const rows = await listCol("inventoryItems", { orderArr:["updatedAt","desc"], lim: 600 });
-
-  body.innerHTML = `
-    <div class="card">
-      <div class="cardHeader">
-        <div>
-          <div class="cardTitle">قائمة القطع</div>
-          <div class="cardDesc">يمكن تعديل الكلفة/السعر/المتوفر/الحد الأدنى</div>
-        </div>
-        <div style="min-width:320px">
-          <input class="input" id="invnSearch" placeholder="بحث: اسم، SKU، باركود..." />
-        </div>
-      </div>
-      <div id="invnTable"></div>
-    </div>
-  `;
-
-  const render = (filter="")=>{
-    const f = filter.trim().toLowerCase();
-    const data = !f ? rows : rows.filter(x=>{
-      const t = [x.name,x.sku,x.barcode,x.brand,x.location].join(" ").toLowerCase();
-      return t.includes(f);
-    });
-
-    $("#invnTable").innerHTML = tableHTML({
-      columns:[
-        { label:"الصنف", render:r=> `<b>${escapeHtml(r.name||"")}</b><div class="smallMuted">SKU: ${escapeHtml(r.sku||"")}</div>` },
-        { label:"المتوفر", render:r=>{
-          const s = Number(r.stock||0), m = Number(r.minStock||0);
-          const cls = s<=m ? "pill warn" : "pill";
-          return `<span class="${cls}">${escapeHtml(String(s))}</span><div class="smallMuted">Min: ${escapeHtml(String(m))}</div>`;
-        }},
-        { label:"كلفة/بيع", render:r=> `${money(r.cost||0, State.settings.currency)}<div class="smallMuted">${money(r.price||0, State.settings.currency)}</div>`},
-        { label:"الموقع", render:r=> `${escapeHtml(r.location||"")}<div class="smallMuted">${escapeHtml(r.brand||"")}</div>`},
-        { label:"إجراء", render:r=> `
-          <div class="btnRow">
-            <button class="btn small ghost" data-edit="${r.id}">تعديل</button>
-            <button class="btn small danger" data-del="${r.id}">حذف</button>
-          </div>
-        `}
-      ],
-      rows:data
-    });
-
-    $$("button[data-edit]").forEach(b=> b.onclick = ()=> openInventoryEditor(rows.find(x=>x.id===b.dataset.edit)));
-    $$("button[data-del]").forEach(b=> b.onclick = async ()=>{
-      if(!await safeConfirm("حذف الصنف؟")) return;
-      const before = rows.find(x=>x.id===b.dataset.del) || null;
-      await del("inventoryItems", b.dataset.del);
-      await audit("delete","inventoryItems", b.dataset.del, before, null);
-      toast("تم الحذف","تم حذف الصنف.");
-      renderInventory();
-    });
-  };
-
-  render();
-  $("#invnSearch").oninput = (e)=> render(e.target.value);
-}
-
-function openInventoryEditor(existing=null){
-  const data = existing ? JSON.parse(JSON.stringify(existing)) : {
-    name:"", sku:"", barcode:"", brand:"", unit:"قطعة",
-    cost:0, price:0, stock:0, minStock:0, location:""
-  };
-
-  modal({
-    title: existing ? `تعديل صنف: ${existing.name||existing.id}` : "إضافة صنف",
-    bodyHTML: `
-      <div class="row">
-        <div class="col-6"><label>الاسم</label><input class="input" id="name" value="${escapeHtml(data.name)}"/></div>
-        <div class="col-3"><label>SKU</label><input class="input" id="sku" value="${escapeHtml(data.sku||"")}"/></div>
-        <div class="col-3"><label>باركود</label><input class="input" id="barcode" value="${escapeHtml(data.barcode||"")}"/></div>
-
-        <div class="col-4"><label>العلامة</label><input class="input" id="brand" value="${escapeHtml(data.brand||"")}"/></div>
-        <div class="col-4"><label>الوحدة</label><input class="input" id="unit" value="${escapeHtml(data.unit||"قطعة")}"/></div>
-        <div class="col-4"><label>الموقع</label><input class="input" id="location" value="${escapeHtml(data.location||"")}"/></div>
-
-        <div class="col-3"><label>الكلفة</label><input class="input" id="cost" type="number" value="${escapeHtml(String(data.cost||0))}"/></div>
-        <div class="col-3"><label>سعر البيع</label><input class="input" id="price" type="number" value="${escapeHtml(String(data.price||0))}"/></div>
-        <div class="col-3"><label>المتوفر</label><input class="input" id="stock" type="number" value="${escapeHtml(String(data.stock||0))}"/></div>
-        <div class="col-3"><label>حد أدنى</label><input class="input" id="minStock" type="number" value="${escapeHtml(String(data.minStock||0))}"/></div>
-      </div>
-    `,
-    footerHTML: `
-      <button class="btn primary" id="save">حفظ</button>
-      <button class="btn ghost" data-x>إغلاق</button>
-    `,
-    onMount:(host, close)=>{
-      $("#save", host).onclick = async ()=>{
-        try{
-          const payload = {
-            name: $("#name", host).value.trim(),
-            sku: $("#sku", host).value.trim(),
-            barcode: $("#barcode", host).value.trim(),
-            brand: $("#brand", host).value.trim(),
-            unit: $("#unit", host).value.trim(),
-            location: $("#location", host).value.trim(),
-            cost: Number($("#cost", host).value||0),
-            price: Number($("#price", host).value||0),
-            stock: Number($("#stock", host).value||0),
-            minStock: Number($("#minStock", host).value||0),
-          };
-
-          if(!existing){
-            const id = await addCol("inventoryItems", payload);
-            await audit("create","inventoryItems", id, null, payload);
-            toast("تمت الإضافة", payload.name);
-          }else{
-            const before = existing;
-            await upd("inventoryItems", existing.id, payload);
-            await audit("update","inventoryItems", existing.id, before, payload);
-            toast("تم التحديث", payload.name);
-          }
-          close();
-          renderInventory();
-        }catch(e){
-          toast("خطأ", e.message);
-        }
-      };
-    }
-  });
-}
-
-/* =========================
-   Suppliers
-========================= */
-async function renderSuppliers(){
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"الموردين",
-    subtitle:"إضافة/تعديل/حذف الموردين",
-    actionsHTML: `
-      <button class="btn primary" id="newSup">إضافة مورد</button>
-      <button class="btn ghost" id="refreshSup">تحديث</button>
-    `
-  });
-  $("#refreshSup").onclick = ()=> renderSuppliers();
-  $("#newSup").onclick = ()=> openSupplierEditor();
-
-  const body = $("#pageBody");
-  body.innerHTML = `<div class="card"><div class="cardTitle">تحميل...</div></div>`;
-
-  const rows = await listCol("suppliers", { orderArr:["updatedAt","desc"], lim: 400 });
-
-  body.innerHTML = `
-    <div class="card">
-      <div class="cardHeader">
-        <div><div class="cardTitle">قائمة الموردين</div><div class="cardDesc">تستخدم في المشتريات</div></div>
-        <div style="min-width:320px"><input class="input" id="supSearch" placeholder="بحث..." /></div>
-      </div>
-      <div id="supTable"></div>
-    </div>
-  `;
-
-  const render=(filter="")=>{
-    const f = filter.trim().toLowerCase();
-    const data = !f ? rows : rows.filter(x=> [x.name,x.phone,x.address].join(" ").toLowerCase().includes(f));
-    $("#supTable").innerHTML = tableHTML({
-      columns:[
-        { label:"الاسم", render:r=> `<b>${escapeHtml(r.name||"")}</b>` },
-        { label:"الهاتف", key:"phone" },
-        { label:"العنوان", key:"address" },
-        { label:"إجراء", render:r=> `
-          <div class="btnRow">
-            <button class="btn small ghost" data-edit="${r.id}">تعديل</button>
-            <button class="btn small danger" data-del="${r.id}">حذف</button>
-          </div>
-        `}
-      ],
-      rows:data
-    });
-
-    $$("button[data-edit]").forEach(b=> b.onclick = ()=> openSupplierEditor(rows.find(x=>x.id===b.dataset.edit)));
-    $$("button[data-del]").forEach(b=> b.onclick = async ()=>{
-      if(!await safeConfirm("حذف المورد؟")) return;
-      const before = rows.find(x=>x.id===b.dataset.del) || null;
-      await del("suppliers", b.dataset.del);
-      await audit("delete","suppliers", b.dataset.del, before, null);
-      toast("تم الحذف","تم حذف المورد.");
-      renderSuppliers();
-    });
-  };
-
-  render();
-  $("#supSearch").oninput = (e)=> render(e.target.value);
-}
-
-function openSupplierEditor(existing=null){
-  const data = existing ? JSON.parse(JSON.stringify(existing)) : { name:"", phone:"", address:"" };
-  modal({
-    title: existing ? `تعديل مورد: ${existing.name}` : "إضافة مورد",
-    bodyHTML: `
-      <div class="row">
-        <div class="col-6"><label>الاسم</label><input class="input" id="name" value="${escapeHtml(data.name||"")}"/></div>
-        <div class="col-6"><label>الهاتف</label><input class="input" id="phone" value="${escapeHtml(data.phone||"")}"/></div>
-        <div class="col-12"><label>العنوان</label><input class="input" id="address" value="${escapeHtml(data.address||"")}"/></div>
-      </div>
-    `,
-    footerHTML: `<button class="btn primary" id="save">حفظ</button><button class="btn ghost" data-x>إغلاق</button>`,
-    onMount:(host, close)=>{
-      $("#save", host).onclick = async ()=>{
-        try{
-          const payload = {
-            name: $("#name", host).value.trim(),
-            phone: $("#phone", host).value.trim(),
-            address: $("#address", host).value.trim(),
-          };
-          if(!existing){
-            const id = await addCol("suppliers", payload);
-            await audit("create","suppliers", id, null, payload);
-            toast("تمت الإضافة", payload.name);
-          }else{
-            const before = existing;
-            await upd("suppliers", existing.id, payload);
-            await audit("update","suppliers", existing.id, before, payload);
-            toast("تم التحديث", payload.name);
-          }
-          close();
-          renderSuppliers();
-        }catch(e){ toast("خطأ", e.message); }
-      };
-    }
-  });
-}
-
-/* =========================
-   Purchases (فاتورة شراء + تحديث مخزون)
-========================= */
-async function renderPurchases(){
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"المشتريات",
-    subtitle:"إضافة فاتورة شراء للمورد وتحديث المخزون",
-    actionsHTML: `
-      <button class="btn primary" id="newPO">فاتورة شراء جديدة</button>
-      <button class="btn ghost" id="refreshPO">تحديث</button>
-    `
-  });
-  $("#refreshPO").onclick = ()=> renderPurchases();
-  $("#newPO").onclick = ()=> openPurchaseEditor();
-
-  const body = $("#pageBody");
-  body.innerHTML = `<div class="card"><div class="cardTitle">تحميل...</div></div>`;
-
-  const rows = await listCol("purchaseOrders", { orderArr:["updatedAt","desc"], lim: 250 });
-
-  body.innerHTML = `
-    <div class="card">
-      <div class="cardHeader">
-        <div><div class="cardTitle">فواتير الشراء</div><div class="cardDesc">عند اعتماد الشراء يتم إضافة الكميات للمخزون</div></div>
-      </div>
-      <div id="poTable"></div>
-    </div>
-  `;
-
-  $("#poTable").innerHTML = tableHTML({
-    columns:[
-      { label:"رقم", render:r=> `<b>${escapeHtml(r.poNo||r.id)}</b>` },
-      { label:"المورد", render:r=> `${escapeHtml(r.supplierSnapshot?.name||"")}` },
-      { label:"الحالة", render:r=> statusPill(r.status) },
-      { label:"الإجمالي", render:r=> `<b>${money(r?.totals?.grandTotal||0, State.settings.currency)}</b>` },
-      { label:"إجراء", render:r=> `
-        <div class="btnRow">
-          <button class="btn small ghost" data-edit="${r.id}">تعديل</button>
-          <button class="btn small danger" data-del="${r.id}">حذف</button>
-        </div>
-      `}
-    ],
-    rows
-  });
-
-  $$("button[data-edit]").forEach(b=> b.onclick = ()=> openPurchaseEditor(rows.find(x=>x.id===b.dataset.edit)));
-  $$("button[data-del]").forEach(b=> b.onclick = async ()=>{
-    if(!await safeConfirm("حذف فاتورة الشراء؟")) return;
-    const before = rows.find(x=>x.id===b.dataset.del)||null;
-    await del("purchaseOrders", b.dataset.del);
-    await audit("delete","purchaseOrders", b.dataset.del, before, null);
-    toast("تم الحذف","تم حذف فاتورة الشراء.");
-    renderPurchases();
-  });
-}
-
-function openPurchaseEditor(existing=null){
-  const data = existing ? JSON.parse(JSON.stringify(existing)) : {
-    poNo:"", status:"draft",
-    supplierId:"", supplierSnapshot:{},
-    items: [], discount:0, taxRate:0, totals:{subTotal:0,discount:0,tax:0,grandTotal:0},
-    notes:""
-  };
-
-  modal({
-    title: existing ? `تعديل شراء: ${existing.poNo||existing.id}` : "فاتورة شراء جديدة",
-    bodyHTML: `
-      <div class="row">
-        <div class="col-6">
-          <label>المورد</label>
-          <select class="input" id="supSel"></select>
-        </div>
-        <div class="col-3">
-          <label>الحالة</label>
-          <select class="input" id="st">
-            ${["draft","posted"].map(s=>`<option ${(data.status===s)?"selected":""} value="${s}">${s}</option>`).join("")}
-          </select>
-        </div>
-        <div class="col-3">
-          <label>خصم</label>
-          <input class="input" id="disc" type="number" value="${escapeHtml(String(data.discount||0))}"/>
-        </div>
-
-        <div class="col-12">
-          <div class="card" style="padding:12px">
-            <div class="cardHeader">
-              <div>
-                <div class="cardTitle">عناصر الشراء</div>
-                <div class="cardDesc">العنصر مرتبط بالمخزون (إضافة كمية + تحديث كلفة)</div>
-              </div>
-              <div class="btnRow">
-                <button class="btn small ghost" id="add">+ إضافة صنف</button>
-              </div>
-            </div>
-            <div id="items"></div>
-          </div>
-        </div>
-
-        <div class="col-12">
-          <label>ملاحظات</label>
-          <textarea class="input" id="notes">${escapeHtml(data.notes||"")}</textarea>
-        </div>
-
-        <div class="col-12">
-          <div id="sum" class="pill ok" style="justify-content:space-between;width:100%"></div>
-        </div>
-      </div>
-    `,
-    footerHTML: `
-      <button class="btn primary" id="save">حفظ</button>
-      <button class="btn success" id="post">اعتماد (تحديث مخزون)</button>
-      <button class="btn ghost" data-x>إغلاق</button>
-    `,
-    onMount: async (host, close)=>{
-      const suppliers = await listCol("suppliers", { orderArr:["name","asc"], lim: 500 });
-      const invItems = await listCol("inventoryItems", { orderArr:["name","asc"], lim: 800 });
-
-      $("#supSel", host).innerHTML = `
-        <option value="">— اختر مورد —</option>
-        ${suppliers.map(s=>`<option ${(data.supplierId===s.id)?"selected":""} value="${s.id}">${escapeHtml(s.name||"")}</option>`).join("")}
-      `;
-
-      const refresh = ()=>{
-        const wrap = $("#items", host);
-        wrap.innerHTML = data.items.map((it,idx)=>`
-          <div class="row" style="align-items:end;border:1px solid var(--line);border-radius:16px;padding:10px;margin-top:10px">
-            <div class="col-7">
-              <label>الصنف (مخزون)</label>
-              <select class="input" data-k="inventoryItemId" data-i="${idx}">
-                <option value="">— اختر —</option>
-                ${invItems.map(x=>`<option ${(it.inventoryItemId===x.id)?"selected":""} value="${x.id}">${escapeHtml(x.name||"")} • متوفر:${escapeHtml(String(x.stock||0))}</option>`).join("")}
-              </select>
-            </div>
-            <div class="col-2">
-              <label>الكمية</label>
-              <input class="input" data-k="qty" data-i="${idx}" type="number" value="${escapeHtml(String(it.qty||1))}"/>
-            </div>
-            <div class="col-3">
-              <label>كلفة الوحدة</label>
-              <input class="input" data-k="cost" data-i="${idx}" type="number" value="${escapeHtml(String(it.cost||0))}"/>
-            </div>
-            <div class="col-12">
-              <button class="btn small danger" data-del="${idx}">حذف</button>
-            </div>
-          </div>
-        `).join("") || `<div class="smallMuted">لا يوجد عناصر.</div>`;
-
-        $$("button[data-del]", host).forEach(b=> b.onclick = ()=>{
-          data.items.splice(Number(b.dataset.del), 1);
-          refresh();
-        });
-
-        $$("input[data-k], select[data-k]", host).forEach(el=>{
-          el.oninput = ()=>{
-            const i = Number(el.dataset.i);
-            const k = el.dataset.k;
-            data.items[i][k] = (k==="qty"||k==="cost") ? Number(el.value||0) : el.value;
-            refresh();
-          };
-        });
-
-        const sub = data.items.reduce((s,it)=> s + (Number(it.qty||0)*Number(it.cost||0)), 0);
-        const discount = Number($("#disc", host).value||0);
-        const grand = Math.max(sub - discount, 0);
-        data.discount = discount;
-        data.totals = { subTotal: sub, discount, tax:0, grandTotal: grand };
-        $("#sum", host).innerHTML = `<span>الإجمالي</span><span><b>${money(grand, State.settings.currency)}</b></span>`;
-      };
-
-      $("#add", host).onclick = ()=>{
-        data.items.push({ inventoryItemId:"", qty:1, cost:0 });
-        refresh();
-      };
-      refresh();
-
-      async function saveOnly(){
-        const supplierId = $("#supSel", host).value;
-        const supplier = suppliers.find(s=>s.id===supplierId) || null;
-        data.supplierId = supplierId;
-        data.supplierSnapshot = supplier ? { name:supplier.name||"", phone:supplier.phone||"" } : {};
-        data.status = $("#st", host).value;
-        data.notes = $("#notes", host).value;
-
-        if(!existing){
-          data.poNo = await nextNumber("po");
-          const id = await addCol("purchaseOrders", { ...data, createdBy: State.user?.uid || "" });
-          await audit("create","purchaseOrders", id, null, data);
-          toast("تم الحفظ", data.poNo);
-        }else{
-          const before = existing;
-          await upd("purchaseOrders", existing.id, data);
-          await audit("update","purchaseOrders", existing.id, before, data);
-          toast("تم التحديث", data.poNo||existing.id);
-        }
-      }
-
-      $("#save", host).onclick = async ()=>{
-        try{
-          await saveOnly();
-          close();
-          renderPurchases();
-        }catch(e){ toast("خطأ", e.message); }
-      };
-
-      $("#post", host).onclick = async ()=>{
-        try{
-          // احفظ أولاً
-          await saveOnly();
-
-          // اعتماد = تحديث مخزون: +qty وتحديث cost (اختياري)
-          const id = existing?.id ? existing.id : null;
-          if(!id){
-            toast("تنبيه","افتح الفاتورة بعد الحفظ واعتمدها.");
-            close();
-            return;
-          }
-
-          await runTransaction(db, async (tx)=>{
-            for(const it of data.items){
-              if(!it.inventoryItemId) continue;
-              const ref = doc(db,"inventoryItems", it.inventoryItemId);
-              const snap = await tx.get(ref);
-              if(!snap.exists()) continue;
-              const cur = snap.data();
-              const newStock = Number(cur.stock||0) + Number(it.qty||0);
-              tx.update(ref, {
-                stock: newStock,
-                cost: Number(it.cost||cur.cost||0),
-                updatedAt: serverTimestamp()
-              });
-            }
-            tx.update(doc(db,"purchaseOrders", id), { status:"posted", updatedAt: serverTimestamp() });
-          });
-
-          await audit("post","purchaseOrders", id, { status:data.status }, { status:"posted" });
-          toast("تم الاعتماد","تم تحديث المخزون.");
-          close();
-          renderPurchases();
-        }catch(e){ toast("خطأ", e.message); }
-      };
-    }
-  });
-}
-
-/* =========================
-   Customers & Vehicles
-========================= */
-async function renderCustomers(){
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"الزبائن والسيارات",
-    subtitle:"إدارة عامة — (لكن إنشاء الزبون/السيارة يحدث تلقائياً من أمر الشغل)",
-    actionsHTML:`<button class="btn ghost" id="refreshC">تحديث</button>`
-  });
-  $("#refreshC").onclick = ()=> renderCustomers();
-
-  const body = $("#pageBody");
-  body.innerHTML = `<div class="card"><div class="cardTitle">تحميل...</div></div>`;
-
-  const customers = await listCol("customers", { orderArr:["updatedAt","desc"], lim: 300 });
-
-  body.innerHTML = `
-    <div class="card">
-      <div class="cardHeader">
-        <div><div class="cardTitle">الزبائن</div><div class="cardDesc">يمكن تعديل الاسم/الهاتف</div></div>
-        <div style="min-width:320px"><input class="input" id="cSearch" placeholder="بحث..." /></div>
-      </div>
-      <div id="cTable"></div>
-    </div>
-  `;
-
-  const render=(filter="")=>{
-    const f = filter.trim().toLowerCase();
-    const data = !f ? customers : customers.filter(x=> [x.name,x.phone].join(" ").toLowerCase().includes(f));
-    $("#cTable").innerHTML = tableHTML({
-      columns:[
-        { label:"الاسم", render:r=> `<b>${escapeHtml(r.name||"")}</b>` },
-        { label:"الهاتف", key:"phone" },
-        { label:"إجراء", render:r=> `
-          <div class="btnRow">
-            <button class="btn small ghost" data-edit="${r.id}">تعديل</button>
-            <button class="btn small danger" data-del="${r.id}">حذف</button>
-          </div>
-        `}
-      ],
-      rows:data
-    });
-
-    $$("button[data-edit]").forEach(b=> b.onclick = ()=> openCustomerEditor(customers.find(x=>x.id===b.dataset.edit)));
-    $$("button[data-del]").forEach(b=> b.onclick = async ()=>{
-      if(!await safeConfirm("حذف الزبون؟")) return;
-      const before = customers.find(x=>x.id===b.dataset.del)||null;
-      await del("customers", b.dataset.del);
-      await audit("delete","customers", b.dataset.del, before, null);
-      toast("تم الحذف","تم حذف الزبون.");
-      renderCustomers();
-    });
-  };
-
-  render();
-  $("#cSearch").oninput = (e)=> render(e.target.value);
-}
-
-function openCustomerEditor(existing){
-  const data = JSON.parse(JSON.stringify(existing));
-  modal({
-    title:`تعديل زبون: ${data.name||data.id}`,
-    bodyHTML: `
-      <div class="row">
-        <div class="col-6"><label>الاسم</label><input class="input" id="name" value="${escapeHtml(data.name||"")}"/></div>
-        <div class="col-6"><label>الهاتف</label><input class="input" id="phone" value="${escapeHtml(data.phone||"")}"/></div>
-      </div>
-    `,
-    footerHTML:`<button class="btn primary" id="save">حفظ</button><button class="btn ghost" data-x>إغلاق</button>`,
-    onMount:(host, close)=>{
-      $("#save", host).onclick = async ()=>{
-        try{
-          const payload = { name: $("#name", host).value.trim(), phone: $("#phone", host).value.trim() };
-          await upd("customers", data.id, payload);
-          await audit("update","customers", data.id, existing, payload);
-          toast("تم الحفظ","تم تحديث الزبون.");
-          close(); renderCustomers();
-        }catch(e){ toast("خطأ", e.message); }
-      };
-    }
-  });
-}
-
-/* =========================
-   Reports (Basic)
-========================= */
-async function renderReports(){
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"التقارير",
-    subtitle:"مبيعات تقريبية + تنبيهات مخزون",
-    actionsHTML:`<button class="btn ghost" id="refreshR">تحديث</button>`
-  });
-  $("#refreshR").onclick = ()=> renderReports();
-
-  const body = $("#pageBody");
-  body.innerHTML = `<div class="card"><div class="cardTitle">تحميل...</div></div>`;
-
-  const invoices = await listCol("invoices", { orderArr:["updatedAt","desc"], lim: 200 });
-  const invn = await listCol("inventoryItems", { orderArr:["updatedAt","desc"], lim: 600 });
-  const sales = invoices.reduce((s,i)=> s + Number(i?.totals?.grandTotal||0), 0);
-  const paid = invoices.filter(x=>x.status==="paid").reduce((s,i)=> s + Number(i?.totals?.grandTotal||0), 0);
-  const low = invn.filter(x=> Number(x.stock||0) <= Number(x.minStock||0));
-
-  body.innerHTML = `
-    <div class="grid">
-      <div class="card" style="grid-column:span 6">
-        <div class="cardTitle">المبيعات</div>
-        <div class="cardDesc">آخر 200 فاتورة</div>
-        <hr/>
-        <div class="pill ok" style="justify-content:space-between;width:100%">
-          <span>إجمالي</span><span><b>${money(sales, State.settings.currency)}</b></span>
-        </div>
-        <div class="pill" style="justify-content:space-between;width:100%;margin-top:10px">
-          <span>مدفوع (Paid)</span><span><b>${money(paid, State.settings.currency)}</b></span>
-        </div>
-        <div class="smallMuted" style="margin-top:10px">* تقرير مبسط — يمكن توسعته لاحقاً.</div>
-      </div>
-
-      <div class="card" style="grid-column:span 6">
-        <div class="cardTitle">تنبيه المخزون</div>
-        <div class="cardDesc">الأصناف تحت الحد الأدنى</div>
-        <hr/>
-        ${low.length ? `
-          ${low.slice(0,20).map(x=>`
-            <div class="pill warn" style="justify-content:space-between;width:100%;margin-top:10px">
-              <span>${escapeHtml(x.name||"")}</span>
-              <span>${escapeHtml(String(x.stock||0))} / Min:${escapeHtml(String(x.minStock||0))}</span>
-            </div>
-          `).join("")}
-        ` : `<div class="smallMuted">لا توجد تنبيهات ✅</div>`}
-      </div>
-    </div>
-  `;
-}
-
-/* =========================
-   Templates Manager (Admin)
-========================= */
-async function renderTemplates(){
-  if(!requireAdmin()) return;
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"قوالب الفواتير",
-    subtitle:"محرر HTML/CSS + معاينة مباشرة + اختيار الافتراضي",
-    actionsHTML: `
-      <button class="btn primary" id="newTpl">قالب جديد</button>
-      <button class="btn ghost" id="refreshTpl">تحديث</button>
-    `
-  });
-  $("#refreshTpl").onclick = ()=> bootstrap(true);
-  $("#newTpl").onclick = ()=> openTemplateEditor();
-
-  const body = $("#pageBody");
-  const rows = await listCol("invoiceTemplates", { orderArr:["name","asc"], lim: 300 });
-
-  body.innerHTML = `
-    <div class="card">
-      <div class="cardHeader">
-        <div><div class="cardTitle">القوالب</div><div class="cardDesc">استخدم {{ }} للحقول و {{#items}} للقائمة</div></div>
-      </div>
-      <div id="tplTable"></div>
-    </div>
-  `;
-
-  $("#tplTable").innerHTML = tableHTML({
-    columns:[
-      { label:"الاسم", render:r=> `<b>${escapeHtml(r.name||r.id)}</b><div class="smallMuted">${escapeHtml(r.id)}</div>` },
-      { label:"Built-in", render:r=> r.builtIn ? `<span class="pill ok">نعم</span>` : `<span class="pill">لا</span>` },
-      { label:"إجراء", render:r=> `
-        <div class="btnRow">
-          <button class="btn small ghost" data-edit="${r.id}">تعديل</button>
-          <button class="btn small danger" data-del="${r.id}">حذف</button>
-        </div>
-      `}
-    ],
-    rows
-  });
-
-  $$("button[data-edit]").forEach(b=> b.onclick = ()=> openTemplateEditor(rows.find(x=>x.id===b.dataset.edit)));
-  $$("button[data-del]").forEach(b=> b.onclick = async ()=>{
-    const t = rows.find(x=>x.id===b.dataset.del);
-    if(t?.builtIn){
-      toast("ممنوع","لا يمكن حذف القوالب المدمجة.");
-      return;
-    }
-    if(!await safeConfirm("حذف القالب؟")) return;
-    await del("invoiceTemplates", b.dataset.del);
-    await audit("delete","invoiceTemplates", b.dataset.del, t, null);
-    toast("تم الحذف","تم حذف القالب.");
-    bootstrap(true);
-  });
-}
-
-function openTemplateEditor(existing=null){
-  if(!requireAdmin()) return;
-
-  const data = existing ? JSON.parse(JSON.stringify(existing)) : {
-    id: "tpl_" + uid().slice(0,8),
-    name:"قالب جديد",
-    html: DEFAULT_TEMPLATES[0].html,
-    css: DEFAULT_TEMPLATES[0].css,
-    builtIn:false
-  };
-
-  modal({
-    title: existing ? `تعديل قالب: ${data.name}` : "قالب جديد",
-    bodyHTML: `
-      <div class="row">
-        <div class="col-4">
-          <label>Template ID</label>
-          <input class="input" id="tid" value="${escapeHtml(data.id)}" ${existing ? "disabled" : ""}/>
-        </div>
-        <div class="col-8">
-          <label>الاسم</label>
-          <input class="input" id="tname" value="${escapeHtml(data.name)}"/>
-        </div>
-
-        <div class="col-6">
-          <label>CSS</label>
-          <textarea class="input" id="tcss" style="min-height:260px">${escapeHtml(data.css||"")}</textarea>
-        </div>
-        <div class="col-6">
-          <label>HTML</label>
-          <textarea class="input" id="thtml" style="min-height:260px">${escapeHtml(data.html||"")}</textarea>
-        </div>
-
-        <div class="col-12">
-          <div class="card" style="padding:12px">
-            <div class="cardHeader">
-              <div><div class="cardTitle">معاينة</div><div class="cardDesc">عناصر تجريبية</div></div>
-            </div>
-            <div id="prev" style="background:#fff;color:#111;border-radius:16px;padding:10px"></div>
-          </div>
-        </div>
-
-        <div class="col-12 smallMuted">
-          مفاتيح جاهزة: {{invoiceNo}}, {{date}}, {{customerName}}, {{customerPhone}}, {{plate}}, {{carModel}}, {{carYear}}, {{km}}, {{subTotal}}, {{discount}}, {{tax}}, {{grandTotal}}, {{notes}}
-          <br/>قائمة العناصر: {{#items}} ... {{/items}} وبداخلها: {{type}}, {{name}}, {{qty}}, {{price}}, {{lineTotal}}
-        </div>
-      </div>
-    `,
-    footerHTML: `
-      <button class="btn primary" id="save">حفظ</button>
-      <button class="btn success" id="setDefault">تعيين كافتراضي</button>
-      <button class="btn ghost" data-x>إغلاق</button>
-    `,
-    onMount:(host, close)=>{
-      const sample = {
-        workshopName: State.settings.workshopName || "RPM",
-        invoiceNo: "INV-2026-000001",
-        date: nowISO(),
-        customerName: "مثال زبون",
-        customerPhone: "07xxxxxxxxx",
-        plate: "بغداد 12345",
-        carModel: "Camry",
-        carYear: "2020",
-        km: "120000",
-        items:[
-          { type:"خدمة", name:"تبديل دهن", qty:"1", price:"10000", lineTotal:"10000" },
-          { type:"قطعة", name:"فلتر زيت", qty:"1", price:"5000", lineTotal:"5000" },
-        ],
-        subTotal:"15000", discount:"0", tax:"0", grandTotal:"15000", notes:"ملاحظة تجريبية"
-      };
-
-      const renderPrev = ()=>{
-        const html = $("#thtml", host).value;
-        const css = $("#tcss", host).value;
-        $("#prev", host).innerHTML = `<style>${css}</style>${renderTemplate(html, sample)}`;
-      };
-
-      $("#thtml", host).oninput = renderPrev;
-      $("#tcss", host).oninput = renderPrev;
-      renderPrev();
-
-      $("#save", host).onclick = async ()=>{
-        try{
-          const id = existing ? data.id : $("#tid", host).value.trim();
-          const payload = {
-            name: $("#tname", host).value.trim(),
-            html: $("#thtml", host).value,
-            css: $("#tcss", host).value,
-            builtIn: !!existing?.builtIn
-          };
-          await setDocId("invoiceTemplates", id, payload, true);
-          await audit(existing ? "update":"create", "invoiceTemplates", id, existing||null, payload);
-          toast("تم الحفظ", payload.name);
-          close();
-          bootstrap(true);
-        }catch(e){ toast("خطأ", e.message); }
-      };
-
-      $("#setDefault", host).onclick = async ()=>{
-        try{
-          const id = existing ? data.id : $("#tid", host).value.trim();
-          await upd("settings","app", { defaultInvoiceTemplateId: id });
-          await audit("update","settings","app", null, { defaultInvoiceTemplateId:id });
-          toast("تم", "تم تعيين القالب الافتراضي.");
-          close();
-          bootstrap(true);
-        }catch(e){ toast("خطأ", e.message); }
-      };
-    }
-  });
-}
-
-/* =========================
-   Custom Pages Builder (Admin)
-   - إنشاء صفحات (HTML/CSS) بدون تعديل الملفات الأساسية
-========================= */
-async function renderPagesManager(){
-  if(!requireAdmin()) return;
-
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"صفحات إضافية",
-    subtitle:"أنشئ صفحات مخصصة للأدمن أو عامة — بدون تعديل الكود لاحقاً",
-    actionsHTML: `
-      <button class="btn primary" id="newPage">صفحة جديدة</button>
-      <button class="btn ghost" id="refreshP">تحديث</button>
-    `
-  });
-  $("#refreshP").onclick = ()=> bootstrap(true);
-  $("#newPage").onclick = ()=> openPageEditor();
-
-  const body = $("#pageBody");
-  const rows = await listCol("customPages", { orderArr:["title","asc"], lim: 300 });
-
-  body.innerHTML = `
-    <div class="card">
-      <div class="cardHeader">
-        <div><div class="cardTitle">الصفحات</div><div class="cardDesc">تظهر تلقائياً في القائمة الجانبية</div></div>
-      </div>
-      <div id="pTable"></div>
-    </div>
-  `;
-
-  $("#pTable").innerHTML = tableHTML({
-    columns:[
-      { label:"العنوان", render:r=> `<b>${escapeHtml(r.title||"")}</b><div class="smallMuted">slug: ${escapeHtml(r.slug||"")}</div>` },
-      { label:"الظهور", render:r=> `<span class="pill">${escapeHtml(r.visibility||"admin")}</span>` },
-      { label:"إجراء", render:r=> `
-        <div class="btnRow">
-          <button class="btn small ghost" data-edit="${r.id}">تعديل</button>
-          <button class="btn small danger" data-del="${r.id}">حذف</button>
-        </div>
-      `}
-    ],
-    rows
-  });
-
-  $$("button[data-edit]").forEach(b=> b.onclick = ()=> openPageEditor(rows.find(x=>x.id===b.dataset.edit)));
-  $$("button[data-del]").forEach(b=> b.onclick = async ()=>{
-    if(!await safeConfirm("حذف الصفحة؟")) return;
-    const before = rows.find(x=>x.id===b.dataset.del)||null;
-    await del("customPages", b.dataset.del);
-    await audit("delete","customPages", b.dataset.del, before, null);
-    toast("تم الحذف","تم حذف الصفحة.");
-    bootstrap(true);
-  });
-}
-
-function openPageEditor(existing=null){
-  if(!requireAdmin()) return;
-
-  const data = existing ? JSON.parse(JSON.stringify(existing)) : {
-    title:"صفحة جديدة",
-    slug:"page-" + uid().slice(0,6),
-    visibility:"admin",
-    css:`body{font-family:Tahoma,Arial;direction:rtl;padding:18px}`,
-    html:`<h2>صفحة جديدة</h2><p>اكتب المحتوى هنا.</p>`
-  };
-
-  modal({
-    title: existing ? `تعديل صفحة: ${data.title}` : "صفحة جديدة",
-    bodyHTML: `
-      <div class="row">
-        <div class="col-6"><label>العنوان</label><input class="input" id="t" value="${escapeHtml(data.title)}"/></div>
-        <div class="col-6"><label>Slug (رابط)</label><input class="input" id="s" value="${escapeHtml(data.slug)}" ${existing ? "disabled":""}/></div>
-        <div class="col-6">
-          <label>الظهور</label>
-          <select class="input" id="v">
-            ${["admin","public"].map(x=>`<option ${(data.visibility===x)?"selected":""} value="${x}">${x}</option>`).join("")}
-          </select>
-        </div>
-        <div class="col-6 smallMuted" style="padding-top:34px">
-          تظهر في القائمة تلقائياً بعد الحفظ.
-        </div>
-
-        <div class="col-6"><label>CSS</label><textarea class="input" id="css" style="min-height:260px">${escapeHtml(data.css||"")}</textarea></div>
-        <div class="col-6"><label>HTML</label><textarea class="input" id="html" style="min-height:260px">${escapeHtml(data.html||"")}</textarea></div>
-
-        <div class="col-12">
-          <div class="card" style="padding:12px">
-            <div class="cardTitle">معاينة</div>
-            <div id="prev" style="background:#fff;color:#111;border-radius:16px;padding:10px"></div>
-          </div>
-        </div>
-      </div>
-    `,
-    footerHTML: `
-      <button class="btn primary" id="save">حفظ</button>
-      <button class="btn ghost" data-x>إغلاق</button>
-    `,
-    onMount:(host, close)=>{
-      const renderPrev = ()=>{
-        $("#prev", host).innerHTML = `<style>${$("#css", host).value}</style>${$("#html", host).value}`;
-      };
-      $("#css", host).oninput = renderPrev;
-      $("#html", host).oninput = renderPrev;
-      renderPrev();
-
-      $("#save", host).onclick = async ()=>{
-        try{
-          const title = $("#t", host).value.trim();
-          const slug = existing ? data.slug : $("#s", host).value.trim();
-          const payload = {
-            title,
-            slug,
-            visibility: $("#v", host).value,
-            css: $("#css", host).value,
-            html: $("#html", host).value,
-          };
-
-          if(!existing){
-            // id = slug لضمان uniqueness
-            await setDoc(doc(db,"customPages", slug), payload, { merge:true });
-            await audit("create","customPages", slug, null, payload);
-            toast("تمت الإضافة", title);
-          }else{
-            const before = existing;
-            await upd("customPages", existing.id, payload);
-            await audit("update","customPages", existing.id, before, payload);
-            toast("تم التحديث", title);
-          }
-
-          close();
-          bootstrap(true);
-        }catch(e){ toast("خطأ", e.message); }
-      };
-    }
-  });
-}
-
-async function renderCustomPage(slug){
-  const outlet = $("#routeOutlet");
-  const p = (State.customPages||[]).find(x=>x.slug===slug || x.id===slug);
-
-  if(!p){
-    outlet.innerHTML = pageLayout({ title:"غير موجود", subtitle:"الصفحة غير موجودة" });
-    $("#pageBody").innerHTML = `<div class="card"><div class="cardTitle">لا توجد صفحة بهذا الرابط.</div></div>`;
-    return;
-  }
-
-  // إذا كانت admin only
-  if((p.visibility||"admin")==="admin" && State.role!=="admin"){
-    outlet.innerHTML = pageLayout({ title:"ممنوع", subtitle:"هذه الصفحة للأدمن فقط" });
-    $("#pageBody").innerHTML = `<div class="card"><div class="cardTitle">صلاحية غير كافية</div></div>`;
-    return;
-  }
-
-  outlet.innerHTML = pageLayout({
-    title: p.title || "صفحة",
-    subtitle: "صفحة مخصصة",
-    actionsHTML: State.role==="admin" ? `<a class="btn ghost" href="#/pages">إدارة الصفحات</a>` : ``
-  });
-
-  $("#pageBody").innerHTML = `
-    <div class="card">
-      <div style="background:#fff;color:#111;border-radius:16px;padding:10px">
-        <style>${p.css||""}</style>
-        ${p.html||""}
-      </div>
-    </div>
-  `;
-}
-
-/* =========================
-   Users & Roles (Admin)
-========================= */
-async function renderUsers(){
-  if(!requireAdmin()) return;
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"المستخدمين والصلاحيات",
-    subtitle:"Admin / staff — تفعيل/تعطيل",
-    actionsHTML:`<button class="btn ghost" id="refreshU">تحديث</button>`
-  });
-  $("#refreshU").onclick = ()=> renderUsers();
-
-  const body = $("#pageBody");
-  const rows = await listCol("users", { orderArr:["updatedAt","desc"], lim: 300 });
-
-  body.innerHTML = `
-    <div class="card">
-      <div class="cardHeader">
-        <div><div class="cardTitle">المستخدمين</div><div class="cardDesc">غير الدور من هنا</div></div>
-      </div>
-      <div id="uTable"></div>
-    </div>
-  `;
-
-  $("#uTable").innerHTML = tableHTML({
-    columns:[
-      { label:"Email", render:r=> `<b>${escapeHtml(r.email||"")}</b><div class="smallMuted">${escapeHtml(r.uid||r.id)}</div>` },
-      { label:"الاسم", key:"name" },
-      { label:"الدور", render:r=> `<span class="pill">${escapeHtml(r.role||"staff")}</span>` },
-      { label:"الحالة", render:r=> r.isActive===false ? `<span class="pill bad">موقوف</span>` : `<span class="pill ok">فعال</span>` },
-      { label:"إجراء", render:r=> `
-        <div class="btnRow">
-          <button class="btn small ghost" data-role="${r.id}">تغيير دور</button>
-          <button class="btn small danger" data-toggle="${r.id}">${r.isActive===false?"تفعيل":"تعطيل"}</button>
-        </div>
-      `}
-    ],
-    rows
-  });
-
-  $$("button[data-role]").forEach(b=> b.onclick = ()=>{
-    const u = rows.find(x=>x.id===b.dataset.role);
-    modal({
-      title:`تغيير دور: ${u.email}`,
-      bodyHTML: `
-        <label>الدور</label>
-        <select class="input" id="roleSel">
-          ${["admin","staff"].map(x=>`<option ${(u.role===x)?"selected":""} value="${x}">${x}</option>`).join("")}
-        </select>
-      `,
-      footerHTML:`<button class="btn primary" id="save">حفظ</button><button class="btn ghost" data-x>إغلاق</button>`,
-      onMount:(host, close)=>{
-        $("#save", host).onclick = async ()=>{
-          const role = $("#roleSel", host).value;
-          await upd("users", u.id, { role });
-          await audit("update","users", u.id, u, { role });
-          toast("تم", "تم تغيير الدور.");
-          close(); renderUsers();
-        };
-      }
-    });
-  });
-
-  $$("button[data-toggle]").forEach(b=> b.onclick = async ()=>{
-    const u = rows.find(x=>x.id===b.dataset.toggle);
-    const newState = !(u.isActive===false);
-    await upd("users", u.id, { isActive: !newState });
-    await audit("update","users", u.id, u, { isActive: !newState });
-    toast("تم", "تم تحديث الحالة.");
-    renderUsers();
-  });
-}
-
-/* =========================
-   Audit Log (Admin)
-========================= */
-async function renderAudit(){
-  if(!requireAdmin()) return;
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"سجل التدقيق",
-    subtitle:"يوثق إنشاء/تعديل/حذف",
-    actionsHTML:`<button class="btn ghost" id="refreshA">تحديث</button>`
-  });
-  $("#refreshA").onclick = ()=> renderAudit();
-
-  const body = $("#pageBody");
-  const rows = await listCol("auditLogs", { orderArr:["at","desc"], lim: 300 });
-
-  body.innerHTML = `
-    <div class="card">
-      <div class="cardHeader">
-        <div><div class="cardTitle">آخر 300 عملية</div><div class="cardDesc">مفيد جداً للأدمن</div></div>
-      </div>
-      <div id="aTable"></div>
-    </div>
-  `;
-
-  $("#aTable").innerHTML = tableHTML({
-    columns:[
-      { label:"الوقت", render:r=> `<b>${escapeHtml(r.at?.toDate ? r.at.toDate().toLocaleString("ar-IQ") : "")}</b>` },
-      { label:"الإجراء", key:"action" },
-      { label:"الكيان", render:r=> `${escapeHtml(r.entity||"")}<div class="smallMuted">${escapeHtml(r.entityId||"")}</div>` },
-      { label:"بواسطة", render:r=> `${escapeHtml(r.email||"")}<div class="smallMuted">${escapeHtml(r.by||"")}</div>` },
-    ],
-    rows
-  });
-}
-
-/* =========================
-   Settings (Admin)
-========================= */
-async function renderSettings(){
-  if(!requireAdmin()) return;
-  const outlet = $("#routeOutlet");
-  outlet.innerHTML = pageLayout({
-    title:"الإعدادات",
-    subtitle:"اسم الورشة + ضريبة + ترقيم + سياسة خصم المخزون",
-    actionsHTML:`<button class="btn primary" id="saveS">حفظ</button>`
-  });
-
-  const body = $("#pageBody");
-  const s = State.settings || { ...DEFAULT_SETTINGS };
-
-  body.innerHTML = `
-    <div class="card">
-      <div class="cardTitle">إعدادات عامة</div>
-      <div class="row">
-        <div class="col-6"><label>اسم الورشة</label><input class="input" id="wsName" value="${escapeHtml(s.workshopName||"")}"/></div>
-        <div class="col-3"><label>الهاتف</label><input class="input" id="wsPhone" value="${escapeHtml(s.phone||"")}"/></div>
-        <div class="col-3"><label>العملة</label><input class="input" id="cur" value="${escapeHtml(s.currency||"IQD")}"/></div>
-        <div class="col-12"><label>العنوان</label><input class="input" id="addr" value="${escapeHtml(s.address||"")}"/></div>
-      </div>
-      <hr/>
-      <div class="cardTitle">الضرائب والترقيم</div>
-      <div class="row">
-        <div class="col-3"><label>ضريبة (%)</label><input class="input" id="tax" type="number" value="${escapeHtml(String(s.taxRate||0))}"/></div>
-        <div class="col-3"><label>بادئة الفاتورة</label><input class="input" id="invP" value="${escapeHtml(s.invoicePrefix||"INV")}"/></div>
-        <div class="col-3"><label>بادئة أمر الشغل</label><input class="input" id="woP" value="${escapeHtml(s.woPrefix||"WO")}"/></div>
-        <div class="col-3"><label>عدد الخانات</label><input class="input" id="w" type="number" value="${escapeHtml(String(s.numberWidth||6))}"/></div>
-      </div>
-      <hr/>
-      <div class="cardTitle">سياسة المخزون</div>
-      <div class="row">
-        <div class="col-6">
-          <label>متى يتم خصم المخزون؟</label>
-          <select class="input" id="policy">
-            <option ${(s.stockConsumePolicy==="invoice_create")?"selected":""} value="invoice_create">عند إنشاء الفاتورة</option>
-            <option ${(s.stockConsumePolicy==="invoice_paid")?"selected":""} value="invoice_paid">عند دفع الفاتورة (Paid)</option>
-          </select>
-        </div>
-        <div class="col-6">
-          <label>القالب الافتراضي</label>
-          <select class="input" id="defTpl">
-            ${State.templates.map(t=>`<option ${(s.defaultInvoiceTemplateId===t.id)?"selected":""} value="${t.id}">${escapeHtml(t.name||t.id)}</option>`).join("")}
-          </select>
-        </div>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="cardTitle">ملاحظة</div>
-      <div class="smallMuted">
-        يفضل ربط عناصر "القطع" بالمخزون داخل الفاتورة حتى يتم الخصم بدقة.
-      </div>
-    </div>
-  `;
-
-  $("#saveS").onclick = async ()=>{
-    try{
       const payload = {
-        workshopName: $("#wsName").value.trim(),
-        phone: $("#wsPhone").value.trim(),
-        address: $("#addr").value.trim(),
-        currency: $("#cur").value.trim(),
-        taxRate: Number($("#tax").value||0),
-        invoicePrefix: $("#invP").value.trim(),
-        woPrefix: $("#woP").value.trim(),
-        numberWidth: Number($("#w").value||6),
-        stockConsumePolicy: $("#policy").value,
-        defaultInvoiceTemplateId: $("#defTpl").value
+        type: data.type || "general",
+        status: fStatus.value,
+        customerId,
+        customerName: fName.value.trim(),
+        customerPhone: fPhone.value.trim(),
+        carId,
+        carPlate: fPlate.value.trim(),
+        carModel: fModel.value.trim(),
+        carYear: fYear.value ? Number(fYear.value) : null,
+        notes: fNotes.value,
+        services: data.services || [],
+        parts: data.parts || [],
+        totalEstimate: calcTotal(),
+        updatedAt: serverTimestamp(),
       };
-      await upd("settings","app", payload);
-      await audit("update","settings","app", State.settings, payload);
-      toast("تم الحفظ","تم تحديث الإعدادات.");
-      await bootstrap(true);
-    }catch(e){ toast("خطأ", e.message); }
+
+      if (isNew) {
+        payload.createdAt = serverTimestamp();
+        const ref = await addDoc(collection(state.db, C.orders), payload);
+        toast("تم الإنشاء", "أمر شغل جديد", "ok");
+        renderRoute();
+        navTo("orders", ref.id);
+      } else {
+        await updateDoc(doc(state.db, C.orders, orderId), payload);
+        toast("تم الحفظ", "تم تحديث أمر الشغل", "ok");
+        renderRoute();
+      }
+    } catch (e) {
+      toast("فشل الحفظ", e?.message || String(e), "bad");
+    } finally {
+      btnSave.disabled = false;
+    }
+  }}, ["حفظ"]);
+
+  const btnInvoice = el("button", { class:"btn ok", onclick: async () => {
+    if (isNew) return toast("احفظ أولاً", "لازم إنشاء أمر الشغل قبل الفاتورة", "warn");
+    try {
+      const invId = await createInvoiceFromOrder(orderId);
+      toast("تم إنشاء فاتورة", "جاهزة للتعديل والطباعة", "ok");
+      navTo("invoices", invId);
+    } catch (e) {
+      toast("تعذر إنشاء فاتورة", e?.message || "", "bad");
+    }
+  }}, ["إنشاء فاتورة"]);
+
+  const { close } = openModal(title, body, [btnSave, btnInvoice]);
+  return { close };
+}
+
+/* ---------- Oil Change Page ---------- */
+async function pageOil() {
+  setPageHeader("تبديل دهن", "واجهة سريعة — أمر شغل + فاتورة");
+
+  const box = el("div", { class:"grid cols2" }, []);
+
+  const left = el("div", { class:"card" }, [
+    el("h3", {}, ["بيانات الزبون والسيارة"]),
+  ]);
+
+  const cName = el("input", { class:"input", placeholder:"اسم الزبون" });
+  const cPhone = el("input", { class:"input", placeholder:"الهاتف" });
+
+  const plate = el("input", { class:"input", placeholder:"اللوحة (مثال: ك13...)" });
+  const model = el("input", { class:"input", placeholder:"الموديل (مثال: سوناتا 2)" });
+  const year  = el("input", { class:"input", type:"number", placeholder:"السنة" });
+
+  left.appendChild(el("div", { class:"row" }, [
+    el("div", { class:"field" }, [el("label", {}, ["الاسم"]), cName]),
+    el("div", { class:"field" }, [el("label", {}, ["الهاتف"]), cPhone]),
+  ]));
+  left.appendChild(el("div", { class:"row" }, [
+    el("div", { class:"field" }, [el("label", {}, ["اللوحة"]), plate]),
+    el("div", { class:"field" }, [el("label", {}, ["الموديل"]), model]),
+    el("div", { class:"field" }, [el("label", {}, ["السنة"]), year]),
+  ]));
+
+  const right = el("div", { class:"card" }, [
+    el("h3", {}, ["تفاصيل تبديل الدهن"]),
+  ]);
+
+  const oilType = el("input", { class:"input", placeholder:"نوع/ماركة الدهن" });
+  const oilVisc = el("input", { class:"input", placeholder:"اللزوجة (مثال: 5W-30)" });
+  const oilQty  = el("input", { class:"input", type:"number", placeholder:"الكمية (لتر)", value:"4" });
+  const oilPrice = el("input", { class:"input", type:"number", placeholder:"سعر الدهن" });
+
+  const filter = el("input", { class:"input", placeholder:"فلتر (اختياري)" });
+  const filterPrice = el("input", { class:"input", type:"number", placeholder:"سعر الفلتر" });
+
+  const kmNow = el("input", { class:"input", type:"number", placeholder:"KM الحالي" });
+  const kmNext = el("input", { class:"input", type:"number", placeholder:"KM القادم (مثال: +5000)" });
+
+  const notes = el("textarea", {}, [""]);
+
+  right.appendChild(el("div", { class:"row" }, [
+    el("div", { class:"field" }, [el("label", {}, ["نوع الدهن"]), oilType]),
+    el("div", { class:"field" }, [el("label", {}, ["اللزوجة"]), oilVisc]),
+  ]));
+  right.appendChild(el("div", { class:"row" }, [
+    el("div", { class:"field" }, [el("label", {}, ["الكمية (لتر)"]), oilQty]),
+    el("div", { class:"field" }, [el("label", {}, ["سعر الدهن"]), oilPrice]),
+  ]));
+  right.appendChild(el("div", { class:"row" }, [
+    el("div", { class:"field" }, [el("label", {}, ["فلتر (اختياري)"]), filter]),
+    el("div", { class:"field" }, [el("label", {}, ["سعر الفلتر"]), filterPrice]),
+  ]));
+  right.appendChild(el("div", { class:"row" }, [
+    el("div", { class:"field" }, [el("label", {}, ["KM الحالي"]), kmNow]),
+    el("div", { class:"field" }, [el("label", {}, ["KM القادم"]), kmNext]),
+  ]));
+  right.appendChild(el("div", { class:"field" }, [el("label", {}, ["ملاحظات"]), notes]));
+
+  const preview = el("div", { class:"card" }, [
+    el("h3", {}, ["المجموع"]),
+    el("div", { class:"kpi" }, [
+      el("div", { class:"n", id:"oilTotal" }, [fmtMoney(0)]),
+      el("div", { class:"l" }, ["دهن + فلتر (تقريباً)"])
+    ]),
+    el("div", { class:"muted", style:"margin-top:8px" }, ["سيتم إنشاء: أمر شغل + فاتورة قابلة للطباعة"])
+  ]);
+
+  function oilTotal(){
+    const o = Number(oilPrice.value||0);
+    const f = Number(filterPrice.value||0);
+    return o + f;
+  }
+  function refreshOilTotal(){
+    $("#oilTotal", preview).textContent = fmtMoney(oilTotal());
+  }
+  [oilPrice, filterPrice].forEach(i=>i.addEventListener("input", refreshOilTotal));
+  refreshOilTotal();
+
+  const btnCreate = el("button", { class:"btn primary", onclick: async () => {
+    try{
+      btnCreate.disabled = true;
+
+      const { customerId, carId } = await ensureCustomerAndCar({
+        customerName: cName.value,
+        customerPhone: cPhone.value,
+        plate: plate.value,
+        model: model.value,
+        year: year.value,
+      });
+
+      const services = [
+        { name: "تبديل دهن", price: Number(oilPrice.value||0) }
+      ];
+      const parts = [];
+      if (filter.value.trim()) parts.push({ name: `فلتر: ${filter.value.trim()}`, qty: 1, price: Number(filterPrice.value||0) });
+
+      const orderPayload = {
+        type: "oilChange",
+        status: "done",
+        customerId,
+        customerName: cName.value.trim(),
+        customerPhone: cPhone.value.trim(),
+        carId,
+        carPlate: plate.value.trim(),
+        carModel: model.value.trim(),
+        carYear: year.value ? Number(year.value) : null,
+        oil: {
+          brand: oilType.value.trim(),
+          viscosity: oilVisc.value.trim(),
+          qty: Number(oilQty.value||0),
+          kmNow: kmNow.value ? Number(kmNow.value) : null,
+          kmNext: kmNext.value ? Number(kmNext.value) : null,
+        },
+        notes: notes.value,
+        services,
+        parts,
+        totalEstimate: oilTotal(),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+
+      const orderRef = await addDoc(collection(state.db, C.orders), orderPayload);
+
+      // Update car with oil info (optional)
+      try{
+        await updateDoc(doc(state.db, C.cars, carId), {
+          lastOilChangeAt: serverTimestamp(),
+          lastOilKm: kmNow.value ? Number(kmNow.value) : null,
+          nextOilKm: kmNext.value ? Number(kmNext.value) : null,
+          oilBrand: oilType.value.trim(),
+          oilViscosity: oilVisc.value.trim(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch {}
+
+      // Create invoice directly
+      const invId = await createInvoiceFromOrder(orderRef.id, { serviceTitle: "تبديل دهن" });
+
+      toast("تمت العملية بنجاح", "أمر شغل + فاتورة", "ok");
+      navTo("invoices", invId);
+    } catch(e){
+      toast("فشل إنشاء تبديل الدهن", e?.message || String(e), "bad");
+    } finally{
+      btnCreate.disabled = false;
+    }
+  }}, ["إنشاء أمر + فاتورة"]);
+
+  box.appendChild(left);
+  box.appendChild(right);
+  box.appendChild(preview);
+  box.appendChild(el("div", { class:"card" }, [
+    el("h3", {}, ["ملاحظة"]),
+    el("div", { class:"muted" }, [
+      "هذه الصفحة مصممة لتكون سريعة: مجرد تعبئة البيانات ثم إنشاء الفاتورة مباشرة.",
+      "بعدها تقدرين تعدلين الفاتورة من صفحة الفواتير."
+    ])
+  ]));
+  preview.appendChild(el("div", { class:"actions", style:"margin-top:12px" }, [btnCreate]));
+
+  return box;
+}
+
+/* ---------- Create Invoice from Order ---------- */
+async function createInvoiceFromOrder(orderId, extra={}) {
+  const oSnap = await getDoc(doc(state.db, C.orders, orderId));
+  if (!oSnap.exists()) throw new Error("أمر الشغل غير موجود");
+  const order = { id:oSnap.id, ...oSnap.data() };
+
+  const invoiceNo = await nextInvoiceNo();
+
+  // pick template
+  let templateId = state.settings?.defaultTemplateId || "";
+  if (!templateId) {
+    const tq = query(collection(state.db, C.invoiceTemplates), orderBy("createdAt","desc"), limit(1));
+    const ts = await getDocs(tq);
+    if (!ts.empty) templateId = ts.docs[0].id;
+  }
+
+  // build items
+  const items = [];
+  (order.services || []).forEach(s => items.push({ desc: s.name || "خدمة", qty: 1, price: Number(s.price||0) }));
+  (order.parts || []).forEach(p => items.push({ desc: p.name || "قطعة", qty: Number(p.qty||1), price: Number(p.price||0) }));
+
+  const subtotal = items.reduce((a,i)=>a + (Number(i.qty||1)*Number(i.price||0)), 0);
+  const taxPercent = Number(state.settings?.taxPercent || 0);
+  const tax = subtotal * (taxPercent/100);
+  const total = subtotal + tax;
+
+  const payload = {
+    invoiceNo,
+    status: "issued",
+    date: fmtDate(new Date()),
+    orderId: order.id,
+    customerId: order.customerId || "",
+    customerName: order.customerName || "",
+    customerPhone: order.customerPhone || "",
+    carId: order.carId || "",
+    plate: order.carPlate || order.plate || "",
+    carModel: order.carModel || order.model || "",
+    year: order.carYear || order.year || "",
+    items,
+    subtotal,
+    taxPercent,
+    tax,
+    total,
+    templateId,
+    serviceTitle: extra.serviceTitle || (order.type === "oilChange" ? "تبديل دهن" : "خدمات ورشة"),
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
   };
+
+  const ref = await addDoc(collection(state.db, C.invoices), payload);
+  return ref.id;
 }
 
-/* =========================
-   Firestore Rules (مقترح) — ضعها في Firebase Console > Firestore Rules
-   (اختياري لكن مهم للأمان)
-========================= */
-/*
-rules_version = '2';
-service cloud.firestore {
-  match /databases/{database}/documents {
+/* ---------- Invoices Page ---------- */
+async function pageInvoices() {
+  setPageHeader("الفواتير", "تعديل / طباعة / حذف");
 
-    function signedIn(){ return request.auth != null; }
-    function isAdmin(){
-      return signedIn() &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
-    }
-    function isStaff(){
-      return signedIn() &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isActive != false;
-    }
+  const host = el("div", { class:"grid", style:"gap:16px" }, []);
+  const top = el("div", { class:"card" }, [
+    el("h3", {}, ["قائمة الفواتير"]),
+    el("div", { class:"muted" }, ["يمكن تعديل الفاتورة، اختيار قالب، ثم طباعة"]),
+    el("hr", { class:"hr" }),
+  ]);
 
-    match /settings/{doc} { allow read: if isStaff(); allow write: if isAdmin(); }
-    match /users/{uid} { allow read: if isAdmin(); allow write: if isAdmin(); }
+  const search = el("input", { class:"input", placeholder:"بحث: رقم الفاتورة / اسم / هاتف / لوحة…" });
+  const btnRefresh = el("button", { class:"btn ghost" }, ["تحديث"]);
+  top.appendChild(el("div", { class:"row" }, [
+    el("div", { class:"field" }, [el("label", {}, ["بحث"]), search]),
+    el("div", { class:"actions", style:"align-items:flex-end; padding-top:18px" }, [btnRefresh]),
+  ]));
 
-    match /{col}/{id} {
-      allow read: if isStaff();
-      allow write: if isStaff(); // يمكن تشديدها حسب الحاجة
+  const tableBox = el("div", { class:"card" }, [el("div", { class:"muted" }, ["جارِ التحميل…"])]);
+  host.appendChild(top);
+  host.appendChild(tableBox);
+
+  async function load() {
+    tableBox.innerHTML = "";
+    tableBox.appendChild(el("div", { class:"muted" }, ["جارِ التحميل…"]));
+    try{
+      const q1 = query(collection(state.db, C.invoices), orderBy("createdAt","desc"), limit(150));
+      const s1 = await getDocs(q1);
+      const rows = s1.docs.map(d => ({ id:d.id, ...d.data() }));
+      render(rows);
+    }catch(e){
+      tableBox.innerHTML = "";
+      tableBox.appendChild(el("div", { class:"muted" }, ["فشل التحميل: ", String(e?.message||e)]));
     }
   }
+
+  function render(rows) {
+    const q = search.value.trim().toLowerCase();
+    let filtered = rows;
+    if (q) {
+      filtered = rows.filter(x => {
+        const s = `${x.invoiceNo||""} ${x.customerName||""} ${x.customerPhone||""} ${x.plate||""}`.toLowerCase();
+        return s.includes(q);
+      });
+    }
+
+    const tbl = el("table", { class:"table" }, [
+      el("thead", {}, [el("tr", {}, [
+        el("th", {}, ["التاريخ"]),
+        el("th", {}, ["رقم"]),
+        el("th", {}, ["الزبون"]),
+        el("th", {}, ["السيارة"]),
+        el("th", {}, ["المجموع"]),
+        el("th", {}, ["إجراءات"]),
+      ])]),
+      el("tbody")
+    ]);
+
+    const tb = tbl.querySelector("tbody");
+    if (!filtered.length) {
+      tb.appendChild(el("tr", {}, [el("td", { colspan:"6", style:"text-align:center; color:rgba(234,240,255,.7)" }, ["لا يوجد بيانات"])]));
+    } else {
+      for (const r of filtered) {
+        tb.appendChild(el("tr", {}, [
+          el("td", {}, [r.date || fmtDate(r.createdAt)]),
+          el("td", {}, [el("b", {}, [r.invoiceNo || "-"])]),
+          el("td", {}, [
+            el("div", {}, [el("b", {}, [r.customerName || "-"])]),
+            el("div", { class:"muted", style:"font-size:12px" }, [r.customerPhone || ""])
+          ]),
+          el("td", {}, [`${r.plate||"-"} ${r.carModel ? "— "+r.carModel : ""}`]),
+          el("td", {}, [fmtMoney(r.total||0)]),
+          el("td", {}, [
+            el("div", { class:"actions" }, [
+              el("button", { class:"btn", onclick: () => openInvoiceEditor(r.id) }, ["تعديل"]),
+              el("button", { class:"btn ok", onclick: () => printInvoice(r.id) }, ["طباعة"]),
+              hasPerm(state.profile, "delete")
+                ? el("button", { class:"btn bad", onclick: () => deleteInvoice(r.id) }, ["حذف"])
+                : el("span"),
+            ])
+          ]),
+        ]));
+      }
+    }
+
+    tableBox.innerHTML = "";
+    tableBox.appendChild(tbl);
+  }
+
+  btnRefresh.onclick = load;
+  search.addEventListener("input", load);
+  await load();
+  return host;
 }
-*/
 
-/* =========================
-   App Start
-========================= */
-onAuthStateChanged(auth, async (user)=>{
-  State.user = user || null;
-
-  if(!user){
-    State.role = "guest";
-    State.profile = null;
-    State.settings = null;
-    State.templates = [];
-    State.customPages = [];
-    loginUI();
-    return;
-  }
-
-  // منع مستخدم معطل
+async function deleteInvoice(id){
+  if (!confirm("تأكيد حذف الفاتورة؟")) return;
   try{
-    const prof = await loadProfile(user.uid);
-    if(prof?.isActive === false){
-      toast("الحساب معطل", "راجع الأدمن.");
-      await signOut(auth);
+    await deleteDoc(doc(state.db, C.invoices, id));
+    toast("تم الحذف", "فاتورة", "ok");
+    renderRoute();
+  }catch(e){
+    toast("تعذر الحذف", e?.message||"", "bad");
+  }
+}
+
+/* ---------- Invoice Editor (Admin-friendly) ---------- */
+async function openInvoiceEditor(id) {
+  const s = await getDoc(doc(state.db, C.invoices, id));
+  if (!s.exists()) return toast("غير موجود", "الفاتورة غير موجودة", "warn");
+  const inv = { id:s.id, ...s.data() };
+
+  const fNo = el("input", { class:"input", value: inv.invoiceNo || "", disabled:true });
+  const fDate = el("input", { class:"input", value: inv.date || fmtDate(inv.createdAt) });
+
+  const fName = el("input", { class:"input", value: inv.customerName || "" });
+  const fPhone = el("input", { class:"input", value: inv.customerPhone || "" });
+
+  const fPlate = el("input", { class:"input", value: inv.plate || "" });
+  const fModel = el("input", { class:"input", value: inv.carModel || "" });
+  const fYear  = el("input", { class:"input", type:"number", value: inv.year || "" });
+
+  // template dropdown
+  const tplSel = el("select", {});
+  {
+    const qs = query(collection(state.db, C.invoiceTemplates), orderBy("createdAt","desc"), limit(50));
+    const ss = await getDocs(qs);
+    tplSel.appendChild(el("option", { value:"" }, ["(بدون قالب)"]));
+    ss.docs.forEach(d => {
+      tplSel.appendChild(el("option", { value:d.id }, [d.data().name || d.id]));
+    });
+    tplSel.value = inv.templateId || "";
+  }
+
+  // items editor
+  inv.items = inv.items || [];
+  const itemsHost = el("div", {}, []);
+
+  function recalc() {
+    const subtotal = inv.items.reduce((a,i)=>a + (Number(i.qty||1) * Number(i.price||0)), 0);
+    const taxPercent = Number(inv.taxPercent || state.settings?.taxPercent || 0);
+    const tax = subtotal * (taxPercent/100);
+    inv.subtotal = subtotal;
+    inv.taxPercent = taxPercent;
+    inv.tax = tax;
+    inv.total = subtotal + tax;
+  }
+
+  function renderItems() {
+    recalc();
+    itemsHost.innerHTML = "";
+
+    const t = el("table", { class:"table" }, [
+      el("thead", {}, [el("tr", {}, [
+        el("th", {}, ["الوصف"]),
+        el("th", {}, ["كمية"]),
+        el("th", {}, ["سعر"]),
+        el("th", {}, [""]),
+      ])]),
+      el("tbody")
+    ]);
+
+    const tb = t.querySelector("tbody");
+
+    if (!inv.items.length) {
+      tb.appendChild(el("tr", {}, [
+        el("td", { colspan:"4", style:"text-align:center; color:rgba(234,240,255,.7)" }, ["لا توجد عناصر"])
+      ]));
+    } else {
+      inv.items.forEach((it, idx) => {
+        const d = el("input", { class:"input", value: it.desc || "" });
+        const q = el("input", { class:"input", type:"number", value: it.qty ?? 1 });
+        const p = el("input", { class:"input", type:"number", value: it.price ?? 0 });
+
+        const sync = () => {
+          it.desc = d.value;
+          it.qty = Number(q.value||1);
+          it.price = Number(p.value||0);
+          renderItems();
+        };
+        [d,q,p].forEach(x=>x.addEventListener("change", sync));
+
+        tb.appendChild(el("tr", {}, [
+          el("td", {}, [d]),
+          el("td", {}, [q]),
+          el("td", {}, [p]),
+          el("td", {}, [
+            el("button", { class:"btn bad", onclick: () => { inv.items.splice(idx,1); renderItems(); }}, ["حذف"])
+          ]),
+        ]));
+      });
+    }
+
+    itemsHost.appendChild(t);
+    itemsHost.appendChild(el("div", { class:"actions", style:"margin-top:10px" }, [
+      el("button", { class:"btn", onclick: () => { inv.items.push({ desc:"", qty:1, price:0 }); renderItems(); }}, ["+ إضافة سطر"]),
+      el("span", { class:"badge" }, [`Subtotal: ${fmtMoney(inv.subtotal||0)}`]),
+      el("span", { class:"badge" }, [`Tax(${inv.taxPercent||0}%): ${fmtMoney(inv.tax||0)}`]),
+      el("span", { class:"badge ok" }, [`Total: ${fmtMoney(inv.total||0)}`]),
+    ]));
+  }
+
+  renderItems();
+
+  const body = el("div", { class:"grid", style:"gap:14px" }, [
+    el("div", { class:"card" }, [
+      el("h3", {}, ["معلومات الفاتورة"]),
+      el("div", { class:"row" }, [
+        el("div", { class:"field" }, [el("label", {}, ["رقم الفاتورة"]), fNo]),
+        el("div", { class:"field" }, [el("label", {}, ["التاريخ"]), fDate]),
+      ]),
+      el("div", { class:"row" }, [
+        el("div", { class:"field" }, [el("label", {}, ["الاسم"]), fName]),
+        el("div", { class:"field" }, [el("label", {}, ["الهاتف"]), fPhone]),
+      ]),
+      el("div", { class:"row" }, [
+        el("div", { class:"field" }, [el("label", {}, ["اللوحة"]), fPlate]),
+        el("div", { class:"field" }, [el("label", {}, ["الموديل"]), fModel]),
+        el("div", { class:"field" }, [el("label", {}, ["السنة"]), fYear]),
+      ]),
+      el("div", { class:"field" }, [el("label", {}, ["قالب الطباعة"]), tplSel]),
+    ]),
+    el("div", { class:"card" }, [
+      el("h3", {}, ["عناصر الفاتورة"]),
+      itemsHost
+    ])
+  ]);
+
+  const btnSave = el("button", { class:"btn primary", onclick: async () => {
+    try{
+      btnSave.disabled = true;
+      recalc();
+
+      await updateDoc(doc(state.db, C.invoices, id), {
+        date: fDate.value,
+        customerName: fName.value.trim(),
+        customerPhone: fPhone.value.trim(),
+        plate: fPlate.value.trim(),
+        carModel: fModel.value.trim(),
+        year: fYear.value ? Number(fYear.value) : "",
+        items: inv.items,
+        subtotal: inv.subtotal,
+        taxPercent: inv.taxPercent,
+        tax: inv.tax,
+        total: inv.total,
+        templateId: tplSel.value,
+        updatedAt: serverTimestamp(),
+      });
+
+      toast("تم الحفظ", "الفاتورة تحدّثت", "ok");
+      renderRoute();
+    }catch(e){
+      toast("فشل الحفظ", e?.message||String(e), "bad");
+    }finally{
+      btnSave.disabled = false;
+    }
+  }}, ["حفظ"]);
+
+  const btnPrint = el("button", { class:"btn ok", onclick: () => printInvoice(id) }, ["طباعة"]);
+  openModal("تعديل فاتورة", body, [btnSave, btnPrint]);
+}
+
+/* ---------- Print Invoice ---------- */
+async function printInvoice(invoiceId) {
+  try{
+    const s = await getDoc(doc(state.db, C.invoices, invoiceId));
+    if (!s.exists()) return toast("غير موجود", "الفاتورة غير موجودة", "warn");
+    const inv = { id:s.id, ...s.data() };
+
+    let tpl = null;
+    if (inv.templateId) {
+      const t = await getDoc(doc(state.db, C.invoiceTemplates, inv.templateId));
+      if (t.exists()) tpl = { id:t.id, ...t.data() };
+    }
+    if (!tpl) {
+      // fallback: pick any
+      const qs = query(collection(state.db, C.invoiceTemplates), limit(1));
+      const ss = await getDocs(qs);
+      if (!ss.empty) tpl = { id:ss.docs[0].id, ...ss.docs[0].data() };
+    }
+    if (!tpl) throw new Error("لا يوجد قالب فواتير");
+
+    const items = (inv.items||[]).map(it => {
+      const qty = Number(it.qty||1);
+      const price = Number(it.price||0);
+      return {
+        desc: it.desc || "",
+        qty,
+        price,
+        priceFmt: fmtMoney(price),
+        lineTotalFmt: fmtMoney(qty*price),
+      };
+    });
+
+    const data = {
+      invoiceNo: inv.invoiceNo || "",
+      date: inv.date || fmtDate(inv.createdAt),
+      customerName: inv.customerName || "",
+      customerPhone: inv.customerPhone || "",
+      plate: inv.plate || "",
+      carModel: inv.carModel || "",
+      year: inv.year || "",
+      serviceTitle: inv.serviceTitle || "خدمات ورشة",
+      items,
+      totalFmt: fmtMoney(inv.total || 0),
+    };
+
+    const html = `
+      <!doctype html>
+      <html lang="ar" dir="rtl">
+      <head>
+        <meta charset="utf-8"/>
+        <meta name="viewport" content="width=device-width,initial-scale=1"/>
+        <title>${inv.invoiceNo || "Invoice"}</title>
+        <style>${tpl.css || ""}</style>
+      </head>
+      <body>
+        ${renderTemplate(tpl.html || "", data)}
+        <script>
+          window.onload = () => { setTimeout(()=>window.print(), 250); };
+        </script>
+      </body>
+      </html>
+    `;
+
+    const iframe = el("iframe", { style:"width:100%; height:80vh; border:1px solid rgba(255,255,255,.12); border-radius:16px; background:#fff;" });
+    openModal("معاينة الطباعة", el("div", {}, [iframe]), [
+      el("button", { class:"btn ok", onclick: () => iframe.contentWindow?.print() }, ["طباعة الآن"])
+    ]);
+    iframe.srcdoc = html;
+
+  }catch(e){
+    toast("تعذر الطباعة", e?.message||String(e), "bad");
+  }
+}
+
+/* ---------- Templates Page ---------- */
+async function pageTemplates() {
+  setPageHeader("قوالب الفواتير", "تعديل القالب + معاينة فورية + حفظ");
+
+  const host = el("div", { class:"grid cols2" }, []);
+
+  const listBox = el("div", { class:"card" }, [
+    el("h3", {}, ["القوالب"]),
+    el("div", { class:"muted" }, ["إنشاء/تعديل/حذف القوالب"]),
+    el("hr", { class:"hr" }),
+  ]);
+
+  const editorBox = el("div", { class:"card" }, [
+    el("h3", {}, ["المحرر"]),
+    el("div", { class:"muted" }, ["قالب HTML + CSS — يدعم {{var}} و {{#items}} ... {{/items}}"]),
+    el("hr", { class:"hr" }),
+  ]);
+
+  host.appendChild(listBox);
+  host.appendChild(editorBox);
+
+  const tplList = el("div", { class:"muted" }, ["جارِ التحميل…"]);
+  listBox.appendChild(tplList);
+
+  const name = el("input", { class:"input", placeholder:"اسم القالب" });
+  const css = el("textarea", {}, [""]);
+  const html = el("textarea", {}, [""]);
+
+  const preview = el("iframe", { style:"width:100%; height:360px; border:1px solid rgba(255,255,255,.12); border-radius:16px; background:#fff;" });
+
+  const current = { id:null };
+
+  function sampleData() {
+    return {
+      invoiceNo: "RPM-000123",
+      date: fmtDate(new Date()),
+      customerName: "علي حسن رشيد",
+      customerPhone: "0770xxxxxxx",
+      plate: "ك13-----",
+      carModel: "سوناتا 2",
+      year: "1994",
+      serviceTitle: "تبديل دهن",
+      items: [
+        { desc:"دهن 5W-30", qty:1, priceFmt: fmtMoney(35000), lineTotalFmt: fmtMoney(35000) },
+        { desc:"فلتر", qty:1, priceFmt: fmtMoney(5000), lineTotalFmt: fmtMoney(5000) },
+      ],
+      totalFmt: fmtMoney(40000),
+    };
+  }
+
+  function refreshPreview() {
+    const docHtml = `
+      <!doctype html><html lang="ar" dir="rtl">
+      <head><meta charset="utf-8"/><style>${css.value}</style></head>
+      <body>${renderTemplate(html.value, sampleData())}</body></html>
+    `;
+    preview.srcdoc = docHtml;
+  }
+
+  [name, css, html].forEach(x => x.addEventListener("input", refreshPreview));
+
+  editorBox.appendChild(el("div", { class:"field" }, [el("label", {}, ["اسم القالب"]), name]));
+  editorBox.appendChild(el("div", { class:"field" }, [el("label", {}, ["CSS"]), css]));
+  editorBox.appendChild(el("div", { class:"field" }, [el("label", {}, ["HTML"]), html]));
+  editorBox.appendChild(el("div", { class:"actions" }, [
+    el("button", { class:"btn primary", onclick: async () => {
+      try{
+        if (!name.value.trim()) return toast("اسم القالب مطلوب", "", "warn");
+        if (!current.id) {
+          const ref = await addDoc(collection(state.db, C.invoiceTemplates), {
+            name: name.value.trim(),
+            css: css.value,
+            html: html.value,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+          current.id = ref.id;
+          toast("تم الإنشاء", "قالب جديد", "ok");
+        } else {
+          await updateDoc(doc(state.db, C.invoiceTemplates, current.id), {
+            name: name.value.trim(),
+            css: css.value,
+            html: html.value,
+            updatedAt: serverTimestamp(),
+          });
+          toast("تم الحفظ", "القالب تحدّث", "ok");
+        }
+        await loadList();
+      }catch(e){
+        toast("فشل الحفظ", e?.message||String(e), "bad");
+      }
+    }}, ["حفظ القالب"]),
+    el("button", { class:"btn", onclick: () => {
+      current.id = null;
+      name.value=""; css.value=""; html.value="";
+      refreshPreview();
+    }}, ["قالب جديد"]),
+    hasPerm(state.profile, "delete")
+      ? el("button", { class:"btn bad", onclick: async () => {
+        if (!current.id) return;
+        if (!confirm("حذف القالب؟")) return;
+        try{
+          await deleteDoc(doc(state.db, C.invoiceTemplates, current.id));
+          toast("تم الحذف", "قالب", "ok");
+          current.id=null;
+          name.value=""; css.value=""; html.value="";
+          refreshPreview();
+          await loadList();
+        }catch(e){
+          toast("تعذر الحذف", e?.message||"", "bad");
+        }
+      }}, ["حذف"])
+      : el("span")
+  ]));
+
+  editorBox.appendChild(el("hr", { class:"hr" }));
+  editorBox.appendChild(el("h3", {}, ["المعاينة"]));
+  editorBox.appendChild(preview);
+
+  async function loadList() {
+    tplList.innerHTML = "";
+    tplList.appendChild(el("div", { class:"muted" }, ["جارِ التحميل…"]));
+
+    const q1 = query(collection(state.db, C.invoiceTemplates), orderBy("createdAt","desc"), limit(50));
+    const s1 = await getDocs(q1);
+
+    tplList.innerHTML = "";
+    if (s1.empty) {
+      tplList.appendChild(el("div", { class:"muted" }, ["لا توجد قوالب."]));
       return;
     }
-  }catch(e){ /* ignore */ }
+    s1.docs.forEach(d => {
+      const t = d.data();
+      const row = el("div", { class:"card", style:"margin-bottom:10px" }, [
+        el("div", { style:"display:flex; justify-content:space-between; align-items:center; gap:10px" }, [
+          el("div", {}, [
+            el("b", {}, [t.name || d.id]),
+            el("div", { class:"muted", style:"font-size:12px" }, [d.id]),
+          ]),
+          el("div", { class:"actions" }, [
+            el("button", { class:"btn", onclick: () => {
+              current.id = d.id;
+              name.value = t.name || "";
+              css.value = t.css || "";
+              html.value = t.html || "";
+              refreshPreview();
+              toast("تم التحميل", "القالب في المحرر", "ok");
+            }}, ["تحميل"]),
+          ])
+        ])
+      ]);
+      tplList.appendChild(row);
+    });
+  }
 
-  await bootstrap();
+  refreshPreview();
+  await loadList();
+  return host;
+}
 
-  window.addEventListener("hashchange", route);
-  if(!location.hash) location.hash = "#/dashboard";
-});
+/* ---------- Customers Page ---------- */
+async function pageCustomers() {
+  setPageHeader("الزبائن", "إدارة الزبائن");
+
+  const host = el("div", { class:"grid", style:"gap:16px" }, []);
+  const top = el("div", { class:"card" }, [
+    el("h3", {}, ["قائمة الزبائن"]),
+    el("div", { class:"muted" }, ["الاسم + الهاتف + إنشاء/تعديل"]),
+    el("hr", { class:"hr" }),
+  ]);
+
+  const search = el("input", { class:"input", placeholder:"بحث: اسم أو هاتف…" });
+  const btnAdd = el("button", { class:"btn primary" }, ["+ زبون"]);
+  const btnRefresh = el("button", { class:"btn ghost" }, ["تحديث"]);
+
+  top.appendChild(el("div", { class:"row" }, [
+    el("div", { class:"field" }, [el("label", {}, ["بحث"]), search]),
+    el("div", { class:"actions", style:"align-items:flex-end; padding-top:18px" }, [btnAdd, btnRefresh]),
+  ]));
+
+  const box = el("div", { class:"card" }, [el("div", { class:"muted" }, ["جارِ التحميل…"])]);
+  host.appendChild(top);
+  host.appendChild(box);
+
+  btnAdd.onclick = () => openCustomerEditor();
+
+  async function load() {
+    box.innerHTML = "";
+    box.appendChild(el("div", { class:"muted" }, ["جارِ التحميل…"]));
+
+    try{
+      const q1 = query(collection(state.db, C.customers), orderBy("createdAt","desc"), limit(200));
+      const s1 = await getDocs(q1);
+      const rows = s1.docs.map(d => ({ id:d.id, ...d.data() }));
+      render(rows);
+    }catch(e){
+      box.innerHTML = "";
+      box.appendChild(el("div", { class:"muted" }, ["فشل: ", String(e?.message||e)]));
+    }
+  }
+
+  function render(rows) {
+    const q = search.value.trim().toLowerCase();
+    const filtered = q ? rows.filter(x => (`${x.name||x.customerName||""} ${x.phone||x.customerPhone||""}`.toLowerCase().includes(q))) : rows;
+
+    const tbl = el("table", { class:"table" }, [
+      el("thead", {}, [el("tr", {}, [
+        el("th", {}, ["الاسم"]),
+        el("th", {}, ["الهاتف"]),
+        el("th", {}, ["تاريخ"]),
+        el("th", {}, ["إجراءات"]),
+      ])]),
+      el("tbody")
+    ]);
+    const tb = tbl.querySelector("tbody");
+
+    if (!filtered.length) {
+      tb.appendChild(el("tr", {}, [el("td", { colspan:"4", style:"text-align:center; color:rgba(234,240,255,.7)" }, ["لا يوجد بيانات"])]));
+    } else {
+      for (const r of filtered) {
+        tb.appendChild(el("tr", {}, [
+          el("td", {}, [el("b", {}, [r.name || r.customerName || "-"])]),
+          el("td", {}, [r.phone || r.customerPhone || "-"]),
+          el("td", {}, [fmtDate(r.createdAt)]),
+          el("td", {}, [
+            el("div", { class:"actions" }, [
+              el("button", { class:"btn", onclick: () => openCustomerEditor(r) }, ["تعديل"]),
+              hasPerm(state.profile, "delete")
+                ? el("button", { class:"btn bad", onclick: () => deleteCustomer(r.id) }, ["حذف"])
+                : el("span"),
+            ])
+          ]),
+        ]));
+      }
+    }
+
+    box.innerHTML = "";
+    box.appendChild(tbl);
+  }
+
+  btnRefresh.onclick = load;
+  search.addEventListener("input", load);
+  await load();
+  return host;
+}
+
+function openCustomerEditor(row=null){
+  const isNew = !row;
+  const name = el("input", { class:"input", value: row?.name || row?.customerName || "" });
+  const phone = el("input", { class:"input", value: row?.phone || row?.customerPhone || "" });
+
+  const body = el("div", { class:"grid" }, [
+    el("div", { class:"card" }, [
+      el("h3", {}, [isNew ? "زبون جديد" : "تعديل زبون"]),
+      el("div", { class:"field" }, [el("label", {}, ["الاسم"]), name]),
+      el("div", { class:"field" }, [el("label", {}, ["الهاتف"]), phone]),
+    ])
+  ]);
+
+  const btnSave = el("button", { class:"btn primary", onclick: async () => {
+    try{
+      if (!name.value.trim() || !phone.value.trim()) return toast("الاسم والهاتف مطلوبين", "", "warn");
+      btnSave.disabled=true;
+
+      if (isNew) {
+        await addDoc(collection(state.db, C.customers), {
+          name: name.value.trim(),
+          phone: phone.value.trim(),
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } else {
+        await updateDoc(doc(state.db, C.customers, row.id), {
+          name: name.value.trim(),
+          phone: phone.value.trim(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      toast("تم الحفظ", "", "ok");
+      renderRoute();
+    }catch(e){
+      toast("فشل", e?.message||String(e), "bad");
+    }finally{
+      btnSave.disabled=false;
+    }
+  }}, ["حفظ"]);
+
+  openModal("الزبائن", body, [btnSave]);
+}
+
+async function deleteCustomer(id){
+  if (!confirm("حذف الزبون؟")) return;
+  try{
+    await deleteDoc(doc(state.db, C.customers, id));
+    toast("تم الحذف", "", "ok");
+    renderRoute();
+  }catch(e){
+    toast("تعذر الحذف", e?.message||"", "bad");
+  }
+}
+
+/* ---------- Cars Page ---------- */
+async function pageCars() {
+  setPageHeader("السيارات", "إدارة السيارات");
+
+  const host = el("div", { class:"grid", style:"gap:16px" }, []);
+  const top = el("div", { class:"card" }, [
+    el("h3", {}, ["قائمة السيارات"]),
+    el("div", { class:"muted" }, ["اللوحة + الموديل + الزبون"]),
+    el("hr", { class:"hr" }),
+  ]);
+
+  const search = el("input", { class:"input", placeholder:"بحث: لوحة / موديل / زبون…" });
+  const btnRefresh = el("button", { class:"btn ghost" }, ["تحديث"]);
+
+  top.appendChild(el("div", { class:"row" }, [
+    el("div", { class:"field" }, [el("label", {}, ["بحث"]), search]),
+    el("div", { class:"actions", style:"align-items:flex-end; padding-top:18px" }, [btnRefresh]),
+  ]));
+
+  const box = el("div", { class:"card" }, [el("div", { class:"muted" }, ["جارِ التحميل…"])]);
+  host.appendChild(top);
+  host.appendChild(box);
+
+  async function load() {
+    box.innerHTML = "";
+    box.appendChild(el("div", { class:"muted" }, ["جارِ التحميل…"]));
+    try{
+      const q1 = query(collection(state.db, C.cars), orderBy("createdAt","desc"), limit(200));
+      const s1 = await getDocs(q1);
+      const rows = s1.docs.map(d => ({ id:d.id, ...d.data() }));
+      render(rows);
+    }catch(e){
+      box.innerHTML = "";
+      box.appendChild(el("div", { class:"muted" }, ["فشل: ", String(e?.message||e)]));
+    }
+  }
+
+  function render(rows) {
+    const q = search.value.trim().toLowerCase();
+    const filtered = q ? rows.filter(x => (`${x.plate||""} ${x.model||""} ${x.customerName||""}`.toLowerCase().includes(q))) : rows;
+
+    const tbl = el("table", { class:"table" }, [
+      el("thead", {}, [el("tr", {}, [
+        el("th", {}, ["اللوحة"]),
+        el("th", {}, ["الموديل"]),
+        el("th", {}, ["السنة"]),
+        el("th", {}, ["الزبون"]),
+        el("th", {}, ["تاريخ"]),
+      ])]),
+      el("tbody")
+    ]);
+    const tb = tbl.querySelector("tbody");
+
+    if (!filtered.length) {
+      tb.appendChild(el("tr", {}, [el("td", { colspan:"5", style:"text-align:center; color:rgba(234,240,255,.7)" }, ["لا يوجد بيانات"])]));
+    } else {
+      for (const r of filtered) {
+        tb.appendChild(el("tr", {}, [
+          el("td", {}, [el("b", {}, [r.plate || "-"])]),
+          el("td", {}, [r.model || "-"]),
+          el("td", {}, [r.year ? String(r.year) : "-"]),
+          el("td", {}, [r.customerName || "-"]),
+          el("td", {}, [fmtDate(r.createdAt)]),
+        ]));
+      }
+    }
+
+    box.innerHTML = "";
+    box.appendChild(tbl);
+  }
+
+  btnRefresh.onclick = load;
+  search.addEventListener("input", load);
+  await load();
+  return host;
+}
+
+/* ---------- Users (Admin) ---------- */
+async function pageUsers() {
+  if (!hasPerm(state.profile, "manageUsers")) {
+    setPageHeader("ممنوع", "لا تملكين صلاحية إدارة المستخدمين");
+    return el("div", { class:"card" }, [el("div", { class:"muted" }, ["لا يوجد صلاحية."])]);
+  }
+
+  setPageHeader("صلاحيات المستخدمين", "إنشاء حسابات + أدوار + صلاحيات");
+
+  const host = el("div", { class:"grid cols2" }, []);
+
+  const left = el("div", { class:"card" }, [
+    el("h3", {}, ["إنشاء مستخدم (Auth)"]),
+    el("div", { class:"muted" }, ["ينشئ حساب دخول + يسجل دوره في users/{uid}"]),
+    el("hr", { class:"hr" }),
+  ]);
+
+  const email = el("input", { class:"input", placeholder:"email@example.com" });
+  const pass = el("input", { class:"input", placeholder:"كلمة مرور مبدئية", type:"password" });
+  const role = el("select", {}, [
+    el("option", { value:"viewer" }, ["viewer"]),
+    el("option", { value:"tech" }, ["tech"]),
+    el("option", { value:"manager" }, ["manager"]),
+    el("option", { value:"admin" }, ["admin"]),
+  ]);
+
+  left.appendChild(el("div", { class:"field" }, [el("label", {}, ["Email"]), email]));
+  left.appendChild(el("div", { class:"field" }, [el("label", {}, ["Password"]), pass]));
+  left.appendChild(el("div", { class:"field" }, [el("label", {}, ["Role"]), role]));
+
+  const btnCreate = el("button", { class:"btn primary", onclick: async () => {
+    try{
+      btnCreate.disabled = true;
+      if (!email.value.trim() || !pass.value) return toast("أكملي البيانات", "", "warn");
+
+      // Create auth user (requires privileged context normally; but client can create if rules allow)
+      const cred = await createUserWithEmailAndPassword(state.auth, email.value.trim(), pass.value);
+      const uid = cred.user.uid;
+
+      await setDoc(doc(state.db, C.users, uid), {
+        email: email.value.trim(),
+        role: role.value,
+        permissions: {},
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
+      toast("تم إنشاء المستخدم", "تمت إضافة الدور في Firestore", "ok");
+      renderRoute();
+    } catch(e){
+      toast("فشل الإنشاء", e?.message || String(e), "bad");
+    } finally{
+      btnCreate.disabled = false;
+    }
+  }}, ["إنشاء"]);
+
+  left.appendChild(el("div", { class:"actions" }, [btnCreate]));
+  left.appendChild(el("div", { class:"muted", style:"margin-top:10px" }, [
+    "ملاحظة: إنشاء المستخدم من الواجهة يعتمد على إعدادات Auth وقيود المشروع. "
+  ]));
+
+  const right = el("div", { class:"card" }, [
+    el("h3", {}, ["قائمة المستخدمين (users)"]),
+    el("div", { class:"muted" }, ["تعديل الدور/الصلاحيات (Firestore)"]),
+    el("hr", { class:"hr" }),
+  ]);
+
+  const list = el("div", { class:"muted" }, ["جارِ التحميل…"]);
+  right.appendChild(list);
+
+  async function load() {
+    list.innerHTML = "";
+    list.appendChild(el("div", { class:"muted" }, ["جارِ التحميل…"]));
+    try{
+      const q1 = query(collection(state.db, C.users), orderBy("createdAt","desc"), limit(200));
+      const s1 = await getDocs(q1);
+      list.innerHTML = "";
+      if (s1.empty) return list.appendChild(el("div", { class:"muted" }, ["لا يوجد مستخدمين داخل users."]));
+
+      s1.docs.forEach(d => {
+        const u = d.data();
+        const sel = el("select", {}, [
+          el("option", { value:"viewer" }, ["viewer"]),
+          el("option", { value:"tech" }, ["tech"]),
+          el("option", { value:"manager" }, ["manager"]),
+          el("option", { value:"admin" }, ["admin"]),
+        ]);
+        sel.value = u.role || "viewer";
+
+        const btnSaveRole = el("button", { class:"btn", onclick: async () => {
+          try{
+            await updateDoc(doc(state.db, C.users, d.id), { role: sel.value, updatedAt: serverTimestamp() });
+            toast("تم تحديث الدور", u.email || d.id, "ok");
+          }catch(e){
+            toast("فشل", e?.message||"", "bad");
+          }
+        }}, ["حفظ"]);
+
+        const card = el("div", { class:"card", style:"margin-bottom:10px" }, [
+          el("div", { style:"display:flex; justify-content:space-between; gap:10px; align-items:center" }, [
+            el("div", {}, [
+              el("b", {}, [u.email || d.id]),
+              el("div", { class:"muted", style:"font-size:12px" }, [`uid: ${d.id}`]),
+            ]),
+            el("div", { class:"actions" }, [sel, btnSaveRole]),
+          ]),
+        ]);
+
+        list.appendChild(card);
+      });
+
+    }catch(e){
+      list.innerHTML = "";
+      list.appendChild(el("div", { class:"muted" }, ["فشل التحميل: ", String(e?.message||e)]));
+    }
+  }
+
+  await load();
+  host.appendChild(left);
+  host.appendChild(right);
+  return host;
+}
+
+/* ---------- Settings (Admin) ---------- */
+async function pageSettings() {
+  if (!hasPerm(state.profile, "manageSettings")) {
+    setPageHeader("ممنوع", "لا تملكين صلاحية الإعدادات");
+    return el("div", { class:"card" }, [el("div", { class:"muted" }, ["لا يوجد صلاحية."])]);
+  }
+
+  setPageHeader("الإعدادات", "اسم الورشة + ترقيم الفواتير + ضريبة");
+
+  const s = state.settings || {};
+  const name = el("input", { class:"input", value: s.workshopName || "" });
+  const phone = el("input", { class:"input", value: s.workshopPhone || "" });
+  const addr = el("input", { class:"input", value: s.workshopAddress || "" });
+
+  const prefix = el("input", { class:"input", value: s.invoicePrefix || "RPM-" });
+  const padding = el("input", { class:"input", type:"number", value: s.invoicePadding || 6 });
+  const tax = el("input", { class:"input", type:"number", value: s.taxPercent || 0 });
+
+  const box = el("div", { class:"grid cols2" }, [
+    el("div", { class:"card" }, [
+      el("h3", {}, ["بيانات الورشة"]),
+      el("div", { class:"field" }, [el("label", {}, ["الاسم"]), name]),
+      el("div", { class:"field" }, [el("label", {}, ["الهاتف"]), phone]),
+      el("div", { class:"field" }, [el("label", {}, ["العنوان"]), addr]),
+    ]),
+    el("div", { class:"card" }, [
+      el("h3", {}, ["الفواتير"]),
+      el("div", { class:"field" }, [el("label", {}, ["Prefix"]), prefix]),
+      el("div", { class:"field" }, [el("label", {}, ["Padding"]), padding]),
+      el("div", { class:"field" }, [el("label", {}, ["Tax %"]), tax]),
+    ]),
+  ]);
+
+  const btnSave = el("button", { class:"btn primary", onclick: async () => {
+    try{
+      btnSave.disabled = true;
+      await setDoc(doc(state.db, C.settings, "app"), {
+        workshopName: name.value.trim(),
+        workshopPhone: phone.value.trim(),
+        workshopAddress: addr.value.trim(),
+        invoicePrefix: prefix.value.trim(),
+        invoicePadding: Number(padding.value||6),
+        taxPercent: Number(tax.value||0),
+        updatedAt: serverTimestamp(),
+      }, { merge:true });
+
+      toast("تم حفظ الإعدادات", "", "ok");
+      await loadBootstrapData(); // refresh state
+      renderRoute();
+    }catch(e){
+      toast("فشل الحفظ", e?.message||String(e), "bad");
+    }finally{
+      btnSave.disabled = false;
+    }
+  }}, ["حفظ"]);
+
+  const btnSeed = el("button", { class:"btn", onclick: async () => {
+    try{
+      await ensureDefaults();
+      toast("تم تهيئة الافتراضيات", "settings/uiConfig/meta/templates", "ok");
+      await loadBootstrapData();
+      renderRoute();
+    }catch(e){
+      toast("فشل التهيئة", e?.message||String(e), "bad");
+    }
+  }}, ["تهيئة افتراضيات"]);
+
+  return el("div", {}, [
+    el("div", { class:"actions", style:"margin-bottom:12px" }, [btnSave, btnSeed]),
+    box
+  ]);
+}
+
+/* ---------- UI Pages (Admin) ---------- */
+async function pageUI() {
+  if (!hasPerm(state.profile, "manageSettings")) {
+    setPageHeader("ممنوع", "لا تملكين صلاحية صفحات مخصصة");
+    return el("div", { class:"card" }, [el("div", { class:"muted" }, ["لا يوجد صلاحية."])]);
+  }
+
+  setPageHeader("صفحات مخصّصة", "إنشاء صفحات داخل uiConfig بدون تعديل الملفات");
+
+  const host = el("div", { class:"grid cols2" }, []);
+
+  const left = el("div", { class:"card" }, [
+    el("h3", {}, ["إنشاء صفحة HTML"]),
+    el("div", { class:"muted" }, ["تُحفظ داخل uiConfig/{docId} كـ kind=page"]),
+    el("hr", { class:"hr" }),
+  ]);
+
+  const slug = el("input", { class:"input", placeholder:"slug مثال: offers" });
+  const title = el("input", { class:"input", placeholder:"عنوان الصفحة" });
+  const html = el("textarea", {}, ["<h2>مرحبا</h2><p>هذه صفحة مخصصة.</p>"]);
+
+  const btnCreate = el("button", { class:"btn primary", onclick: async () => {
+    try{
+      if (!slug.value.trim() || !title.value.trim()) return toast("slug والعنوان مطلوبين", "", "warn");
+      btnCreate.disabled=true;
+      const id = "page_" + slug.value.trim().toLowerCase();
+      await setDoc(doc(state.db, C.uiConfig, id), {
+        kind: "page",
+        slug: slug.value.trim().toLowerCase(),
+        title: title.value.trim(),
+        type: "html",
+        html: html.value,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }, { merge:true });
+
+      toast("تم إنشاء الصفحة", "يمكن فتحها من الرابط مباشرة", "ok");
+      navTo("page", slug.value.trim().toLowerCase());
+    }catch(e){
+      toast("فشل", e?.message||String(e), "bad");
+    }finally{
+      btnCreate.disabled=false;
+    }
+  }}, ["حفظ الصفحة"]);
+
+  left.appendChild(el("div", { class:"field" }, [el("label", {}, ["Slug"]), slug]));
+  left.appendChild(el("div", { class:"field" }, [el("label", {}, ["Title"]), title]));
+  left.appendChild(el("div", { class:"field" }, [el("label", {}, ["HTML"]), html]));
+  left.appendChild(el("div", { class:"actions" }, [btnCreate]));
+
+  const right = el("div", { class:"card" }, [
+    el("h3", {}, ["الصفحات الموجودة"]),
+    el("div", { class:"muted" }, ["تظهر وتُفتح عبر: #/page/<slug>"]),
+    el("hr", { class:"hr" }),
+  ]);
+  const list = el("div", { class:"muted" }, ["جارِ التحميل…"]);
+  right.appendChild(list);
+
+  async function load() {
+    list.innerHTML = "";
+    try{
+      const q1 = query(collection(state.db, C.uiConfig), where("kind","==","page"), limit(80));
+      const s1 = await getDocs(q1);
+      if (s1.empty) return list.appendChild(el("div", { class:"muted" }, ["لا توجد صفحات."]));
+      s1.docs.forEach(d => {
+        const p = d.data();
+        list.appendChild(el("div", { class:"card", style:"margin-bottom:10px" }, [
+          el("b", {}, [p.title || p.slug || d.id]),
+          el("div", { class:"muted", style:"font-size:12px" }, [`slug: ${p.slug}`]),
+          el("div", { class:"actions", style:"margin-top:8px" }, [
+            el("button", { class:"btn", onclick: () => navTo("page", p.slug) }, ["فتح"]),
+            hasPerm(state.profile, "delete")
+              ? el("button", { class:"btn bad", onclick: async () => {
+                if (!confirm("حذف الصفحة؟")) return;
+                await deleteDoc(doc(state.db, C.uiConfig, d.id));
+                toast("تم الحذف", "", "ok");
+                load();
+              }}, ["حذف"])
+              : el("span"),
+          ])
+        ]));
+      });
+    }catch(e){
+      list.appendChild(el("div", { class:"muted" }, ["فشل: ", String(e?.message||e)]));
+    }
+  }
+
+  await load();
+  host.appendChild(left);
+  host.appendChild(right);
+  return host;
+}
+
+/* ---------- Custom Page viewer: #/page/<slug> ---------- */
+async function pageCustom(slug) {
+  setPageHeader("صفحة مخصصة", slug);
+
+  const id = "page_" + slug;
+  const s = await getDoc(doc(state.db, C.uiConfig, id));
+  if (!s.exists()) {
+    return el("div", { class:"card" }, [
+      el("h3", {}, ["غير موجودة"]),
+      el("div", { class:"muted" }, ["لا توجد صفحة بهذا الـ slug."]),
+    ]);
+  }
+  const p = s.data();
+  setPageHeader(p.title || "صفحة", p.slug || "");
+  return el("div", { class:"card" }, [el("div", { html: p.html || "" })]);
+}
+
+/* ---------- Employees / Departments (basic CRUD placeholders) ---------- */
+async function pageEmployees() {
+  setPageHeader("الموظفون", "إدارة الموظفين");
+  return el("div", { class:"card" }, [
+    el("h3", {}, ["جاهز للتوسعة"]),
+    el("div", { class:"muted" }, ["حالياً: يمكن إضافة CRUD مشابه للزبائن بسهولة داخل employees collection."])
+  ]);
+}
+async function pageDepartments() {
+  setPageHeader("الأقسام", "إدارة الأقسام");
+  return el("div", { class:"card" }, [
+    el("h3", {}, ["جاهز للتوسعة"]),
+    el("div", { class:"muted" }, ["حالياً: يمكن إضافة CRUD مشابه للزبائن داخل departments collection."])
+  ]);
+}
+
+/* ---------- Route Renderer ---------- */
+async function renderRoute() {
+  if (!state.user) return renderAuth();
+  if (!state.profile) return; // wait
+
+  refreshActiveNav();
+  const page = $("#page");
+  page.innerHTML = "";
+  const { slug, id } = route();
+
+  try{
+    if (slug === "dashboard") page.appendChild(await pageDashboard());
+    else if (slug === "orders") page.appendChild(await pageOrders());
+    else if (slug === "oil") page.appendChild(await pageOil());
+    else if (slug === "invoices") page.appendChild(await pageInvoices());
+    else if (slug === "templates") page.appendChild(await pageTemplates());
+    else if (slug === "customers") page.appendChild(await pageCustomers());
+    else if (slug === "cars") page.appendChild(await pageCars());
+    else if (slug === "employees") page.appendChild(await pageEmployees());
+    else if (slug === "departments") page.appendChild(await pageDepartments());
+    else if (slug === "users") page.appendChild(await pageUsers());
+    else if (slug === "settings") page.appendChild(await pageSettings());
+    else if (slug === "ui") page.appendChild(await pageUI());
+    else if (slug === "page") page.appendChild(await pageCustom(id || ""));
+    else {
+      setPageHeader("غير معروف", slug);
+      page.appendChild(el("div", { class:"card" }, [el("div", { class:"muted" }, ["الصفحة غير موجودة."])]));
+    }
+  } catch(e){
+    page.innerHTML = "";
+    page.appendChild(el("div", { class:"card" }, [
+      el("h3", {}, ["حصل خطأ"]),
+      el("div", { class:"muted" }, [String(e?.message || e)]),
+      el("hr", { class:"hr" }),
+      el("div", { class:"muted" }, [
+        "إذا الخطأ Permission Denied: راجعي Firestore Rules.",
+      ])
+    ]));
+  }
+}
+
+/* ---------- Bootstrap Data ---------- */
+async function loadBootstrapData() {
+  try{
+    await ensureDefaults();
+    state.settings = await getSettings();
+
+    const uiRef = doc(state.db, C.uiConfig, "app");
+    const uiSnap = await getDoc(uiRef);
+    state.uiConfig = uiSnap.exists() ? { id:uiSnap.id, ...uiSnap.data() } : null;
+  } catch(e) {
+    toast("مشكلة إعدادات", e?.message || String(e), "warn");
+  }
+}
+
+/* ---------- Load User Profile ---------- */
+async function loadProfile(uid, email) {
+  const ref = doc(state.db, C.users, uid);
+  const s = await getDoc(ref);
+  if (s.exists()) return { id:s.id, ...s.data() };
+
+  // If missing profile: create viewer by default (safe)
+  await setDoc(ref, {
+    email: email || "",
+    role: "viewer",
+    permissions: {},
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  }, { merge:true });
+
+  return { id: uid, email: email || "", role:"viewer", permissions:{} };
+}
+
+/* ---------- Init ---------- */
+async function init() {
+  // Validate config
+  if (!firebaseConfig.apiKey || firebaseConfig.apiKey.includes("PUT_YOUR_API_KEY")) {
+    renderAuth();
+    toast("ملاحظة", "أدخلي apiKey داخل firebaseConfig في app.js", "warn");
+  }
+
+  state.app = initializeApp(firebaseConfig);
+  state.auth = getAuth(state.app);
+  state.db = getFirestore(state.app);
+
+  onAuthStateChanged(state.auth, async (user) => {
+    state.user = user || null;
+    state.profile = null;
+
+    clearLive();
+
+    if (!user) {
+      renderAuth();
+      return;
+    }
+
+    try{
+      await loadBootstrapData();
+      state.profile = await loadProfile(user.uid, user.email);
+      renderShell();
+      toast("أهلاً", `تم تسجيل الدخول: ${user.email}`, "ok");
+    } catch(e){
+      toast("خطأ", e?.message || String(e), "bad");
+      renderAuth();
+    }
+  });
+
+  window.addEventListener("hashchange", () => {
+    if (state.user) {
+      refreshActiveNav();
+      renderRoute();
+    }
+  });
+}
+
+init();
+
+/* =========================================================
+   🔐 Firestore Rules (اقتراح — ضعيها في Firebase Console)
+   =========================================================
+   ملاحظة: الواجهة وحدها لا تكفي. لازم Rules حقيقية.
+   الفكرة: role محفوظ في users/{uid}.role
+
+   rules_version = '2';
+   service cloud.firestore {
+     match /databases/{database}/documents {
+
+       function signedIn() { return request.auth != null; }
+       function userDoc() { return get(/databases/$(database)/documents/users/$(request.auth.uid)); }
+       function role() { return signedIn() ? userDoc().data.role : 'viewer'; }
+       function isAdmin() { return role() == 'admin'; }
+       function isManager() { return role() == 'manager' || isAdmin(); }
+       function isTech() { return role() == 'tech' || isManager(); }
+
+       match /users/{uid} {
+         allow read: if signedIn() && (isAdmin() || request.auth.uid == uid);
+         allow write: if isAdmin();
+       }
+
+       match /settings/{doc} {
+         allow read: if signedIn();
+         allow write: if isAdmin();
+       }
+
+       match /uiConfig/{doc} {
+         allow read: if signedIn();
+         allow write: if isAdmin();
+       }
+
+       match /meta/{doc} {
+         allow read: if signedIn();
+         allow write: if isAdmin();
+       }
+
+       match /invoiceTemplates/{id} {
+         allow read: if signedIn();
+         allow write: if isManager();
+       }
+
+       match /invoices/{id} {
+         allow read: if signedIn();
+         allow write: if isManager();
+         allow delete: if isAdmin();
+       }
+
+       match /orders/{id} {
+         allow read: if signedIn();
+         allow write: if isTech();
+         allow delete: if isAdmin();
+       }
+
+       match /customers/{id} {
+         allow read: if signedIn();
+         allow write: if isTech();
+         allow delete: if isAdmin();
+       }
+
+       match /cars/{id} {
+         allow read: if signedIn();
+         allow write: if isTech();
+         allow delete: if isAdmin();
+       }
+
+       match /employees/{id} {
+         allow read: if signedIn();
+         allow write: if isManager();
+         allow delete: if isAdmin();
+       }
+
+       match /departments/{id} {
+         allow read: if signedIn();
+         allow write: if isManager();
+         allow delete: if isAdmin();
+       }
+     }
+   }
+*/
