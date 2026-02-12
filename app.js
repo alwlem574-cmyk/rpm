@@ -2396,7 +2396,7 @@ async function loadProfile(uid, email) {
 /* ---------- Init ---------- */
 async function init() {
   // Validate config
-  if (!firebaseConfig.apiKey || firebaseConfig.apiKey.includes("PUT_YOUR_API_KEY")) {
+  if (!firebaseConfig.apiKey || firebaseConfig.apiKey.includes("AIzaSyC0p4cqNHuqZs9_gNuKLl7nEY0MqRXbf_A")) {
     renderAuth();
     toast("ملاحظة", "أدخلي apiKey داخل firebaseConfig في app.js", "warn");
   }
@@ -2517,3 +2517,4 @@ init();
      }
    }
 */
+
