@@ -1,2346 +1,1977 @@
-// app.js
-// RPM Front-end (9 ميزات) — 3 ملفات فقط
-// - SPA Router + Dashboard + Kanban + Invoices/Print/QR + Services/Cart
-// - Ctrl+K (Command Palette) + Draft AutoSave + Undo/Redo
-// - IndexedDB + Export/Import/CSV
-// - PWA Offline (Service Worker داخل نفس الملف)
-// - Voice Commands + Startup Sound (WebAudio) + QR Scanner (Camera)
+/* RPM — Front-end + Firebase (Realtime Database) + Invoice + Reports
+   الميزات (9):
+   1) Dashboard KPIs + آخر نشاط
+   2) CRUD الزبائن
+   3) CRUD السيارات + ربطها بالزبون
+   4) أوامر العمل Work Orders
+   5) فواتير احترافية (طباعة) + ترقيم تلقائي
+   6) تقارير كاملة + Charts (Canvas)
+   7) بحث + فلاتر + حالات (مدفوع/غير مدفوع)
+   8) نسخ احتياطي Export/Import JSON
+   9) وضع محلي Local fallback + Sync عند الاتصال
+*/
 
-const IS_SERVICE_WORKER = (typeof window === "undefined") || (typeof self !== "undefined" && !("document" in self));
-if (IS_SERVICE_WORKER) {
-  // =========================
-  // Service Worker (Offline)
-  // =========================
-  const CACHE = "rpm-cache-v1";
-  const CORE = [
-    "./",
-    "./index.html",
-    "./styles.css",
-    "./app.js",
+const $ = (sel, root=document) => root.querySelector(sel);
+const $$ = (sel, root=document) => [...root.querySelectorAll(sel)];
+const escapeHtml = (s="") => String(s)
+  .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+  .replaceAll('"',"&quot;").replaceAll("'","&#039;");
+
+const fmtIQD = new Intl.NumberFormat("ar-IQ", { style:"currency", currency:"IQD", maximumFractionDigits:0 });
+const fmtNum = new Intl.NumberFormat("ar-IQ");
+const fmtDate = (ts) => {
+  try{
+    const d = (typeof ts === "number") ? new Date(ts) : (ts?.toMillis ? new Date(ts.toMillis()) : new Date(ts));
+    return d.toLocaleString("ar-IQ", { year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" });
+  }catch{ return "—"; }
+};
+const ymd = (d) => {
+  const x = new Date(d);
+  const m = String(x.getMonth()+1).padStart(2,"0");
+  const dd = String(x.getDate()).padStart(2,"0");
+  return `${x.getFullYear()}-${m}-${dd}`;
+};
+const startOfDay = (d) => {
+  const x = new Date(d); x.setHours(0,0,0,0); return x.getTime();
+};
+const endOfDay = (d) => {
+  const x = new Date(d); x.setHours(23,59,59,999); return x.getTime();
+};
+
+const toast = (msg, type="") => {
+  const root = $("#toastRoot");
+  const el = document.createElement("div");
+  el.className = `toast ${type}`.trim();
+  el.textContent = msg;
+  root.appendChild(el);
+  setTimeout(()=> el.remove(), 3200);
+};
+
+const modal = {
+  open({title, bodyHtml, footerHtml, onMount}){
+    const root = $("#modalRoot");
+    root.innerHTML = `
+      <div class="modalOverlay" id="modalOverlay">
+        <div class="modal" role="dialog" aria-modal="true">
+          <div class="modalHeader">
+            <div class="modalTitle">${escapeHtml(title || "")}</div>
+            <button class="iconBtn modalClose" id="modalClose" title="إغلاق">✕</button>
+          </div>
+          <div class="modalBody" id="modalBody">${bodyHtml || ""}</div>
+          <div class="modalFooter">${footerHtml || ""}</div>
+        </div>
+      </div>
+    `;
+    $("#modalClose").addEventListener("click", modal.close);
+    $("#modalOverlay").addEventListener("click", (e)=>{ if(e.target.id==="modalOverlay") modal.close(); });
+    if(onMount) onMount();
+  },
+  close(){ $("#modalRoot").innerHTML = ""; }
+};
+
+// ------------------ Local DB (fallback) ------------------
+const LOCAL_KEY = "rpm_local_db_v1";
+const loadLocalDB = () => {
+  try{
+    const raw = localStorage.getItem(LOCAL_KEY);
+    if(!raw) return {
+      customers:{}, cars:{}, workOrders:{}, invoices:{}, services:{},
+      settings:{ company:{}, invoice:{}, ui:{} },
+      meta:{ counters:{ invoiceNo: 1000 } }
+    };
+    return JSON.parse(raw);
+  }catch{
+    return {
+      customers:{}, cars:{}, workOrders:{}, invoices:{}, services:{},
+      settings:{ company:{}, invoice:{}, ui:{} },
+      meta:{ counters:{ invoiceNo: 1000 } }
+    };
+  }
+};
+const saveLocalDB = () => localStorage.setItem(LOCAL_KEY, JSON.stringify(state.localDB));
+
+const toArray = (obj={}) => Object.entries(obj).map(([id, data]) => ({ id, ...data }));
+
+// ------------------ Firebase Config Wizard ------------------
+const CFG_KEY = "rpm_firebase_config_v1";
+
+/* إعدادات Firebase المعروفة من مشروعج (rpm574)
+   إذا ناقص apiKey / messagingSenderId: عبّيهم من Firebase console مرة وحدة داخل الإعدادات.
+*/
+const DEFAULT_FIREBASE_CONFIG = {
+  apiKey: "AIzaSyC0p4cqNHuqZs9_gNuKLl7nEY0MqRXbf_A",
+  authDomain: "rpm574.firebaseapp.com",
+  databaseURL: "https://rpm574-default-rtdb.firebaseio.com",
+  projectId: "rpm574",
+  storageBucket: "rpm574.firebasestorage.app",
+  messagingSenderId: "150918603525",
+  appId: "1:150918603525:web:fe1d0fbe5c4505936c4d6c"
+};
+
+
+const loadFirebaseConfig = () => {
+  try{
+    const raw = localStorage.getItem(CFG_KEY);
+    if(!raw) return { ...DEFAULT_FIREBASE_CONFIG };
+    const obj = JSON.parse(raw);
+    return { ...DEFAULT_FIREBASE_CONFIG, ...obj };
+  }catch{
+    return { ...DEFAULT_FIREBASE_CONFIG };
+  }
+};
+const saveFirebaseConfig = (cfg) => localStorage.setItem(CFG_KEY, JSON.stringify(cfg));
+
+// ------------------ App State ------------------
+const state = {
+  firebase: {
+    ready:false,
+    err:"",
+    cfg: loadFirebaseConfig(),
+    app:null,
+    db:null,
+    auth:null,
+    user:null,
+    api: null, // firebase module methods
+    sdkVer: "12.9.0",
+  },
+  mode: "local", // local | firebase
+  localDB: loadLocalDB(),
+  data: {
+    customers: [],
+    cars: [],
+    workOrders: [],
+    invoices: [],
+    services: [],
+    settings: null
+  },
+  ui:{
+    sidebarOpen:false,
+    lastSyncAt:0
+  }
+};
+
+const setNetPill = (kind, text) => {
+  const el = $("#netPill");
+  el.className = `pill ${kind}`.trim();
+  el.textContent = text;
+};
+
+// ------------------ Firebase Init (Realtime Database) ------------------
+async function initFirebase(){
+  const cfg = state.firebase.cfg;
+
+  // حد أدنى: لازم projectId + databaseURL + (غالبًا) apiKey
+  const missing = [];
+  if(!cfg.projectId) missing.push("projectId");
+  if(!cfg.databaseURL) missing.push("databaseURL");
+  if(!cfg.apiKey) missing.push("apiKey");
+  if(missing.length){
+    state.firebase.ready = false;
+    state.firebase.err = `ناقص: ${missing.join(", ")}`;
+    state.mode = "local";
+    setNetPill("warn", "📦 وضع محلي — Firebase غير جاهز");
+    return;
+  }
+
+  try{
+    setNetPill("", "⏳ جاري ربط Firebase...");
+    const v = state.firebase.sdkVer;
+
+    // حسب توثيق Firebase CDN (ES Modules)
+    const { initializeApp } = await import(`https://www.gstatic.com/firebasejs/${v}/firebase-app.js`);
+    const {
+      getDatabase, ref, onValue, push, set, update, remove, runTransaction, get, child
+    } = await import(`https://www.gstatic.com/firebasejs/${v}/firebase-database.js`);
+    const {
+      getAuth, onAuthStateChanged, signInAnonymously, GoogleAuthProvider, signInWithPopup, signOut
+    } = await import(`https://www.gstatic.com/firebasejs/${v}/firebase-auth.js`);
+
+    const app = initializeApp(cfg);
+    const db = getDatabase(app);
+    const auth = getAuth(app);
+
+    state.firebase.app = app;
+    state.firebase.db = db;
+    state.firebase.auth = auth;
+
+    state.firebase.api = {
+      ref, onValue, push, set, update, remove, runTransaction, get, child,
+      onAuthStateChanged, signInAnonymously, GoogleAuthProvider, signInWithPopup, signOut
+    };
+
+    state.firebase.ready = true;
+    state.mode = "firebase";
+
+    // Auth (اختياري)
+    onAuthStateChanged(auth, (u)=>{
+      state.firebase.user = u || null;
+      renderTopUserBadge();
+    });
+
+    // Auto sign-in anonymous (حتى ما تتعطل القراءة/الكتابة إذا كانت القواعد تتطلب auth)
+    try{ await signInAnonymously(auth); }catch{}
+
+    // Subscriptions
+    subscribeAll();
+
+    setNetPill("good", "✅ Firebase متصل");
+    toast("تم ربط Firebase بنجاح", "good");
+  }catch(err){
+    state.firebase.ready = false;
+    state.firebase.err = String(err?.message || err);
+    state.mode = "local";
+    setNetPill("bad", "⚠️ فشل ربط Firebase — وضع محلي");
+    toast("فشل ربط Firebase (تحققي من apiKey / القواعد / Database)", "bad");
+  }
+}
+
+function subscribeAll(){
+  const { ref, onValue } = state.firebase.api;
+  const db = state.firebase.db;
+
+  const sub = (path, cb) => onValue(ref(db, path), (snap)=>{
+    cb(snap.exists() ? snap.val() : {});
+  });
+
+  sub("customers", (v)=> { state.data.customers = toArray(v).sort((a,b)=> (b.createdAt||0)-(a.createdAt||0)); safeMirrorLocal("customers", v); renderRoute(); });
+  sub("cars", (v)=> { state.data.cars = toArray(v).sort((a,b)=> (b.createdAt||0)-(a.createdAt||0)); safeMirrorLocal("cars", v); renderRoute(); });
+  sub("workOrders", (v)=> { state.data.workOrders = toArray(v).sort((a,b)=> (b.createdAt||0)-(a.createdAt||0)); safeMirrorLocal("workOrders", v); renderRoute(); });
+  sub("invoices", (v)=> { state.data.invoices = toArray(v).sort((a,b)=> (b.createdAt||0)-(a.createdAt||0)); safeMirrorLocal("invoices", v); renderRoute(); });
+  sub("services", (v)=> { state.data.services = toArray(v).sort((a,b)=> (a.name||"").localeCompare(b.name||"")); safeMirrorLocal("services", v); renderRoute(); });
+  sub("settings", (v)=> { state.data.settings = v; safeMirrorLocal("settings", v, true); renderRoute(); });
+
+  // init from local if empty
+  hydrateFromLocal();
+}
+
+function safeMirrorLocal(key, value, direct=false){
+  // نحافظ نسخة محلية كنسخ احتياطي
+  if(direct){
+    state.localDB[key] = value;
+  }else{
+    state.localDB[key] = value || {};
+  }
+  saveLocalDB();
+  state.ui.lastSyncAt = Date.now();
+}
+
+function hydrateFromLocal(){
+  // إذا Firebase بعده ما جاب بيانات، نعرض المحلي
+  if(!state.data.settings) state.data.settings = state.localDB.settings || { company:{}, invoice:{}, ui:{} };
+  if(!state.data.customers.length) state.data.customers = toArray(state.localDB.customers).sort((a,b)=> (b.createdAt||0)-(a.createdAt||0));
+  if(!state.data.cars.length) state.data.cars = toArray(state.localDB.cars).sort((a,b)=> (b.createdAt||0)-(a.createdAt||0));
+  if(!state.data.workOrders.length) state.data.workOrders = toArray(state.localDB.workOrders).sort((a,b)=> (b.createdAt||0)-(a.createdAt||0));
+  if(!state.data.invoices.length) state.data.invoices = toArray(state.localDB.invoices).sort((a,b)=> (b.createdAt||0)-(a.createdAt||0));
+  if(!state.data.services.length) state.data.services = toArray(state.localDB.services).sort((a,b)=> (a.name||"").localeCompare(b.name||""));
+}
+
+// ------------------ Data Layer (firebase/local) ------------------
+const genId = () => Math.random().toString(16).slice(2) + Date.now().toString(16);
+
+async function dbSet(path, obj){
+  if(state.mode === "firebase" && state.firebase.ready){
+    const { ref, set } = state.firebase.api;
+    await set(ref(state.firebase.db, path), obj);
+  }else{
+    // local
+    const [root, id] = path.split("/");
+    if(id){
+      state.localDB[root] = state.localDB[root] || {};
+      state.localDB[root][id] = obj;
+    }else{
+      state.localDB[root] = obj;
+    }
+    saveLocalDB();
+  }
+}
+async function dbUpdate(path, patch){
+  if(state.mode === "firebase" && state.firebase.ready){
+    const { ref, update } = state.firebase.api;
+    await update(ref(state.firebase.db, path), patch);
+  }else{
+    const [root, id] = path.split("/");
+    state.localDB[root] = state.localDB[root] || {};
+    state.localDB[root][id] = { ...(state.localDB[root][id]||{}), ...patch };
+    saveLocalDB();
+  }
+}
+async function dbRemove(path){
+  if(state.mode === "firebase" && state.firebase.ready){
+    const { ref, remove } = state.firebase.api;
+    await remove(ref(state.firebase.db, path));
+  }else{
+    const [root, id] = path.split("/");
+    if(state.localDB[root]) delete state.localDB[root][id];
+    saveLocalDB();
+  }
+}
+async function dbNextInvoiceNo(){
+  if(state.mode === "firebase" && state.firebase.ready){
+    const { ref, runTransaction } = state.firebase.api;
+    const r = ref(state.firebase.db, "meta/counters/invoiceNo");
+    const res = await runTransaction(r, (cur) => (cur || 1000) + 1);
+    return res.snapshot.val();
+  }else{
+    state.localDB.meta = state.localDB.meta || { counters:{ invoiceNo:1000 } };
+    state.localDB.meta.counters.invoiceNo = (state.localDB.meta.counters.invoiceNo || 1000) + 1;
+    saveLocalDB();
+    return state.localDB.meta.counters.invoiceNo;
+  }
+}
+
+// ------------------ Settings helpers ------------------
+function getSettings(){
+  const s = state.data.settings || state.localDB.settings || { company:{}, invoice:{}, ui:{} };
+  s.company = s.company || {};
+  s.invoice = s.invoice || {};
+  s.ui = s.ui || {};
+
+  // Defaults
+  if(!s.company.name) s.company.name = "RPM — حسن الوليم";
+  if(!s.company.phone) s.company.phone = "";
+  if(!s.company.address) s.company.address = "العراق";
+  if(!s.invoice.prefix) s.invoice.prefix = "RPM";
+  if(!s.invoice.taxRate && s.invoice.taxRate !== 0) s.invoice.taxRate = 0; // %
+  if(!s.invoice.footerNote) s.invoice.footerNote = "شكراً لثقتكم — نلتزم بأفضل خدمة.";
+  if(!s.ui.currency) s.ui.currency = "IQD";
+
+  return s;
+}
+async function saveSettings(newSettings){
+  await dbSet("settings", newSettings);
+  toast("تم حفظ الإعدادات", "good");
+}
+
+// ------------------ UI Shell ------------------
+function setTitle(title, subtitle=""){
+  $("#pageTitle").textContent = title;
+  $("#pageSubtitle").textContent = subtitle || "—";
+}
+
+function bindNav(){
+  $$(".navItem").forEach(b=>{
+    b.addEventListener("click", ()=> { location.hash = b.dataset.route; });
+  });
+  $$(".mobileNav button").forEach(b=>{
+    b.addEventListener("click", ()=> { location.hash = b.dataset.route; });
+  });
+
+  $("#btnToggleSidebar").addEventListener("click", ()=>{
+    state.ui.sidebarOpen = !state.ui.sidebarOpen;
+    $("#sidebar").classList.toggle("open", state.ui.sidebarOpen);
+  });
+
+  $("#btnSync").addEventListener("click", ()=>{
+    hydrateFromLocal();
+    renderRoute();
+    toast("تم التحديث", "good");
+  });
+
+  $("#btnQuickAdd").addEventListener("click", quickAddMenu);
+  $("#btnUser").addEventListener("click", userMenu);
+
+  window.addEventListener("click", (e)=>{
+    // close sidebar on mobile when click outside
+    if(window.innerWidth <= 960){
+      const sb = $("#sidebar");
+      const btn = $("#btnToggleSidebar");
+      if(state.ui.sidebarOpen && !sb.contains(e.target) && e.target !== btn){
+        state.ui.sidebarOpen = false;
+        sb.classList.remove("open");
+      }
+    }
+  });
+}
+
+function markActiveNav(route){
+  $$(".navItem").forEach(b=> b.classList.toggle("active", b.dataset.route === route));
+  $$(".mobileNav button").forEach(b=> b.classList.toggle("active", b.dataset.route === route));
+}
+
+function renderTopUserBadge(){
+  // مجرد Toast خفيف إذا صار login
+  const u = state.firebase.user;
+  if(!state.firebase.ready) return;
+  if(u?.isAnonymous) return;
+  if(u?.email) $("#buildInfo").textContent = `مرحباً: ${u.email}`;
+}
+
+// ------------------ Pages ------------------
+const routes = {
+  "#/dashboard": renderDashboard,
+  "#/customers": renderCustomers,
+  "#/cars": renderCars,
+  "#/workorders": renderWorkOrders,
+  "#/invoices": renderInvoices,
+  "#/reports": renderReports,
+  "#/settings": renderSettings
+};
+
+function renderRoute(){
+  const hash = location.hash || "#/dashboard";
+  const fn = routes[hash] || routes["#/dashboard"];
+  markActiveNav(hash);
+  fn();
+}
+
+// Dashboard
+function renderDashboard(){
+  const s = getSettings();
+
+  const inv = state.data.invoices || [];
+  const wo = state.data.workOrders || [];
+
+  const totalPaid = inv.filter(x=> x.status==="paid").reduce((a,b)=> a + (b.total||0), 0);
+  const totalUnpaid = inv.filter(x=> x.status!=="paid").reduce((a,b)=> a + (b.total||0), 0);
+  const cntInv = inv.length;
+  const cntWO = wo.length;
+
+  const recentInv = inv.slice(0,7);
+
+  setTitle("لوحة التحكم", state.mode === "firebase" ? "متصل بـ Firebase" : "وضع محلي (Fallback)");
+
+  $("#view").innerHTML = `
+    <div class="grid kpis">
+      <div class="card kpi">
+        <div class="h">إيراد (مدفوع)</div>
+        <div class="v">${escapeHtml(fmtIQD.format(totalPaid))}</div>
+        <div class="s">عدد الفواتير: ${escapeHtml(fmtNum.format(cntInv))}</div>
+      </div>
+      <div class="card kpi">
+        <div class="h">مستحقات (غير مدفوعة)</div>
+        <div class="v">${escapeHtml(fmtIQD.format(totalUnpaid))}</div>
+        <div class="s">تابعي التحصيل من صفحة الفواتير</div>
+      </div>
+      <div class="card kpi">
+        <div class="h">أوامر عمل</div>
+        <div class="v">${escapeHtml(fmtNum.format(cntWO))}</div>
+        <div class="s">قيد الإنجاز + مكتملة</div>
+      </div>
+      <div class="card kpi">
+        <div class="h">الورشة</div>
+        <div class="v">${escapeHtml(s.company.name || "RPM")}</div>
+        <div class="s">آخر مزامنة: ${state.ui.lastSyncAt ? fmtDate(state.ui.lastSyncAt) : "—"}</div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:12px; grid-template-columns: 1.2fr .8fr;">
+      <div class="card pad">
+        <div class="row" style="justify-content:space-between; align-items:center">
+          <div>
+            <div style="font-weight:900">آخر الفواتير</div>
+            <div class="muted small">طباعة فاتورة احترافية بنقرة واحدة</div>
+          </div>
+          <div class="row">
+            <button class="btn" id="goInvoices">فتح الفواتير</button>
+            <button class="btn" id="newInvoice">+ فاتورة جديدة</button>
+          </div>
+        </div>
+        <hr class="sep"/>
+        ${recentInv.length ? `
+        <table class="table">
+          <thead>
+            <tr><th>رقم</th><th>الزبون</th><th>المبلغ</th><th>الحالة</th><th>تاريخ</th><th></th></tr>
+          </thead>
+          <tbody>
+            ${recentInv.map(x=>`
+              <tr>
+                <td>${escapeHtml(x.invoiceNo||"—")}</td>
+                <td>${escapeHtml(x.customerName||"—")}</td>
+                <td>${escapeHtml(fmtIQD.format(x.total||0))}</td>
+                <td>${statusTag(x.status)}</td>
+                <td>${escapeHtml(fmtDate(x.createdAt||Date.now()))}</td>
+                <td><button class="iconBtn" data-print="${x.id}" title="طباعة">🖨️</button></td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>` : `<div class="empty">لا توجد فواتير بعد. اضغطي “فاتورة جديدة”.</div>`}
+      </div>
+
+      <div class="card pad">
+        <div style="font-weight:900">إجراءات سريعة</div>
+        <div class="muted small">تنظيم أسرع للشغل اليومي</div>
+        <hr class="sep"/>
+        <div class="grid" style="grid-template-columns:1fr; gap:10px">
+          <button class="btn" id="qaCustomer">+ إضافة زبون</button>
+          <button class="btn" id="qaCar">+ إضافة سيارة</button>
+          <button class="btn" id="qaWO">+ أمر عمل</button>
+          <button class="btn" id="qaReport">فتح التقارير</button>
+        </div>
+        <hr class="sep"/>
+        <div class="muted small">
+          إذا Firebase مو مضبوط، روحي <b>الإعدادات</b> وخلي apiKey و messagingSenderId.
+        </div>
+      </div>
+    </div>
+  `;
+
+  $("#goInvoices").onclick = ()=> location.hash="#/invoices";
+  $("#newInvoice").onclick = ()=> openInvoiceEditor();
+  $("#qaCustomer").onclick = ()=> openCustomerEditor();
+  $("#qaCar").onclick = ()=> openCarEditor();
+  $("#qaWO").onclick = ()=> openWorkOrderEditor();
+  $("#qaReport").onclick = ()=> location.hash="#/reports";
+
+  $$("[data-print]").forEach(b=> b.addEventListener("click", ()=>{
+    const id = b.dataset.print;
+    const inv = state.data.invoices.find(x=> x.id===id);
+    if(inv) printInvoice(inv);
+  }));
+}
+
+function statusTag(status){
+  const s = status || "draft";
+  if(s==="paid") return `<span class="tag good">مدفوعة</span>`;
+  if(s==="unpaid") return `<span class="tag warn">غير مدفوعة</span>`;
+  if(s==="cancelled") return `<span class="tag bad">ملغاة</span>`;
+  return `<span class="tag">مسودة</span>`;
+}
+
+// Customers
+function renderCustomers(){
+  setTitle("الزبائن", "إضافة/تعديل/بحث");
+
+  const q = (new URLSearchParams(location.hash.split("?")[1]||"")).get("q") || "";
+  const list = (state.data.customers || []).filter(c=>{
+    const x = `${c.name||""} ${c.phone||""}`.toLowerCase();
+    return x.includes(q.toLowerCase());
+  });
+
+  $("#view").innerHTML = `
+    <div class="card pad">
+      <div class="row" style="justify-content:space-between; align-items:center">
+        <div>
+          <div style="font-weight:900">إدارة الزبائن</div>
+          <div class="muted small">كل زبون مرتبط بسياراته وفواتيره</div>
+        </div>
+        <div class="row">
+          <input class="input" id="custSearch" placeholder="بحث بالاسم أو الهاتف..." style="width:min(360px, 60vw)" value="${escapeHtml(q)}"/>
+          <button class="btn" id="btnAdd">+ زبون</button>
+        </div>
+      </div>
+      <hr class="sep"/>
+      ${list.length ? `
+        <table class="table">
+          <thead><tr><th>الاسم</th><th>الهاتف</th><th>ملاحظات</th><th>تاريخ الإضافة</th><th></th></tr></thead>
+          <tbody>
+            ${list.map(c=>`
+              <tr>
+                <td>${escapeHtml(c.name||"—")}</td>
+                <td>${escapeHtml(c.phone||"—")}</td>
+                <td>${escapeHtml(c.note||"")}</td>
+                <td>${escapeHtml(fmtDate(c.createdAt||Date.now()))}</td>
+                <td>
+                  <button class="iconBtn" data-edit="${c.id}" title="تعديل">✏️</button>
+                  <button class="iconBtn" data-del="${c.id}" title="حذف">🗑️</button>
+                </td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      ` : `<div class="empty">ماكو زبائن بعد. اضغطي “+ زبون”.</div>`}
+    </div>
+  `;
+
+  $("#custSearch").addEventListener("input", (e)=>{
+    const val = e.target.value.trim();
+    location.hash = `#/customers?q=${encodeURIComponent(val)}`;
+  });
+  $("#btnAdd").onclick = ()=> openCustomerEditor();
+
+  $$("[data-edit]").forEach(b=> b.addEventListener("click", ()=>{
+    const c = state.data.customers.find(x=> x.id===b.dataset.edit);
+    openCustomerEditor(c);
+  }));
+  $$("[data-del]").forEach(b=> b.addEventListener("click", async ()=>{
+    const id = b.dataset.del;
+    if(!confirm("حذف الزبون؟")) return;
+    await dbRemove(`customers/${id}`);
+    toast("تم الحذف", "warn");
+  }));
+}
+
+function openCustomerEditor(cust=null){
+  const isEdit = !!cust;
+  modal.open({
+    title: isEdit ? "تعديل زبون" : "إضافة زبون",
+    bodyHtml: `
+      <div class="formGrid">
+        <div>
+          <label>اسم الزبون</label>
+          <input class="input" id="cName" value="${escapeHtml(cust?.name||"")}" />
+        </div>
+        <div>
+          <label>الهاتف</label>
+          <input class="input" id="cPhone" value="${escapeHtml(cust?.phone||"")}" />
+        </div>
+      </div>
+      <div style="margin-top:10px">
+        <label>ملاحظات</label>
+        <textarea class="input" id="cNote" rows="3">${escapeHtml(cust?.note||"")}</textarea>
+      </div>
+    `,
+    footerHtml: `
+      <button class="iconBtn" id="mCancel">إلغاء</button>
+      <button class="btn" id="mSave">حفظ</button>
+    `,
+    onMount(){
+      $("#mCancel").onclick = modal.close;
+      $("#mSave").onclick = async ()=>{
+        const obj = {
+          name: $("#cName").value.trim(),
+          phone: $("#cPhone").value.trim(),
+          note: $("#cNote").value.trim(),
+          updatedAt: Date.now()
+        };
+        if(!obj.name){ toast("اسم الزبون مطلوب", "bad"); return; }
+
+        if(isEdit){
+          await dbUpdate(`customers/${cust.id}`, obj);
+        }else{
+          const id = genId();
+          await dbSet(`customers/${id}`, { ...obj, createdAt: Date.now() });
+        }
+        modal.close();
+        toast("تم الحفظ", "good");
+      };
+    }
+  });
+}
+
+// Cars
+function renderCars(){
+  setTitle("السيارات", "ربط سيارة بالزبون + لوحة + موديل");
+  const customers = state.data.customers || [];
+  const cars = state.data.cars || [];
+
+  $("#view").innerHTML = `
+    <div class="card pad">
+      <div class="row" style="justify-content:space-between; align-items:center">
+        <div>
+          <div style="font-weight:900">إدارة السيارات</div>
+          <div class="muted small">السيارة مرتبطة بالزبون وتظهر بالفواتير/أوامر العمل</div>
+        </div>
+        <div class="row">
+          <button class="btn" id="btnAddCar">+ سيارة</button>
+        </div>
+      </div>
+      <hr class="sep"/>
+      ${cars.length ? `
+        <table class="table">
+          <thead><tr><th>اللوحة</th><th>الموديل</th><th>الزبون</th><th>ملاحظات</th><th></th></tr></thead>
+          <tbody>
+            ${cars.map(car=>{
+              const c = customers.find(x=> x.id===car.customerId);
+              return `
+                <tr>
+                  <td><b>${escapeHtml(car.plate||"—")}</b></td>
+                  <td>${escapeHtml(car.model||"—")}</td>
+                  <td>${escapeHtml(c?.name || car.customerName || "—")}</td>
+                  <td>${escapeHtml(car.note||"")}</td>
+                  <td>
+                    <button class="iconBtn" data-edit="${car.id}" title="تعديل">✏️</button>
+                    <button class="iconBtn" data-del="${car.id}" title="حذف">🗑️</button>
+                  </td>
+                </tr>
+              `;
+            }).join("")}
+          </tbody>
+        </table>
+      ` : `<div class="empty">ماكو سيارات بعد. اضغطي “+ سيارة”.</div>`}
+    </div>
+  `;
+
+  $("#btnAddCar").onclick = ()=> openCarEditor();
+
+  $$("[data-edit]").forEach(b=> b.addEventListener("click", ()=>{
+    const car = state.data.cars.find(x=> x.id===b.dataset.edit);
+    openCarEditor(car);
+  }));
+  $$("[data-del]").forEach(b=> b.addEventListener("click", async ()=>{
+    const id = b.dataset.del;
+    if(!confirm("حذف السيارة؟")) return;
+    await dbRemove(`cars/${id}`);
+    toast("تم الحذف", "warn");
+  }));
+}
+
+function openCarEditor(car=null){
+  const isEdit = !!car;
+  const customers = state.data.customers || [];
+
+  modal.open({
+    title: isEdit ? "تعديل سيارة" : "إضافة سيارة",
+    bodyHtml: `
+      <div class="formGrid">
+        <div>
+          <label>لوحة السيارة</label>
+          <input class="input" id="vPlate" value="${escapeHtml(car?.plate||"")}" placeholder="مثال: بغداد 12345"/>
+        </div>
+        <div>
+          <label>موديل/نوع السيارة</label>
+          <input class="input" id="vModel" value="${escapeHtml(car?.model||"")}" placeholder="مثال: Camry 2020"/>
+        </div>
+      </div>
+      <div class="formGrid" style="margin-top:10px">
+        <div>
+          <label>الزبون</label>
+          <select id="vCustomer" class="input">
+            <option value="">— اختاري زبون —</option>
+            ${customers.map(c=>`
+              <option value="${escapeHtml(c.id)}" ${car?.customerId===c.id ? "selected":""}>${escapeHtml(c.name)} — ${escapeHtml(c.phone||"")}</option>
+            `).join("")}
+          </select>
+        </div>
+        <div>
+          <label>ملاحظات</label>
+          <input class="input" id="vNote" value="${escapeHtml(car?.note||"")}" />
+        </div>
+      </div>
+    `,
+    footerHtml: `
+      <button class="iconBtn" id="mCancel">إلغاء</button>
+      <button class="btn" id="mSave">حفظ</button>
+    `,
+    onMount(){
+      $("#mCancel").onclick = modal.close;
+      $("#mSave").onclick = async ()=>{
+        const customerId = $("#vCustomer").value;
+        const customer = customers.find(x=> x.id===customerId);
+
+        const obj = {
+          plate: $("#vPlate").value.trim(),
+          model: $("#vModel").value.trim(),
+          customerId: customerId || "",
+          customerName: customer?.name || "",
+          note: $("#vNote").value.trim(),
+          updatedAt: Date.now()
+        };
+        if(!obj.plate){ toast("لوحة السيارة مطلوبة", "bad"); return; }
+
+        if(isEdit){
+          await dbUpdate(`cars/${car.id}`, obj);
+        }else{
+          const id = genId();
+          await dbSet(`cars/${id}`, { ...obj, createdAt: Date.now() });
+        }
+        modal.close();
+        toast("تم الحفظ", "good");
+      };
+    }
+  });
+}
+
+// Work Orders
+function renderWorkOrders(){
+  setTitle("أوامر العمل", "تتبع الشغل قبل الفاتورة أو معها");
+
+  const list = state.data.workOrders || [];
+  $("#view").innerHTML = `
+    <div class="card pad">
+      <div class="row" style="justify-content:space-between; align-items:center">
+        <div>
+          <div style="font-weight:900">أوامر العمل</div>
+          <div class="muted small">سجل أعمال الصيانة قبل إصدار الفاتورة</div>
+        </div>
+        <div class="row">
+          <button class="btn" id="btnAddWO">+ أمر عمل</button>
+        </div>
+      </div>
+      <hr class="sep"/>
+      ${list.length ? `
+        <table class="table">
+          <thead><tr><th>رقم</th><th>الزبون</th><th>السيارة</th><th>الحالة</th><th>تاريخ</th><th></th></tr></thead>
+          <tbody>
+            ${list.map(x=>`
+              <tr>
+                <td>${escapeHtml(x.no||"—")}</td>
+                <td>${escapeHtml(x.customerName||"—")}</td>
+                <td>${escapeHtml(`${x.carPlate||""} ${x.carModel||""}`.trim() || "—")}</td>
+                <td>${woTag(x.status)}</td>
+                <td>${escapeHtml(fmtDate(x.createdAt||Date.now()))}</td>
+                <td>
+                  <button class="iconBtn" data-edit="${x.id}">✏️</button>
+                  <button class="iconBtn" data-del="${x.id}">🗑️</button>
+                </td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      ` : `<div class="empty">ماكو أوامر عمل. اضغطي “+ أمر عمل”.</div>`}
+    </div>
+  `;
+
+  $("#btnAddWO").onclick = ()=> openWorkOrderEditor();
+
+  $$("[data-edit]").forEach(b=> b.addEventListener("click", ()=>{
+    const wo = state.data.workOrders.find(x=> x.id===b.dataset.edit);
+    openWorkOrderEditor(wo);
+  }));
+  $$("[data-del]").forEach(b=> b.addEventListener("click", async ()=>{
+    const id = b.dataset.del;
+    if(!confirm("حذف أمر العمل؟")) return;
+    await dbRemove(`workOrders/${id}`);
+    toast("تم الحذف", "warn");
+  }));
+}
+
+function woTag(status){
+  const s = status || "open";
+  if(s==="done") return `<span class="tag good">مكتمل</span>`;
+  if(s==="cancelled") return `<span class="tag bad">ملغي</span>`;
+  return `<span class="tag warn">قيد العمل</span>`;
+}
+
+function openWorkOrderEditor(wo=null){
+  const isEdit = !!wo;
+  const customers = state.data.customers || [];
+  const cars = state.data.cars || [];
+
+  modal.open({
+    title: isEdit ? "تعديل أمر عمل" : "أمر عمل جديد",
+    bodyHtml: `
+      <div class="formGrid">
+        <div>
+          <label>الزبون</label>
+          <select id="woCustomer" class="input">
+            <option value="">— اختاري —</option>
+            ${customers.map(c=>`<option value="${escapeHtml(c.id)}" ${wo?.customerId===c.id?"selected":""}>${escapeHtml(c.name)} — ${escapeHtml(c.phone||"")}</option>`).join("")}
+          </select>
+        </div>
+        <div>
+          <label>السيارة</label>
+          <select id="woCar" class="input">
+            <option value="">— اختاري —</option>
+            ${cars.map(v=>`<option value="${escapeHtml(v.id)}" ${wo?.carId===v.id?"selected":""}>${escapeHtml(v.plate||"")} — ${escapeHtml(v.model||"")}</option>`).join("")}
+          </select>
+        </div>
+      </div>
+      <div style="margin-top:10px">
+        <label>الأعمال المطلوبة</label>
+        <textarea class="input" id="woDesc" rows="5" placeholder="مثال: تبديل دهن + فلتر">${escapeHtml(wo?.desc||"")}</textarea>
+      </div>
+      <div class="formGrid" style="margin-top:10px">
+        <div>
+          <label>الحالة</label>
+          <select id="woStatus" class="input">
+            <option value="open" ${(wo?.status||"open")==="open"?"selected":""}>قيد العمل</option>
+            <option value="done" ${(wo?.status||"open")==="done"?"selected":""}>مكتمل</option>
+            <option value="cancelled" ${(wo?.status||"open")==="cancelled"?"selected":""}>ملغي</option>
+          </select>
+        </div>
+        <div>
+          <label>ملاحظات</label>
+          <input class="input" id="woNote" value="${escapeHtml(wo?.note||"")}" />
+        </div>
+      </div>
+    `,
+    footerHtml: `
+      <button class="iconBtn" id="mCancel">إلغاء</button>
+      <button class="btn" id="mSave">حفظ</button>
+    `,
+    onMount(){
+      $("#mCancel").onclick = modal.close;
+      $("#mSave").onclick = async ()=>{
+        const customerId = $("#woCustomer").value;
+        const carId = $("#woCar").value;
+        const c = customers.find(x=> x.id===customerId);
+        const v = cars.find(x=> x.id===carId);
+
+        const obj = {
+          customerId, customerName: c?.name||"",
+          carId, carPlate: v?.plate||"", carModel: v?.model||"",
+          desc: $("#woDesc").value.trim(),
+          status: $("#woStatus").value,
+          note: $("#woNote").value.trim(),
+          updatedAt: Date.now()
+        };
+        if(!obj.customerId && !obj.customerName) { toast("اختاري زبون", "bad"); return; }
+
+        if(isEdit){
+          await dbUpdate(`workOrders/${wo.id}`, obj);
+        }else{
+          const id = genId();
+          const no = `WO-${String(Date.now()).slice(-6)}`;
+          await dbSet(`workOrders/${id}`, { ...obj, no, createdAt: Date.now() });
+        }
+
+        modal.close();
+        toast("تم الحفظ", "good");
+      };
+    }
+  });
+}
+
+// Invoices
+function renderInvoices(){
+  setTitle("الفواتير", "بحث + حالة + طباعة");
+
+  const params = new URLSearchParams(location.hash.split("?")[1]||"");
+  const q = (params.get("q")||"").trim().toLowerCase();
+  const st = params.get("st") || "all";
+
+  const list = (state.data.invoices || []).filter(x=>{
+    const blob = `${x.invoiceNo||""} ${x.customerName||""} ${x.customerPhone||""} ${x.carPlate||""} ${x.carModel||""}`.toLowerCase();
+    const okQ = !q || blob.includes(q);
+    const okS = st==="all" ? true : (x.status===st);
+    return okQ && okS;
+  });
+
+  $("#view").innerHTML = `
+    <div class="card pad">
+      <div class="row" style="justify-content:space-between; align-items:center">
+        <div>
+          <div style="font-weight:900">الفواتير</div>
+          <div class="muted small">تصميم طباعة “راقي” + مجموع + ضريبة اختيارية</div>
+        </div>
+        <div class="row">
+          <input class="input" id="invSearch" placeholder="بحث..." style="width:min(360px, 60vw)" value="${escapeHtml(params.get("q")||"")}" />
+          <select class="input" id="invStatus" style="width:160px">
+            <option value="all" ${st==="all"?"selected":""}>كل الحالات</option>
+            <option value="paid" ${st==="paid"?"selected":""}>مدفوعة</option>
+            <option value="unpaid" ${st==="unpaid"?"selected":""}>غير مدفوعة</option>
+            <option value="draft" ${st==="draft"?"selected":""}>مسودة</option>
+            <option value="cancelled" ${st==="cancelled"?"selected":""}>ملغاة</option>
+          </select>
+          <button class="btn" id="btnNewInv">+ فاتورة</button>
+        </div>
+      </div>
+      <hr class="sep"/>
+
+      ${list.length ? `
+        <table class="table">
+          <thead><tr><th>رقم</th><th>الزبون</th><th>السيارة</th><th>المجموع</th><th>الحالة</th><th>تاريخ</th><th></th></tr></thead>
+          <tbody>
+            ${list.map(x=>`
+              <tr>
+                <td><b>${escapeHtml(x.invoiceNo||"—")}</b></td>
+                <td>${escapeHtml(x.customerName||"—")}</td>
+                <td>${escapeHtml(`${x.carPlate||""} ${x.carModel||""}`.trim() || "—")}</td>
+                <td>${escapeHtml(fmtIQD.format(x.total||0))}</td>
+                <td>${statusTag(x.status)}</td>
+                <td>${escapeHtml(fmtDate(x.createdAt||Date.now()))}</td>
+                <td class="row end" style="gap:6px">
+                  <button class="iconBtn" data-edit="${x.id}" title="تعديل">✏️</button>
+                  <button class="iconBtn" data-print="${x.id}" title="طباعة">🖨️</button>
+                  <button class="iconBtn" data-del="${x.id}" title="حذف">🗑️</button>
+                </td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      ` : `<div class="empty">لا توجد نتائج.</div>`}
+    </div>
+  `;
+
+  $("#invSearch").addEventListener("input", ()=>{
+    const q2 = $("#invSearch").value.trim();
+    const st2 = $("#invStatus").value;
+    location.hash = `#/invoices?q=${encodeURIComponent(q2)}&st=${encodeURIComponent(st2)}`;
+  });
+  $("#invStatus").addEventListener("change", ()=>{
+    const q2 = $("#invSearch").value.trim();
+    const st2 = $("#invStatus").value;
+    location.hash = `#/invoices?q=${encodeURIComponent(q2)}&st=${encodeURIComponent(st2)}`;
+  });
+  $("#btnNewInv").onclick = ()=> openInvoiceEditor();
+
+  $$("[data-edit]").forEach(b=> b.addEventListener("click", ()=>{
+    const inv = state.data.invoices.find(x=> x.id===b.dataset.edit);
+    openInvoiceEditor(inv);
+  }));
+  $$("[data-print]").forEach(b=> b.addEventListener("click", ()=>{
+    const inv = state.data.invoices.find(x=> x.id===b.dataset.print);
+    if(inv) printInvoice(inv);
+  }));
+  $$("[data-del]").forEach(b=> b.addEventListener("click", async ()=>{
+    const id = b.dataset.del;
+    if(!confirm("حذف الفاتورة؟")) return;
+    await dbRemove(`invoices/${id}`);
+    toast("تم الحذف", "warn");
+  }));
+}
+
+function openInvoiceEditor(inv=null){
+  const isEdit = !!inv;
+  const s = getSettings();
+  const customers = state.data.customers || [];
+  const cars = state.data.cars || [];
+
+  const items = (inv?.items && Array.isArray(inv.items)) ? inv.items : [
+    { name:"تبديل دهن", qty:1, price:0 }
   ];
 
-  self.addEventListener("install", (e) => {
-    e.waitUntil((async () => {
-      const cache = await caches.open(CACHE);
-      await cache.addAll(CORE);
-      self.skipWaiting();
-    })());
-  });
-
-  self.addEventListener("activate", (e) => {
-    e.waitUntil((async () => {
-      const keys = await caches.keys();
-      await Promise.all(keys.map(k => (k === CACHE ? null : caches.delete(k))));
-      self.clients.claim();
-    })());
-  });
-
-  self.addEventListener("fetch", (e) => {
-    const req = e.request;
-    // network-first للـ HTML، cache-first للباقي
-    const isHTML = req.headers.get("accept")?.includes("text/html");
-    e.respondWith((async () => {
-      const cache = await caches.open(CACHE);
-      if (isHTML) {
-        try {
-          const fresh = await fetch(req);
-          cache.put(req, fresh.clone());
-          return fresh;
-        } catch {
-          return (await cache.match(req)) || (await cache.match("./index.html"));
-        }
-      } else {
-        const hit = await cache.match(req);
-        if (hit) return hit;
-        try {
-          const fresh = await fetch(req);
-          cache.put(req, fresh.clone());
-          return fresh;
-        } catch {
-          return hit || Response.error();
-        }
-      }
-    })());
-  });
-
-  // إنهاء مبكر: لا تكمل كود الواجهة
-} else {
-  // =========================
-  // App (UI + Logic)
-  // =========================
-  const $ = (s, el = document) => el.querySelector(s);
-  const $$ = (s, el = document) => Array.from(el.querySelectorAll(s));
-
-  const fmtIQD = (n) => `${Math.round(n).toLocaleString("ar-IQ")} د.ع`;
-  const fmtDate = (d = Date.now()) => new Intl.DateTimeFormat("ar-IQ", { dateStyle: "medium", timeStyle: "short" }).format(new Date(d));
-  const nowISO = () => new Date().toISOString();
-
-  const uid = () => {
-    try { return crypto.randomUUID(); } catch { return "id_" + Math.random().toString(16).slice(2) + "_" + Date.now(); }
+  const calc = (items, taxRate)=>{
+    const sub = items.reduce((a,b)=> a + (Number(b.qty||0)*Number(b.price||0)), 0);
+    const tax = Math.round(sub * (Number(taxRate||0)/100));
+    const total = sub + tax;
+    return { sub, tax, total };
   };
 
-  // ---------- IndexedDB (بسيط) ----------
-  const DB_NAME = "rpm_db";
-  const DB_VER = 1;
-  const STORE = "kv";
+  const initial = calc(items, s.invoice.taxRate);
 
-  function idbOpen() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, DB_VER);
-      req.onupgradeneeded = () => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
-      };
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
+  modal.open({
+    title: isEdit ? `تعديل فاتورة ${inv.invoiceNo||""}` : "فاتورة جديدة",
+    bodyHtml: `
+      <div class="card pad" style="background: rgba(255,255,255,.02); border-color: rgba(255,255,255,.10)">
+        <div class="formGrid">
+          <div>
+            <label>الزبون</label>
+            <select id="iCustomer" class="input">
+              <option value="">— اختاري زبون —</option>
+              ${customers.map(c=>`<option value="${escapeHtml(c.id)}" ${inv?.customerId===c.id?"selected":""}>${escapeHtml(c.name)} — ${escapeHtml(c.phone||"")}</option>`).join("")}
+            </select>
+          </div>
+          <div>
+            <label>السيارة</label>
+            <select id="iCar" class="input">
+              <option value="">— اختاري سيارة —</option>
+              ${cars.map(v=>`<option value="${escapeHtml(v.id)}" ${inv?.carId===v.id?"selected":""}>${escapeHtml(v.plate||"")} — ${escapeHtml(v.model||"")}</option>`).join("")}
+            </select>
+          </div>
+        </div>
 
-  async function idbGet(key) {
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readonly");
-      const st = tx.objectStore(STORE);
-      const req = st.get(key);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
+        <div class="formGrid" style="margin-top:10px">
+          <div>
+            <label>نسبة الضريبة (%)</label>
+            <input id="iTax" class="input" type="number" min="0" step="0.1" value="${escapeHtml(String(inv?.taxRate ?? s.invoice.taxRate ?? 0))}" />
+          </div>
+          <div>
+            <label>الحالة</label>
+            <select id="iStatus" class="input">
+              <option value="draft" ${(inv?.status||"draft")==="draft"?"selected":""}>مسودة</option>
+              <option value="unpaid" ${(inv?.status||"draft")==="unpaid"?"selected":""}>غير مدفوعة</option>
+              <option value="paid" ${(inv?.status||"draft")==="paid"?"selected":""}>مدفوعة</option>
+              <option value="cancelled" ${(inv?.status||"draft")==="cancelled"?"selected":""}>ملغاة</option>
+            </select>
+          </div>
+        </div>
 
-  async function idbSet(key, val) {
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      const st = tx.objectStore(STORE);
-      const req = st.put(val, key);
-      req.onsuccess = () => resolve(true);
-      req.onerror = () => reject(req.error);
-    });
-  }
+        <hr class="sep"/>
 
-  async function idbDel(key) {
-    const db = await idbOpen();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      const st = tx.objectStore(STORE);
-      const req = st.delete(key);
-      req.onsuccess = () => resolve(true);
-      req.onerror = () => reject(req.error);
-    });
-  }
+        <div class="row" style="justify-content:space-between; align-items:center">
+          <div>
+            <div style="font-weight:900">بنود الخدمة</div>
+            <div class="muted small">اسم الخدمة + كمية + سعر</div>
+          </div>
+          <button class="btn" id="addItem">+ بند</button>
+        </div>
 
-  // ---------- State ----------
-  const state = {
-    settings: {
-      theme: "dark",
-      sound: true,
-      voice: true,
-      accent: "#7c5cff",
-    },
-    data: {
-      customers: [],
-      cars: [],
-      workOrders: [],
-      invoices: [],
-      services: [],
-    },
-    cart: [],
-    history: { undo: [], redo: [] },
-    bootPlayed: false,
-  };
+        <div style="margin-top:10px; overflow:auto">
+          <table class="table" id="itemsTable">
+            <thead><tr><th>الخدمة</th><th>الكمية</th><th>السعر</th><th>المجموع</th><th></th></tr></thead>
+            <tbody>
+              ${items.map((it, idx)=> itemRow(it, idx)).join("")}
+            </tbody>
+          </table>
+        </div>
 
-  // ---------- Toast ----------
-  function toast(title, msg = "", kind = "info") {
-    const host = $("#toasts");
-    const el = document.createElement("div");
-    el.className = "toast";
-    el.innerHTML = `
-      <div>
-        <div class="toastTitle">${escapeHTML(title)}</div>
-        <div class="toastMsg">${escapeHTML(msg)}</div>
+        <div class="row end" style="margin-top:12px">
+          <div class="card pad" style="min-width:min(360px,100%); background: rgba(255,255,255,.02); border-color: rgba(255,255,255,.10)">
+            <div class="row" style="justify-content:space-between"><div class="muted">الإجمالي الفرعي</div><div id="subV">${escapeHtml(fmtIQD.format(initial.sub))}</div></div>
+            <div class="row" style="justify-content:space-between; margin-top:6px"><div class="muted">الضريبة</div><div id="taxV">${escapeHtml(fmtIQD.format(initial.tax))}</div></div>
+            <hr class="sep"/>
+            <div class="row" style="justify-content:space-between"><div style="font-weight:900">المجموع</div><div style="font-weight:900" id="totalV">${escapeHtml(fmtIQD.format(initial.total))}</div></div>
+          </div>
+        </div>
+
+        <div style="margin-top:10px">
+          <label>ملاحظات على الفاتورة</label>
+          <textarea class="input" id="iNote" rows="3" placeholder="...">${escapeHtml(inv?.note||"")}</textarea>
+        </div>
       </div>
-      <button class="iconBtn" style="width:36px;height:36px;border-radius:14px" aria-label="إغلاق">✕</button>
-    `;
-    el.querySelector("button").onclick = () => el.remove();
-    host.appendChild(el);
-    setTimeout(() => el.remove(), 4200);
-  }
-
-  // ---------- Modal ----------
-  function openModal({ title, bodyNode, actions = [] }) {
-    const host = $("#modalHost");
-    host.hidden = false;
-    host.innerHTML = "";
-    const modal = document.createElement("div");
-    modal.className = "modal";
-    modal.innerHTML = `
-      <div class="modalTop">
-        <div class="modalTitle">${escapeHTML(title || "")}</div>
-        <button class="iconBtn" id="mClose" title="إغلاق">✕</button>
-      </div>
-      <div class="modalBody" id="mBody"></div>
-      <div class="modalActions" id="mActions"></div>
-    `;
-    host.appendChild(modal);
-    $("#mBody", modal).appendChild(bodyNode);
-
-    const actionsEl = $("#mActions", modal);
-    actions.forEach(a => {
-      const b = document.createElement("button");
-      b.className = `btn ${a.kind || "ghost"}`;
-      b.textContent = a.text;
-      b.onclick = async () => {
-        const res = await a.onClick?.();
-        if (res !== false) closeModal();
+    `,
+    footerHtml: `
+      <button class="iconBtn" id="mCancel">إلغاء</button>
+      <button class="btn" id="mSave">حفظ</button>
+      ${isEdit ? `<button class="btn" id="mPrint">طباعة</button>` : ``}
+    `,
+    onMount(){
+      const recalcUI = ()=>{
+        const taxRate = Number($("#iTax").value||0);
+        const items2 = readItemsFromTable();
+        const r = calc(items2, taxRate);
+        $("#subV").textContent = fmtIQD.format(r.sub);
+        $("#taxV").textContent = fmtIQD.format(r.tax);
+        $("#totalV").textContent = fmtIQD.format(r.total);
       };
-      actionsEl.appendChild(b);
-      if (a.primary) b.dataset.primary = "1";
-    });
 
-    const close = () => closeModal();
-    $("#mClose", modal).onclick = close;
-    host.onclick = (e) => { if (e.target === host) close(); };
-    window.addEventListener("keydown", escCloseOnce, { once: true });
+      const readItemsFromTable = ()=>{
+        const rows = $$("#itemsTable tbody tr");
+        return rows.map(tr=>{
+          const name = tr.querySelector("[data-f=name]")?.value?.trim() || "";
+          const qty = Number(tr.querySelector("[data-f=qty]")?.value || 0);
+          const price = Number(tr.querySelector("[data-f=price]")?.value || 0);
+          return { name, qty, price };
+        }).filter(x=> x.name || x.qty || x.price);
+      };
 
-    function escCloseOnce(e) {
-      if (e.key === "Escape") close();
-    }
+      $("#mCancel").onclick = modal.close;
 
-    // Ctrl+S = primary
-    const onKey = (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
-        e.preventDefault();
-        const p = modal.querySelector('[data-primary="1"]');
-        if (p) p.click();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    modal.dataset.keyListener = "1";
-    modal._cleanup = () => window.removeEventListener("keydown", onKey);
+      $("#addItem").onclick = ()=>{
+        const tbody = $("#itemsTable tbody");
+        const idx = tbody.children.length;
+        const tr = document.createElement("tr");
+        tr.innerHTML = itemRow({name:"", qty:1, price:0}, idx);
+        tbody.appendChild(tr);
+        bindRow(tbody.lastElementChild);
+        recalcUI();
+      };
 
-    return modal;
-  }
-
-  function closeModal() {
-    const host = $("#modalHost");
-    const modal = $(".modal", host);
-    if (modal?._cleanup) modal._cleanup();
-    host.hidden = true;
-    host.innerHTML = "";
-  }
-
-  // ---------- Escape HTML ----------
-  function escapeHTML(str) {
-    return String(str ?? "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#039;");
-  }
-
-  // ---------- Undo/Redo ----------
-  function pushHistory(label, undoFn, redoFn) {
-    state.history.undo.push({ label, undoFn, redoFn });
-    state.history.redo.length = 0;
-  }
-  async function undo() {
-    const a = state.history.undo.pop();
-    if (!a) return toast("لا يوجد تراجع", "نفذت عمليات التراجع");
-    await a.undoFn();
-    state.history.redo.push(a);
-    toast("تراجع", a.label);
-    render();
-  }
-  async function redo() {
-    const a = state.history.redo.pop();
-    if (!a) return toast("لا يوجد إعادة", "نفذت عمليات الإعادة");
-    await a.redoFn();
-    state.history.undo.push(a);
-    toast("إعادة", a.label);
-    render();
-  }
-
-  // ---------- Draft Autosave ----------
-  function bindDraft(formEl, key) {
-    const k = `draft:${key}`;
-    const saved = localStorage.getItem(k);
-    if (saved) {
-      try {
-        const obj = JSON.parse(saved);
-        $$("[name]", formEl).forEach(inp => {
-          if (obj[inp.name] != null) inp.value = obj[inp.name];
+      function bindRow(tr){
+        tr.querySelectorAll("input").forEach(inp=>{
+          inp.addEventListener("input", ()=>{
+            // update line total preview
+            const qty = Number(tr.querySelector("[data-f=qty]").value||0);
+            const price = Number(tr.querySelector("[data-f=price]").value||0);
+            tr.querySelector("[data-line]").textContent = fmtIQD.format(qty*price);
+            recalcUI();
+          });
         });
-      } catch {}
-    }
-    const save = () => {
-      const obj = {};
-      $$("[name]", formEl).forEach(inp => { obj[inp.name] = inp.value; });
-      localStorage.setItem(k, JSON.stringify(obj));
-    };
-    formEl.addEventListener("input", save);
-    return {
-      clear() { localStorage.removeItem(k); }
-    };
-  }
-
-  // ---------- Storage load/save ----------
-  async function loadAll() {
-    const [settings, customers, cars, workOrders, invoices, services, cart] = await Promise.all([
-      idbGet("settings"),
-      idbGet("customers"),
-      idbGet("cars"),
-      idbGet("workOrders"),
-      idbGet("invoices"),
-      idbGet("services"),
-      idbGet("cart"),
-    ]);
-
-    if (settings) state.settings = { ...state.settings, ...settings };
-    state.data.customers = customers || [];
-    state.data.cars = cars || [];
-    state.data.workOrders = workOrders || [];
-    state.data.invoices = invoices || [];
-    state.data.services = services || [];
-    state.cart = cart || [];
-
-    // Seed أول مرة
-    if (!services || services.length === 0) {
-      state.data.services = seedServices();
-    }
-    if (!customers || customers.length === 0) {
-      const seeded = seedCustomers();
-      state.data.customers = seeded.customers;
-      state.data.cars = seeded.cars;
-      state.data.workOrders = seeded.workOrders;
-      state.data.invoices = seeded.invoices;
-    }
-
-    applyTheme(state.settings.theme);
-    applyAccent(state.settings.accent);
-  }
-
-  async function saveAll() {
-    await Promise.all([
-      idbSet("settings", state.settings),
-      idbSet("customers", state.data.customers),
-      idbSet("cars", state.data.cars),
-      idbSet("workOrders", state.data.workOrders),
-      idbSet("invoices", state.data.invoices),
-      idbSet("services", state.data.services),
-      idbSet("cart", state.cart),
-    ]);
-  }
-
-  // ---------- Seeds ----------
-  function seedServices() {
-    return [
-      { id: uid(), name: "تبديل دهن", price: 15000, minutes: 15, icon: "🛢️" },
-      { id: uid(), name: "تبديل فلتر", price: 8000, minutes: 10, icon: "🧼" },
-      { id: uid(), name: "فحص كمبيوتر", price: 25000, minutes: 20, icon: "💻" },
-      { id: uid(), name: "فرامل", price: 30000, minutes: 30, icon: "🛑" },
-      { id: uid(), name: "تبديل بواجي", price: 18000, minutes: 25, icon: "⚡" },
-      { id: uid(), name: "ميزان/ترصيص", price: 20000, minutes: 25, icon: "🛞" },
-    ];
-  }
-
-  function seedCustomers() {
-    const c1 = { id: uid(), name: "علي كريم", phone: "07701234567", createdAt: Date.now() - 86400000 * 4 };
-    const c2 = { id: uid(), name: "سارة حسن", phone: "07809876543", createdAt: Date.now() - 86400000 * 2 };
-    const car1 = { id: uid(), customerId: c1.id, plate: "بغداد 12345", model: "Toyota Camry 2014" };
-    const car2 = { id: uid(), customerId: c2.id, plate: "بابل 67890", model: "Kia Sportage 2018" };
-
-    const wo1 = {
-      id: uid(),
-      createdAt: Date.now() - 86400000,
-      updatedAt: Date.now() - 3600000,
-      status: "in_progress",
-      customerId: c1.id,
-      carId: car1.id,
-      customerName: c1.name,
-      plate: car1.plate,
-      notes: "صوت خفيف بالمحرك، يحتاج فحص سريع.",
-      items: [{ name: "تبديل دهن", price: 15000 }, { name: "تبديل فلتر", price: 8000 }],
-      total: 23000
-    };
-
-    const inv1 = {
-      id: uid(),
-      invoiceNo: "INV-" + String(Math.floor(Math.random() * 90000) + 10000),
-      date: Date.now() - 3600000 * 6,
-      customerName: c1.name,
-      customerPhone: c1.phone,
-      plate: car1.plate,
-      carModel: car1.model,
-      items: wo1.items,
-      discount: 0,
-      subtotal: 23000,
-      total: 23000,
-      paid: 23000,
-      notes: "شكراً لزيارتكم ❤️",
-    };
-
-    return {
-      customers: [c1, c2],
-      cars: [car1, car2],
-      workOrders: [wo1],
-      invoices: [inv1],
-    };
-  }
-
-  // ---------- Theme ----------
-  function applyTheme(theme) {
-    document.documentElement.dataset.theme = theme;
-    state.settings.theme = theme;
-    idbSet("settings", state.settings).catch(()=>{});
-  }
-  function applyAccent(accent) {
-    document.documentElement.style.setProperty("--accent", accent);
-    state.settings.accent = accent;
-    idbSet("settings", state.settings).catch(()=>{});
-  }
-
-  // ---------- PWA register ----------
-  async function registerSW() {
-    if (!("serviceWorker" in navigator)) return;
-    try {
-      await navigator.serviceWorker.register("./app.js?sw=1", { scope: "./" });
-      // لا نزعج المستخدم بتوست كل مرة
-    } catch {
-      // ignore
-    }
-  }
-
-  // ---------- Startup sound (WebAudio) ----------
-  function playStartupSound() {
-    if (!state.settings.sound) return;
-    if (state.bootPlayed) return;
-    state.bootPlayed = true;
-
-    try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const t0 = ctx.currentTime;
-
-      // "engine-ish" sound
-      const o1 = ctx.createOscillator();
-      const o2 = ctx.createOscillator();
-      const g = ctx.createGain();
-      const f = ctx.createBiquadFilter();
-
-      o1.type = "sawtooth";
-      o2.type = "square";
-      o1.frequency.setValueAtTime(110, t0);
-      o2.frequency.setValueAtTime(55, t0);
-
-      f.type = "lowpass";
-      f.frequency.setValueAtTime(600, t0);
-
-      g.gain.setValueAtTime(0.0001, t0);
-      g.gain.exponentialRampToValueAtTime(0.12, t0 + 0.05);
-      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.55);
-
-      o1.connect(f); o2.connect(f);
-      f.connect(g); g.connect(ctx.destination);
-
-      o1.start(t0); o2.start(t0);
-      o1.stop(t0 + 0.6); o2.stop(t0 + 0.6);
-    } catch {}
-  }
-
-  // ---------- Command Palette (Ctrl+K) ----------
-  function openPalette(prefill = "") {
-    const wrap = document.createElement("div");
-    wrap.innerHTML = `
-      <div class="row" style="gap:10px;align-items:stretch">
-        <div class="field" style="flex:1;min-width:260px">
-          <label>ابحث أو نفّذ أمر</label>
-          <input name="q" placeholder="مثال: فاتورة علي… | افتح الفواتير | أمر عمل جديد" autocomplete="off" />
-        </div>
-        <div class="card" style="padding:10px;display:flex;align-items:center;gap:10px">
-          <span class="pill">Enter</span>
-          <span class="muted">فتح</span>
-        </div>
-      </div>
-      <div class="hr"></div>
-      <div id="results"></div>
-    `;
-    const inp = $('input[name="q"]', wrap);
-    inp.value = prefill;
-
-    const commands = [
-      { title: "افتح الرئيسية", run: () => goto("#/dashboard") },
-      { title: "افتح أوامر العمل", run: () => goto("#/workorders") },
-      { title: "افتح الخدمات والسلة", run: () => goto("#/services") },
-      { title: "افتح الزبائن", run: () => goto("#/customers") },
-      { title: "افتح الفواتير", run: () => goto("#/invoices") },
-      { title: "أمر عمل جديد", run: () => openCreateWorkOrder() },
-      { title: "فاتورة جديدة (من السلة)", run: () => goto("#/services") },
-      { title: "مسح QR بالكاميرا", run: () => openScanner() },
-      { title: "الإعدادات", run: () => openSettings() },
-      { title: "تراجع (Ctrl+Z)", run: () => undo() },
-      { title: "إعادة (Ctrl+Y)", run: () => redo() },
-    ];
-
-    function renderResults(q) {
-      const resEl = $("#results", wrap);
-      const term = (q || "").trim().toLowerCase();
-      const items = [];
-
-      // commands
-      commands
-        .filter(c => !term || c.title.toLowerCase().includes(term))
-        .slice(0, 7)
-        .forEach(c => items.push({ type: "cmd", title: c.title, sub: "أمر", run: c.run }));
-
-      // search customers
-      const cust = state.data.customers
-        .filter(c => (c.name + " " + c.phone).toLowerCase().includes(term))
-        .slice(0, 6)
-        .map(c => ({ type: "cust", title: c.name, sub: c.phone, run: () => openCustomer(c.id) }));
-      items.push(...cust);
-
-      // work orders
-      const wos = state.data.workOrders
-        .filter(w => (w.customerName + " " + w.plate).toLowerCase().includes(term))
-        .slice(0, 6)
-        .map(w => ({ type: "wo", title: `أمر عمل — ${w.plate}`, sub: w.customerName, run: () => openWorkOrder(w.id) }));
-      items.push(...wos);
-
-      // invoices
-      const inv = state.data.invoices
-        .filter(i => (i.invoiceNo + " " + i.customerName + " " + i.plate).toLowerCase().includes(term))
-        .slice(0, 6)
-        .map(i => ({ type: "inv", title: `فاتورة ${i.invoiceNo}`, sub: i.customerName, run: () => goto(`#/invoice/${i.id}`) }));
-      items.push(...inv);
-
-      if (items.length === 0) {
-        resEl.innerHTML = `<div class="muted">لا نتائج…</div>`;
-        return;
+        tr.querySelector("[data-delrow]").addEventListener("click", ()=>{
+          tr.remove();
+          recalcUI();
+        });
       }
 
-      resEl.innerHTML = "";
-      items.slice(0, 14).forEach((it, idx) => {
-        const row = document.createElement("div");
-        row.className = "cartItem";
-        row.style.cursor = "pointer";
-        row.innerHTML = `
-          <div>
-            <div class="woTitle">${escapeHTML(it.title)}</div>
-            <div class="muted">${escapeHTML(it.sub || "")}</div>
-          </div>
-          <span class="pill">${escapeHTML(it.type)}</span>
-        `;
-        row.onclick = () => it.run();
-        resEl.appendChild(row);
-        if (idx === 0) row.dataset.first = "1";
-      });
-    }
-
-    renderResults(inp.value);
-
-    inp.addEventListener("input", () => renderResults(inp.value));
-    inp.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        const first = wrap.querySelector('[data-first="1"]');
-        if (first) first.click();
-      }
-    });
-
-    openModal({
-      title: "لوحة الأوامر والبحث (Ctrl+K)",
-      bodyNode: wrap,
-      actions: [
-        { text: "إغلاق", kind: "ghost" }
-      ]
-    });
-
-    setTimeout(() => inp.focus(), 50);
-  }
-
-  // ---------- Router ----------
-  function currentRoute() {
-    const h = location.hash || "#/dashboard";
-    const raw = h.replace(/^#/, "");
-    const parts = raw.split("/").filter(Boolean);
-    const name = parts[0] || "dashboard";
-    const param = parts[1] || "";
-    return { name, param };
-  }
-
-  function goto(hash) {
-    location.hash = hash;
-  }
-
-  function setActiveNav(routeName) {
-    $$(".navItem").forEach(a => a.classList.toggle("active", a.dataset.route === routeName));
-    $$("#bottomNav a").forEach(a => a.classList.toggle("active", a.dataset.route === routeName));
-  }
-
-  // ---------- Render ----------
-  function render() {
-    const { name, param } = currentRoute();
-    setActiveNav(name);
-
-    const view = $("#view");
-    view.innerHTML = "";
-
-    if (name === "dashboard") view.appendChild(pageDashboard());
-    else if (name === "workorders") view.appendChild(pageWorkOrders());
-    else if (name === "services") view.appendChild(pageServices());
-    else if (name === "customers") view.appendChild(pageCustomers());
-    else if (name === "invoices") view.appendChild(pageInvoices());
-    else if (name === "invoice") view.appendChild(pageInvoice(param));
-    else view.appendChild(pageNotFound());
-  }
-
-  function pageNotFound() {
-    const el = document.createElement("div");
-    el.className = "card";
-    el.innerHTML = `<div class="cardTitle">الصفحة غير موجودة</div><div class="muted">ارجعي للرئيسية.</div>`;
-    return el;
-  }
-
-  // ---------- Dashboard ----------
-  function pageDashboard() {
-    const el = document.createElement("div");
-
-    const today = new Date();
-    const startDay = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
-    const invToday = state.data.invoices.filter(i => i.date >= startDay);
-    const sumToday = invToday.reduce((a, b) => a + (b.total || 0), 0);
-
-    const wosOpen = state.data.workOrders.filter(w => w.status !== "delivered");
-    const topService = mostUsedService();
-
-    el.innerHTML = `
-      <div class="grid">
-        <div class="card" style="grid-column: span 4">
-          <div class="cardHeader">
-            <div class="cardTitle">دخل اليوم</div>
-            <span class="pill good">${fmtIQD(sumToday)}</span>
-          </div>
-          <div class="muted">عدد فواتير اليوم: ${invToday.length}</div>
-        </div>
-
-        <div class="card" style="grid-column: span 4">
-          <div class="cardHeader">
-            <div class="cardTitle">أوامر العمل المفتوحة</div>
-            <span class="pill warn">${wosOpen.length}</span>
-          </div>
-          <div class="muted">سحّبي الكروت بالكانبان لتغيير الحالة.</div>
-        </div>
-
-        <div class="card" style="grid-column: span 4">
-          <div class="cardHeader">
-            <div class="cardTitle">الأكثر طلباً</div>
-            <span class="pill">${escapeHTML(topService?.name || "—")}</span>
-          </div>
-          <div class="muted">مستخرج من السجل المحلي.</div>
-        </div>
-      </div>
-
-      <div class="grid">
-        <div class="card" style="grid-column: span 7">
-          <div class="cardHeader">
-            <div class="cardTitle">آخر أوامر العمل</div>
-            <div class="row">
-              <button class="btn" id="dashNewWO">+ أمر عمل</button>
-              <button class="btn ghost" id="dashUndo">تراجع</button>
-              <button class="btn ghost" id="dashRedo">إعادة</button>
-            </div>
-          </div>
-          <div class="hr"></div>
-          <div id="dashWO"></div>
-        </div>
-
-        <div class="card" style="grid-column: span 5">
-          <div class="cardHeader">
-            <div class="cardTitle">آخر الفواتير</div>
-            <button class="btn ghost" id="dashCSV">تصدير CSV</button>
-          </div>
-          <div class="hr"></div>
-          <div id="dashInv"></div>
-        </div>
-      </div>
-    `;
-
-    $("#dashNewWO", el).onclick = () => openCreateWorkOrder();
-    $("#dashUndo", el).onclick = () => undo();
-    $("#dashRedo", el).onclick = () => redo();
-    $("#dashCSV", el).onclick = () => exportCSV();
-
-    // list WOs
-    const woWrap = $("#dashWO", el);
-    const wos = [...state.data.workOrders].sort((a,b)=> (b.updatedAt||0)-(a.updatedAt||0)).slice(0, 6);
-    if (wos.length === 0) woWrap.innerHTML = `<div class="muted">لا يوجد أوامر عمل…</div>`;
-    else {
-      woWrap.innerHTML = "";
-      wos.forEach(w => {
-        const row = document.createElement("div");
-        row.className = "cartItem";
-        row.style.cursor = "pointer";
-        row.innerHTML = `
-          <div>
-            <div class="woTitle">${escapeHTML(w.plate)} — ${escapeHTML(w.customerName)}</div>
-            <div class="muted">${escapeHTML(statusLabel(w.status))} • ${fmtDate(w.updatedAt || w.createdAt)}</div>
-          </div>
-          <span class="pill">${fmtIQD(w.total || 0)}</span>
-        `;
-        row.onclick = () => openWorkOrder(w.id);
-        woWrap.appendChild(row);
-      });
-    }
-
-    // list invoices
-    const invWrap = $("#dashInv", el);
-    const invs = [...state.data.invoices].sort((a,b)=> (b.date||0)-(a.date||0)).slice(0, 6);
-    if (invs.length === 0) invWrap.innerHTML = `<div class="muted">لا يوجد فواتير…</div>`;
-    else {
-      invWrap.innerHTML = "";
-      invs.forEach(i => {
-        const row = document.createElement("div");
-        row.className = "cartItem";
-        row.style.cursor = "pointer";
-        row.innerHTML = `
-          <div>
-            <div class="woTitle">${escapeHTML(i.invoiceNo)} — ${escapeHTML(i.customerName)}</div>
-            <div class="muted">${escapeHTML(i.plate)} • ${fmtDate(i.date)}</div>
-          </div>
-          <span class="pill good">${fmtIQD(i.total || 0)}</span>
-        `;
-        row.onclick = () => goto(`#/invoice/${i.id}`);
-        invWrap.appendChild(row);
-      });
-    }
-
-    return el;
-  }
-
-  function mostUsedService() {
-    const m = new Map();
-    const all = [
-      ...state.data.invoices.flatMap(i => i.items || []),
-      ...state.data.workOrders.flatMap(w => w.items || []),
-    ];
-    all.forEach(it => {
-      const k = it.name || "";
-      m.set(k, (m.get(k) || 0) + 1);
-    });
-    let best = null;
-    for (const [name, count] of m.entries()) {
-      if (!best || count > best.count) best = { name, count };
-    }
-    return best;
-  }
-
-  // ---------- Work Orders (Kanban) ----------
-  function pageWorkOrders() {
-    const el = document.createElement("div");
-    el.innerHTML = `
-      <div class="card">
-        <div class="cardHeader">
-          <div>
-            <div class="cardTitle">أوامر العمل (Kanban)</div>
-            <div class="muted">اسحبي البطاقة لتغيير الحالة. (يدعم Undo/Redo)</div>
-          </div>
-          <div class="row">
-            <button class="btn" id="woNew">+ أمر عمل</button>
-            <button class="btn ghost" id="woUndo">تراجع</button>
-            <button class="btn ghost" id="woRedo">إعادة</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="kanban" id="kanban">
-        ${kanbanColumn("new", "جديد")}
-        ${kanbanColumn("in_progress", "قيد العمل")}
-        ${kanbanColumn("waiting_parts", "بانتظار قطع")}
-        ${kanbanColumn("ready", "جاهز")}
-      </div>
-
-      <div class="card">
-        <div class="cardHeader">
-          <div class="cardTitle">المنجزة/المُسلّمة</div>
-          <span class="muted">تظهر هنا للتاريخ.</span>
-        </div>
-        <div class="hr"></div>
-        <div id="deliveredList"></div>
-      </div>
-    `;
-
-    $("#woNew", el).onclick = () => openCreateWorkOrder();
-    $("#woUndo", el).onclick = () => undo();
-    $("#woRedo", el).onclick = () => redo();
-
-    const board = $("#kanban", el);
-    const makeCard = (w) => {
-      const c = document.createElement("div");
-      c.className = "cardWO";
-      c.draggable = true;
-      c.dataset.id = w.id;
-      c.innerHTML = `
-        <div class="woTitle">${escapeHTML(w.plate)}</div>
-        <div class="muted">${escapeHTML(w.customerName)}</div>
-        <div class="woMeta">
-          <span class="pill">${escapeHTML(statusLabel(w.status))}</span>
-          <span class="pill good">${fmtIQD(w.total || 0)}</span>
-          <span class="pill">${escapeHTML((w.items?.[0]?.name) || "—")}</span>
-        </div>
-      `;
-      c.addEventListener("dragstart", (e) => {
-        e.dataTransfer.setData("text/plain", w.id);
-      });
-      c.onclick = () => openWorkOrder(w.id);
-      return c;
-    };
-
-    const byStatus = (s) => state.data.workOrders.filter(w => w.status === s).sort((a,b)=> (b.updatedAt||0)-(a.updatedAt||0));
-
-    const colMap = {
-      new: $('[data-col="new"]', board),
-      in_progress: $('[data-col="in_progress"]', board),
-      waiting_parts: $('[data-col="waiting_parts"]', board),
-      ready: $('[data-col="ready"]', board),
-    };
-
-    Object.entries(colMap).forEach(([status, col]) => {
-      const list = $(".colList", col);
-      list.innerHTML = "";
-      byStatus(status).forEach(w => list.appendChild(makeCard(w)));
-
-      col.addEventListener("dragover", (e) => e.preventDefault());
-      col.addEventListener("drop", async (e) => {
-        e.preventDefault();
-        const id = e.dataTransfer.getData("text/plain");
-        const w = state.data.workOrders.find(x => x.id === id);
-        if (!w) return;
-
-        const prev = w.status;
-        if (prev === status) return;
-
-        w.status = status;
-        w.updatedAt = Date.now();
-        await saveAll();
-
-        pushHistory(
-          `تغيير حالة أمر العمل (${w.plate})`,
-          async () => { w.status = prev; w.updatedAt = Date.now(); await saveAll(); },
-          async () => { w.status = status; w.updatedAt = Date.now(); await saveAll(); }
-        );
-
-        toast("تم", `تم نقل ${w.plate} إلى: ${statusLabel(status)}`);
-        render();
-      });
-    });
-
-    // delivered list
-    const delivered = state.data.workOrders.filter(w => w.status === "delivered").sort((a,b)=> (b.updatedAt||0)-(a.updatedAt||0));
-    const dHost = $("#deliveredList", el);
-    if (delivered.length === 0) dHost.innerHTML = `<div class="muted">لا يوجد…</div>`;
-    else {
-      dHost.innerHTML = "";
-      delivered.slice(0, 12).forEach(w => {
-        const row = document.createElement("div");
-        row.className = "cartItem";
-        row.style.cursor = "pointer";
-        row.innerHTML = `
-          <div>
-            <div class="woTitle">${escapeHTML(w.plate)} — ${escapeHTML(w.customerName)}</div>
-            <div class="muted">${fmtDate(w.updatedAt || w.createdAt)}</div>
-          </div>
-          <span class="pill good">${fmtIQD(w.total || 0)}</span>
-        `;
-        row.onclick = () => openWorkOrder(w.id);
-        dHost.appendChild(row);
-      });
-    }
-
-    return el;
-  }
-
-  function kanbanColumn(key, title) {
-    return `
-      <div class="column" data-col="${key}">
-        <div class="columnHeader">
-          <div class="columnTitle">${escapeHTML(title)}</div>
-          <div class="dropHint">اسحبي هنا</div>
-        </div>
-        <div class="colList"></div>
-      </div>
-    `;
-  }
-
-  function statusLabel(s) {
-    return ({
-      new: "جديد",
-      in_progress: "قيد العمل",
-      waiting_parts: "بانتظار قطع",
-      ready: "جاهز",
-      delivered: "مُسلّم"
-    })[s] || s;
-  }
-
-  // ---------- Services + Cart ----------
-  function pageServices() {
-    const el = document.createElement("div");
-    el.innerHTML = `
-      <div class="grid">
-        <div class="card" style="grid-column: span 8">
-          <div class="cardHeader">
-            <div>
-              <div class="cardTitle">كتالوج الخدمات</div>
-              <div class="muted">اضغطي “إضافة” لتدخل للسلة</div>
-            </div>
-            <div class="row">
-              <button class="btn ghost" id="clearCart">تفريغ السلة</button>
-              <button class="btn" id="goInvoice">إنشاء فاتورة</button>
-            </div>
-          </div>
-          <div class="hr"></div>
-          <div class="servicesGrid" id="servicesGrid"></div>
-        </div>
-
-        <div class="cart" style="grid-column: span 4">
-          <div class="cardHeader">
-            <div class="cardTitle">السلة</div>
-            <span class="pill" id="cartCount"></span>
-          </div>
-          <div class="hr"></div>
-          <div id="cartList"></div>
-          <div class="hr"></div>
-          <div class="row" style="justify-content:space-between">
-            <div class="muted">المجموع</div>
-            <div class="pill good" id="cartTotal"></div>
-          </div>
-          <div style="margin-top:12px" class="row">
-            <button class="btn full" id="btnMakeInvoice">إنشاء فاتورة من السلة</button>
-          </div>
-          <div class="muted" style="margin-top:10px">💡 تقدرِين تسوين فاتورة حتى بدون زبون (مؤقتاً).</div>
-        </div>
-      </div>
-    `;
-
-    const grid = $("#servicesGrid", el);
-    state.data.services.forEach(s => {
-      const it = document.createElement("div");
-      it.className = "serviceItem";
-      it.innerHTML = `
-        <div class="row" style="justify-content:space-between;align-items:flex-start">
-          <div>
-            <div class="serviceName">${escapeHTML(s.icon || "🔧")} ${escapeHTML(s.name)}</div>
-            <div class="muted">مدة: ${s.minutes || 0} دقيقة</div>
-          </div>
-          <span class="pill good">${fmtIQD(s.price || 0)}</span>
-        </div>
-        <div style="margin-top:12px" class="row">
-          <button class="btn full" data-add="${s.id}">إضافة للسلة</button>
-        </div>
-      `;
-      grid.appendChild(it);
-    });
-
-    grid.addEventListener("click", async (e) => {
-      const btn = e.target.closest("[data-add]");
-      if (!btn) return;
-      const s = state.data.services.find(x => x.id === btn.dataset.add);
-      if (!s) return;
-      state.cart.push({ id: uid(), name: s.name, price: s.price });
-      await idbSet("cart", state.cart);
-      pushHistory(
-        `إضافة للسلة: ${s.name}`,
-        async () => { state.cart.pop(); await idbSet("cart", state.cart); },
-        async () => { state.cart.push({ id: uid(), name: s.name, price: s.price }); await idbSet("cart", state.cart); }
-      );
-      toast("تم", `تمت إضافة ${s.name} للسلة`);
-      render();
-    });
-
-    $("#clearCart", el).onclick = async () => {
-      const prev = [...state.cart];
-      state.cart = [];
-      await idbSet("cart", state.cart);
-      pushHistory(
-        "تفريغ السلة",
-        async () => { state.cart = prev; await idbSet("cart", state.cart); },
-        async () => { state.cart = []; await idbSet("cart", state.cart); }
-      );
-      toast("تم", "تم تفريغ السلة");
-      render();
-    };
-
-    const makeInvoice = () => openCreateInvoiceFromCart();
-    $("#goInvoice", el).onclick = makeInvoice;
-    $("#btnMakeInvoice", el).onclick = makeInvoice;
-
-    // render cart
-    renderCart(el);
-    return el;
-  }
-
-  function renderCart(root) {
-    const list = $("#cartList", root);
-    const count = $("#cartCount", root);
-    const totalEl = $("#cartTotal", root);
-
-    count.textContent = `${state.cart.length} عنصر`;
-    const total = state.cart.reduce((a,b)=> a + (b.price||0), 0);
-    totalEl.textContent = fmtIQD(total);
-
-    list.innerHTML = "";
-    if (state.cart.length === 0) {
-      list.innerHTML = `<div class="muted">السلة فارغة…</div>`;
-      return;
-    }
-
-    state.cart.forEach((it, idx) => {
-      const row = document.createElement("div");
-      row.className = "cartItem";
-      row.innerHTML = `
-        <div>
-          <div class="woTitle">${escapeHTML(it.name)}</div>
-          <div class="muted">${fmtIQD(it.price || 0)}</div>
-        </div>
-        <button class="iconBtn" data-del="${idx}" title="حذف">🗑️</button>
-      `;
-      list.appendChild(row);
-    });
-
-    list.addEventListener("click", async (e) => {
-      const b = e.target.closest("[data-del]");
-      if (!b) return;
-      const idx = Number(b.dataset.del);
-      const removed = state.cart[idx];
-      state.cart.splice(idx, 1);
-      await idbSet("cart", state.cart);
-
-      pushHistory(
-        `حذف من السلة: ${removed?.name || ""}`,
-        async () => { state.cart.splice(idx, 0, removed); await idbSet("cart", state.cart); },
-        async () => { state.cart.splice(idx, 1); await idbSet("cart", state.cart); }
-      );
-
-      render();
-    });
-  }
-
-  // ---------- Customers ----------
-  function pageCustomers() {
-    const el = document.createElement("div");
-    el.innerHTML = `
-      <div class="card">
-        <div class="cardHeader">
-          <div>
-            <div class="cardTitle">الزبائن</div>
-            <div class="muted">Front-end فقط — البيانات محفوظة محلياً (IndexedDB)</div>
-          </div>
-          <button class="btn" id="custNew">+ زبون</button>
-        </div>
-        <div class="hr"></div>
-        <div class="row">
-          <div class="field" style="min-width:260px">
-            <label>فلتر</label>
-            <input id="custFilter" placeholder="اسم/هاتف…" />
-          </div>
-        </div>
-        <div class="hr"></div>
-        <div id="custTable"></div>
-      </div>
-    `;
-
-    $("#custNew", el).onclick = () => openCreateCustomer();
-    const filter = $("#custFilter", el);
-    const table = $("#custTable", el);
-
-    const renderTable = () => {
-      const term = filter.value.trim().toLowerCase();
-      const rows = state.data.customers
-        .filter(c => !term || (c.name + " " + c.phone).toLowerCase().includes(term))
-        .sort((a,b)=> (b.createdAt||0)-(a.createdAt||0));
-
-      if (rows.length === 0) {
-        table.innerHTML = `<div class="muted">لا يوجد نتائج…</div>`;
-        return;
-      }
-
-      table.innerHTML = `
-        <table class="table">
-          <thead>
-            <tr>
-              <th>الاسم</th>
-              <th>الهاتف</th>
-              <th>آخر تحديث</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rows.map(c => `
-              <tr data-id="${c.id}">
-                <td>${escapeHTML(c.name)}</td>
-                <td>${escapeHTML(c.phone || "")}</td>
-                <td>${escapeHTML(fmtDate(c.createdAt || Date.now()))}</td>
-                <td><button class="btn ghost" data-open="${c.id}">فتح</button></td>
-              </tr>
-            `).join("")}
-          </tbody>
-        </table>
-      `;
-    };
-
-    filter.addEventListener("input", renderTable);
-    table.addEventListener("click", (e) => {
-      const b = e.target.closest("[data-open]");
-      if (!b) return;
-      openCustomer(b.dataset.open);
-    });
-
-    renderTable();
-    return el;
-  }
-
-  // ---------- Invoices ----------
-  function pageInvoices() {
-    const el = document.createElement("div");
-    el.innerHTML = `
-      <div class="card">
-        <div class="cardHeader">
-          <div>
-            <div class="cardTitle">الفواتير</div>
-            <div class="muted">طباعة + PDF من المتصفح + QR</div>
-          </div>
-          <div class="row">
-            <button class="btn ghost" id="invCSV">تصدير CSV</button>
-            <button class="btn" id="invNew">+ فاتورة</button>
-          </div>
-        </div>
-        <div class="hr"></div>
-        <div class="row">
-          <div class="field" style="min-width:260px">
-            <label>بحث</label>
-            <input id="invFilter" placeholder="رقم/اسم/لوحة…" />
-          </div>
-        </div>
-        <div class="hr"></div>
-        <div id="invTable"></div>
-      </div>
-    `;
-
-    $("#invNew", el).onclick = () => openCreateInvoiceFromCart();
-    $("#invCSV", el).onclick = () => exportCSV();
-
-    const filter = $("#invFilter", el);
-    const table = $("#invTable", el);
-
-    const renderTable = () => {
-      const term = filter.value.trim().toLowerCase();
-      const rows = [...state.data.invoices]
-        .filter(i => !term || (i.invoiceNo + " " + i.customerName + " " + i.plate).toLowerCase().includes(term))
-        .sort((a,b)=> (b.date||0)-(a.date||0));
-
-      if (rows.length === 0) {
-        table.innerHTML = `<div class="muted">لا يوجد…</div>`;
-        return;
-      }
-
-      table.innerHTML = `
-        <table class="table">
-          <thead>
-            <tr>
-              <th>رقم</th>
-              <th>الزبون</th>
-              <th>اللوحة</th>
-              <th>التاريخ</th>
-              <th>الإجمالي</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            ${rows.map(i => `
-              <tr>
-                <td>${escapeHTML(i.invoiceNo)}</td>
-                <td>${escapeHTML(i.customerName || "—")}</td>
-                <td>${escapeHTML(i.plate || "—")}</td>
-                <td>${escapeHTML(fmtDate(i.date))}</td>
-                <td>${escapeHTML(fmtIQD(i.total || 0))}</td>
-                <td><button class="btn ghost" data-open="${i.id}">فتح</button></td>
-              </tr>
-            `).join("")}
-          </tbody>
-        </table>
-      `;
-    };
-
-    filter.addEventListener("input", renderTable);
-    table.addEventListener("click", (e) => {
-      const b = e.target.closest("[data-open]");
-      if (!b) return;
-      goto(`#/invoice/${b.dataset.open}`);
-    });
-
-    renderTable();
-    return el;
-  }
-
-  // ---------- Invoice view / print ----------
-  function pageInvoice(id) {
-    const inv = state.data.invoices.find(x => x.id === id);
-    const el = document.createElement("div");
-    if (!inv) {
-      el.className = "card";
-      el.innerHTML = `<div class="cardTitle">الفاتورة غير موجودة</div>`;
-      return el;
-    }
-
-    const qrText = `${location.origin}${location.pathname}#/invoice/${inv.id}`;
-    const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=170x170&data=${encodeURIComponent(qrText)}`;
-
-    el.innerHTML = `
-      <div class="card">
-        <div class="cardHeader">
-          <div>
-            <div class="cardTitle">فاتورة: ${escapeHTML(inv.invoiceNo)}</div>
-            <div class="muted">${escapeHTML(fmtDate(inv.date))}</div>
-          </div>
-          <div class="row">
-            <button class="btn ghost" id="invBack">رجوع</button>
-            <button class="btn" id="invPrint">طباعة / PDF</button>
-            <button class="btn danger" id="invDel">حذف</button>
-          </div>
-        </div>
-      </div>
-
-      <div class="card" id="printArea">
-        <div style="display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap">
-          <div>
-            <h2 style="margin:0 0 6px 0">فاتورة خدمة — RPM</h2>
-            <div class="muted">رقم الفاتورة: <b>${escapeHTML(inv.invoiceNo)}</b> • التاريخ: ${escapeHTML(fmtDate(inv.date))}</div>
-          </div>
-          <div style="text-align:center">
-            <img id="qrImg" src="${qrUrl}" alt="QR" style="width:140px;height:140px;border-radius:14px;border:1px solid var(--border);background:#fff;padding:6px" />
-            <div class="muted" style="margin-top:6px">QR لفتح الفاتورة</div>
-          </div>
-        </div>
-
-        <div class="hr"></div>
-
-        <div class="grid">
-          <div class="card" style="grid-column: span 6; box-shadow:none">
-            <div class="cardTitle" style="margin-bottom:6px">الزبون</div>
-            <div>الاسم: <b>${escapeHTML(inv.customerName || "—")}</b></div>
-            <div>الهاتف: ${escapeHTML(inv.customerPhone || "—")}</div>
-          </div>
-          <div class="card" style="grid-column: span 6; box-shadow:none">
-            <div class="cardTitle" style="margin-bottom:6px">السيارة</div>
-            <div>اللوحة: <b>${escapeHTML(inv.plate || "—")}</b></div>
-            <div>الموديل: ${escapeHTML(inv.carModel || "—")}</div>
-          </div>
-        </div>
-
-        <div class="hr"></div>
-
-        <table class="table">
-          <thead>
-            <tr>
-              <th>البند</th>
-              <th>السعر</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${(inv.items || []).map(it => `
-              <tr>
-                <td>${escapeHTML(it.name || "")}</td>
-                <td>${escapeHTML(fmtIQD(it.price || 0))}</td>
-              </tr>
-            `).join("")}
-          </tbody>
-        </table>
-
-        <div class="hr"></div>
-
-        <div class="row" style="justify-content:space-between">
-          <div class="muted">المجموع الفرعي</div>
-          <div class="pill">${fmtIQD(inv.subtotal || 0)}</div>
-        </div>
-        <div class="row" style="justify-content:space-between">
-          <div class="muted">الخصم</div>
-          <div class="pill">${fmtIQD(inv.discount || 0)}</div>
-        </div>
-        <div class="row" style="justify-content:space-between">
-          <div class="cardTitle">الإجمالي</div>
-          <div class="pill good">${fmtIQD(inv.total || 0)}</div>
-        </div>
-
-        <div class="hr"></div>
-        <div class="muted">${escapeHTML(inv.notes || "شكراً لزيارتكم ❤️")}</div>
-      </div>
-    `;
-
-    $("#invBack", el).onclick = () => history.back();
-    $("#invPrint", el).onclick = () => window.print();
-
-    $("#invDel", el).onclick = async () => {
-      const prev = inv;
-      state.data.invoices = state.data.invoices.filter(x => x.id !== id);
-      await saveAll();
-
-      pushHistory(
-        `حذف فاتورة ${prev.invoiceNo}`,
-        async () => { state.data.invoices.push(prev); await saveAll(); },
-        async () => { state.data.invoices = state.data.invoices.filter(x => x.id !== id); await saveAll(); }
-      );
-
-      toast("تم", "تم حذف الفاتورة");
-      goto("#/invoices");
-    };
-
-    // إذا انقطع النت: نعرض بديل شكلي
-    const img = $("#qrImg", el);
-    img.onerror = () => {
-      img.removeAttribute("src");
-      img.style.background = "repeating-linear-gradient(45deg,#000,#000 6px,#fff 6px,#fff 12px)";
-      img.style.border = "1px solid #ddd";
-    };
-
-    return el;
-  }
-
-  // ---------- Create Customer ----------
-  function openCreateCustomer() {
-    const wrap = document.createElement("div");
-    wrap.innerHTML = `
-      <div class="row">
-        <div class="field">
-          <label>اسم الزبون</label>
-          <input name="name" placeholder="مثال: محمد علي" />
-        </div>
-        <div class="field">
-          <label>الهاتف</label>
-          <input name="phone" placeholder="07xxxxxxxxx" />
-        </div>
-      </div>
-      <div class="hr"></div>
-      <div class="muted">✅ يتم الحفظ محلياً — يدعم Draft تلقائي.</div>
-    `;
-
-    const draft = bindDraft(wrap, "createCustomer");
-
-    openModal({
-      title: "إضافة زبون",
-      bodyNode: wrap,
-      actions: [
-        { text: "إلغاء", kind: "ghost" },
-        {
-          text: "حفظ",
-          kind: "good",
-          primary: true,
-          onClick: async () => {
-            const name = $('[name="name"]', wrap).value.trim();
-            const phone = $('[name="phone"]', wrap).value.trim();
-            if (!name) return toast("تنبيه", "اكتبي الاسم") || false;
-
-            const c = { id: uid(), name, phone, createdAt: Date.now() };
-            state.data.customers.unshift(c);
-            await saveAll();
-
-            pushHistory(
-              `إضافة زبون: ${name}`,
-              async () => { state.data.customers = state.data.customers.filter(x => x.id !== c.id); await saveAll(); },
-              async () => { state.data.customers.unshift(c); await saveAll(); }
-            );
-
-            draft.clear();
-            toast("تم", "تم إضافة الزبون");
-            render();
-          }
+      // bind all existing rows
+      $$("#itemsTable tbody tr").forEach(bindRow);
+
+      $("#iTax").addEventListener("input", recalcUI);
+
+      $("#mSave").onclick = async ()=>{
+        const customerId = $("#iCustomer").value;
+        const carId = $("#iCar").value;
+        const c = customers.find(x=> x.id===customerId);
+        const v = cars.find(x=> x.id===carId);
+
+        if(!customerId){ toast("اختاري زبون", "bad"); return; }
+
+        const taxRate = Number($("#iTax").value||0);
+        const items2 = readItemsFromTable();
+        if(!items2.length){ toast("أضيفي بند واحد على الأقل", "bad"); return; }
+
+        const r = calc(items2, taxRate);
+
+        const base = {
+          customerId,
+          customerName: c?.name || "",
+          customerPhone: c?.phone || "",
+          carId: carId || "",
+          carPlate: v?.plate || "",
+          carModel: v?.model || "",
+          items: items2,
+          subTotal: r.sub,
+          taxRate,
+          tax: r.tax,
+          total: r.total,
+          status: $("#iStatus").value,
+          note: $("#iNote").value.trim(),
+          updatedAt: Date.now()
+        };
+
+        if(isEdit){
+          await dbUpdate(`invoices/${inv.id}`, base);
+          toast("تم تحديث الفاتورة", "good");
+          modal.close();
+          return;
         }
-      ]
-    });
-  }
 
-  // ---------- Open Customer ----------
-  function openCustomer(customerId) {
-    const c = state.data.customers.find(x => x.id === customerId);
-    if (!c) return toast("خطأ", "الزبون غير موجود");
+        const nextNo = await dbNextInvoiceNo();
+        const invoiceNo = `${s.invoice.prefix || "RPM"}-${nextNo}`;
 
-    const cars = state.data.cars.filter(x => x.customerId === c.id);
-    const wos = state.data.workOrders.filter(w => w.customerId === c.id);
-    const invs = state.data.invoices.filter(i => i.customerName === c.name);
+        const id = genId();
+        await dbSet(`invoices/${id}`, { ...base, invoiceNo, createdAt: Date.now() });
 
-    const wrap = document.createElement("div");
-    wrap.innerHTML = `
-      <div class="grid">
-        <div class="card" style="grid-column: span 6; box-shadow:none">
-          <div class="cardTitle">معلومات</div>
-          <div class="hr"></div>
-          <div>الاسم: <b>${escapeHTML(c.name)}</b></div>
-          <div>الهاتف: ${escapeHTML(c.phone || "—")}</div>
-          <div class="muted">أُضيف: ${escapeHTML(fmtDate(c.createdAt || Date.now()))}</div>
-        </div>
-
-        <div class="card" style="grid-column: span 6; box-shadow:none">
-          <div class="cardHeader">
-            <div class="cardTitle">السيارات</div>
-            <button class="btn ghost" id="addCar">+ سيارة</button>
-          </div>
-          <div class="hr"></div>
-          <div id="carList"></div>
-        </div>
-      </div>
-
-      <div class="card" style="box-shadow:none">
-        <div class="cardTitle">آخر أوامر العمل</div>
-        <div class="hr"></div>
-        <div id="woList"></div>
-      </div>
-
-      <div class="card" style="box-shadow:none">
-        <div class="cardTitle">آخر الفواتير</div>
-        <div class="hr"></div>
-        <div id="invList"></div>
-      </div>
-    `;
-
-    const carList = $("#carList", wrap);
-    carList.innerHTML = cars.length ? "" : `<div class="muted">لا سيارات…</div>`;
-    cars.forEach(car => {
-      const row = document.createElement("div");
-      row.className = "cartItem";
-      row.innerHTML = `
-        <div>
-          <div class="woTitle">${escapeHTML(car.plate)}</div>
-          <div class="muted">${escapeHTML(car.model || "")}</div>
-        </div>
-      `;
-      carList.appendChild(row);
-    });
-
-    const woList = $("#woList", wrap);
-    woList.innerHTML = wos.length ? "" : `<div class="muted">لا أوامر…</div>`;
-    wos.slice(0, 6).forEach(w => {
-      const row = document.createElement("div");
-      row.className = "cartItem";
-      row.style.cursor = "pointer";
-      row.innerHTML = `
-        <div>
-          <div class="woTitle">${escapeHTML(w.plate)}</div>
-          <div class="muted">${escapeHTML(statusLabel(w.status))} • ${fmtDate(w.updatedAt || w.createdAt)}</div>
-        </div>
-        <span class="pill">${fmtIQD(w.total || 0)}</span>
-      `;
-      row.onclick = () => { closeModal(); openWorkOrder(w.id); };
-      woList.appendChild(row);
-    });
-
-    const invList = $("#invList", wrap);
-    invList.innerHTML = invs.length ? "" : `<div class="muted">لا فواتير…</div>`;
-    invs.slice(0, 6).forEach(i => {
-      const row = document.createElement("div");
-      row.className = "cartItem";
-      row.style.cursor = "pointer";
-      row.innerHTML = `
-        <div>
-          <div class="woTitle">${escapeHTML(i.invoiceNo)}</div>
-          <div class="muted">${fmtDate(i.date)} • ${escapeHTML(i.plate || "")}</div>
-        </div>
-        <span class="pill good">${fmtIQD(i.total || 0)}</span>
-      `;
-      row.onclick = () => { closeModal(); goto(`#/invoice/${i.id}`); };
-      invList.appendChild(row);
-    });
-
-    $("#addCar", wrap).onclick = () => openAddCar(c.id);
-
-    openModal({
-      title: `زبون: ${c.name}`,
-      bodyNode: wrap,
-      actions: [
-        { text: "إغلاق", kind: "ghost" }
-      ]
-    });
-  }
-
-  function openAddCar(customerId) {
-    const wrap = document.createElement("div");
-    wrap.innerHTML = `
-      <div class="row">
-        <div class="field">
-          <label>اللوحة</label>
-          <input name="plate" placeholder="مثال: بغداد 12345" />
-        </div>
-        <div class="field">
-          <label>الموديل</label>
-          <input name="model" placeholder="مثال: Toyota Camry 2014" />
-        </div>
-      </div>
-    `;
-    const draft = bindDraft(wrap, "addCar");
-
-    openModal({
-      title: "إضافة سيارة",
-      bodyNode: wrap,
-      actions: [
-        { text: "إلغاء", kind: "ghost" },
-        {
-          text: "حفظ",
-          kind: "good",
-          primary: true,
-          onClick: async () => {
-            const plate = $('[name="plate"]', wrap).value.trim();
-            const model = $('[name="model"]', wrap).value.trim();
-            if (!plate) return toast("تنبيه", "اكتبي اللوحة") || false;
-
-            const car = { id: uid(), customerId, plate, model };
-            state.data.cars.unshift(car);
-            await saveAll();
-
-            pushHistory(
-              `إضافة سيارة: ${plate}`,
-              async () => { state.data.cars = state.data.cars.filter(x => x.id !== car.id); await saveAll(); },
-              async () => { state.data.cars.unshift(car); await saveAll(); }
-            );
-
-            draft.clear();
-            toast("تم", "تمت إضافة السيارة");
-            render();
-          }
-        }
-      ]
-    });
-  }
-
-  // ---------- Create Work Order ----------
-  function openCreateWorkOrder() {
-    const wrap = document.createElement("div");
-    wrap.innerHTML = `
-      <div class="row">
-        <div class="field">
-          <label>اسم الزبون</label>
-          <input name="customerName" placeholder="مثال: علي كريم" />
-        </div>
-        <div class="field">
-          <label>الهاتف (اختياري)</label>
-          <input name="customerPhone" placeholder="07xxxxxxxxx" />
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="field">
-          <label>لوحة السيارة</label>
-          <input name="plate" placeholder="مثال: بغداد 12345" />
-        </div>
-        <div class="field">
-          <label>موديل السيارة</label>
-          <input name="carModel" placeholder="مثال: Toyota Camry 2014" />
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="field">
-          <label>الخدمات (افصلها بفواصل)</label>
-          <input name="items" placeholder="تبديل دهن, تبديل فلتر" />
-        </div>
-        <div class="field">
-          <label>المبلغ الإجمالي</label>
-          <input name="total" type="number" placeholder="23000" />
-        </div>
-      </div>
-
-      <div class="field">
-        <label>ملاحظات</label>
-        <textarea name="notes" placeholder="اكتبي ملاحظات…"></textarea>
-      </div>
-
-      <div class="muted">✅ Draft تلقائي • ✅ Ctrl+S للحفظ • ✅ يدعم التراجع Undo</div>
-    `;
-    const draft = bindDraft(wrap, "createWO");
-
-    openModal({
-      title: "أمر عمل جديد",
-      bodyNode: wrap,
-      actions: [
-        { text: "إلغاء", kind: "ghost" },
-        {
-          text: "حفظ",
-          kind: "good",
-          primary: true,
-          onClick: async () => {
-            const customerName = $('[name="customerName"]', wrap).value.trim() || "زبون";
-            const customerPhone = $('[name="customerPhone"]', wrap).value.trim();
-            const plate = $('[name="plate"]', wrap).value.trim() || "—";
-            const carModel = $('[name="carModel"]', wrap).value.trim();
-            const itemsRaw = $('[name="items"]', wrap).value.trim();
-            const total = Number($('[name="total"]', wrap).value || 0);
-            const notes = $('[name="notes"]', wrap).value.trim();
-
-            const items = itemsRaw
-              ? itemsRaw.split(",").map(s => s.trim()).filter(Boolean).map(name => ({ name, price: 0 }))
-              : [];
-
-            // نحاول نطابق الأسعار من كتالوج الخدمات
-            items.forEach(it => {
-              const svc = state.data.services.find(s => s.name === it.name);
-              if (svc) it.price = svc.price || 0;
-            });
-
-            const computedTotal = total || items.reduce((a,b)=>a+(b.price||0),0);
-
-            const wo = {
-              id: uid(),
-              createdAt: Date.now(),
-              updatedAt: Date.now(),
-              status: "new",
-              customerId: null,
-              carId: null,
-              customerName,
-              customerPhone,
-              plate,
-              carModel,
-              notes,
-              items,
-              total: computedTotal,
-            };
-
-            state.data.workOrders.unshift(wo);
-            await saveAll();
-
-            pushHistory(
-              `إضافة أمر عمل: ${plate}`,
-              async () => { state.data.workOrders = state.data.workOrders.filter(x => x.id !== wo.id); await saveAll(); },
-              async () => { state.data.workOrders.unshift(wo); await saveAll(); }
-            );
-
-            draft.clear();
-            toast("تم", "تم إنشاء أمر العمل");
-            goto("#/workorders");
-          }
-        }
-      ]
-    });
-  }
-
-  // ---------- Open Work Order ----------
-  function openWorkOrder(id) {
-    const w = state.data.workOrders.find(x => x.id === id);
-    if (!w) return toast("خطأ", "أمر العمل غير موجود");
-
-    const wrap = document.createElement("div");
-    wrap.innerHTML = `
-      <div class="grid">
-        <div class="card" style="grid-column: span 7; box-shadow:none">
-          <div class="cardHeader">
-            <div>
-              <div class="cardTitle">${escapeHTML(w.plate)} — ${escapeHTML(w.customerName)}</div>
-              <div class="muted">${escapeHTML(statusLabel(w.status))} • ${fmtDate(w.updatedAt || w.createdAt)}</div>
-            </div>
-            <span class="pill good">${fmtIQD(w.total || 0)}</span>
-          </div>
-          <div class="hr"></div>
-          <div class="row">
-            <div class="field">
-              <label>الحالة</label>
-              <select name="status">
-                <option value="new">جديد</option>
-                <option value="in_progress">قيد العمل</option>
-                <option value="waiting_parts">بانتظار قطع</option>
-                <option value="ready">جاهز</option>
-                <option value="delivered">مُسلّم</option>
-              </select>
-            </div>
-            <div class="field">
-              <label>المبلغ</label>
-              <input name="total" type="number" />
-            </div>
-          </div>
-
-          <div class="field">
-            <label>الخدمات</label>
-            <input name="items" />
-          </div>
-
-          <div class="field">
-            <label>ملاحظات</label>
-            <textarea name="notes"></textarea>
-          </div>
-        </div>
-
-        <div class="card" style="grid-column: span 5; box-shadow:none">
-          <div class="cardTitle">إجراءات</div>
-          <div class="hr"></div>
-          <button class="btn full" id="makeInv">تحويل إلى فاتورة</button>
-          <div style="height:10px"></div>
-          <button class="btn ghost full" id="copyLink">نسخ رابط</button>
-          <div style="height:10px"></div>
-          <button class="btn danger full" id="delWO">حذف أمر العمل</button>
-
-          <div class="hr"></div>
-          <div class="muted">✅ يدعم Undo/Redo على تغيير الحالة والحذف.</div>
-        </div>
-      </div>
-    `;
-
-    const sel = $('[name="status"]', wrap);
-    const total = $('[name="total"]', wrap);
-    const items = $('[name="items"]', wrap);
-    const notes = $('[name="notes"]', wrap);
-
-    sel.value = w.status;
-    total.value = w.total || 0;
-    items.value = (w.items || []).map(x => x.name).join(", ");
-    notes.value = w.notes || "";
-
-    const draft = bindDraft(wrap, "editWO:" + w.id);
-
-    const saveEdit = async () => {
-      const prev = { ...w, items: [...(w.items||[])] };
-      const newStatus = sel.value;
-      const newTotal = Number(total.value || 0);
-      const itemsRaw = items.value.trim();
-      const newItems = itemsRaw
-        ? itemsRaw.split(",").map(s => s.trim()).filter(Boolean).map(name => {
-          const svc = state.data.services.find(s => s.name === name);
-          return { name, price: svc?.price || 0 };
-        })
-        : [];
-
-      w.status = newStatus;
-      w.total = newTotal || newItems.reduce((a,b)=>a+(b.price||0),0);
-      w.items = newItems;
-      w.notes = notes.value.trim();
-      w.updatedAt = Date.now();
-
-      await saveAll();
-
-      pushHistory(
-        `تعديل أمر العمل (${w.plate})`,
-        async () => { Object.assign(w, prev); await saveAll(); },
-        async () => {
-          Object.assign(w, { status: newStatus, total: w.total, items: newItems, notes: w.notes, updatedAt: Date.now() });
-          await saveAll();
-        }
-      );
-
-      draft.clear();
-      toast("تم", "تم حفظ التعديلات");
-      render();
-    };
-
-    $("#makeInv", wrap).onclick = async () => {
-      const inv = await makeInvoiceFromWorkOrder(w.id);
-      if (!inv) return;
-      closeModal();
-      goto(`#/invoice/${inv.id}`);
-    };
-
-    $("#copyLink", wrap).onclick = async () => {
-      const link = `${location.origin}${location.pathname}#/workorders`;
-      try {
-        await navigator.clipboard.writeText(link);
-        toast("تم", "تم نسخ رابط النظام");
-      } catch {
-        toast("ملاحظة", "ما نكدر ننسخ بهالمتصفح");
-      }
-    };
-
-    $("#delWO", wrap).onclick = async () => {
-      const prev = w;
-      state.data.workOrders = state.data.workOrders.filter(x => x.id !== w.id);
-      await saveAll();
-
-      pushHistory(
-        `حذف أمر العمل ${prev.plate}`,
-        async () => { state.data.workOrders.unshift(prev); await saveAll(); },
-        async () => { state.data.workOrders = state.data.workOrders.filter(x => x.id !== prev.id); await saveAll(); }
-      );
-
-      toast("تم", "تم حذف أمر العمل");
-      closeModal();
-      render();
-    };
-
-    openModal({
-      title: "تفاصيل أمر العمل",
-      bodyNode: wrap,
-      actions: [
-        { text: "إغلاق", kind: "ghost" },
-        { text: "حفظ (Ctrl+S)", kind: "good", primary: true, onClick: saveEdit }
-      ]
-    });
-  }
-
-  async function makeInvoiceFromWorkOrder(workOrderId) {
-    const w = state.data.workOrders.find(x => x.id === workOrderId);
-    if (!w) return null;
-
-    const subtotal = (w.items || []).reduce((a,b)=>a+(b.price||0),0) || (w.total || 0);
-    const inv = {
-      id: uid(),
-      invoiceNo: "INV-" + String(Math.floor(Math.random() * 90000) + 10000),
-      date: Date.now(),
-      customerName: w.customerName,
-      customerPhone: w.customerPhone || "",
-      plate: w.plate,
-      carModel: w.carModel || "",
-      items: (w.items || []).map(x => ({ name: x.name, price: x.price || 0 })),
-      discount: 0,
-      subtotal,
-      total: subtotal,
-      paid: subtotal,
-      notes: "شكراً لزيارتكم ❤️",
-    };
-
-    state.data.invoices.unshift(inv);
-    await saveAll();
-
-    pushHistory(
-      `تحويل أمر عمل إلى فاتورة (${w.plate})`,
-      async () => { state.data.invoices = state.data.invoices.filter(x => x.id !== inv.id); await saveAll(); },
-      async () => { state.data.invoices.unshift(inv); await saveAll(); }
-    );
-
-    toast("تم", `تم إنشاء فاتورة: ${inv.invoiceNo}`);
-    return inv;
-  }
-
-  // ---------- Create Invoice from Cart ----------
-  function openCreateInvoiceFromCart() {
-    if (state.cart.length === 0) {
-      toast("السلة فارغة", "روحي للخدمات واضيفي عناصر");
-      goto("#/services");
-      return;
-    }
-
-    const wrap = document.createElement("div");
-    const total = state.cart.reduce((a,b)=>a+(b.price||0),0);
-    wrap.innerHTML = `
-      <div class="row">
-        <div class="field">
-          <label>اسم الزبون</label>
-          <input name="customerName" placeholder="مثال: علي كريم" />
-        </div>
-        <div class="field">
-          <label>الهاتف</label>
-          <input name="customerPhone" placeholder="07xxxxxxxxx" />
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="field">
-          <label>لوحة السيارة</label>
-          <input name="plate" placeholder="بغداد 12345" />
-        </div>
-        <div class="field">
-          <label>موديل السيارة</label>
-          <input name="carModel" placeholder="Toyota Camry 2014" />
-        </div>
-      </div>
-
-      <div class="row">
-        <div class="field">
-          <label>خصم</label>
-          <input name="discount" type="number" value="0" />
-        </div>
-        <div class="field">
-          <label>مدفوع</label>
-          <input name="paid" type="number" value="${total}" />
-        </div>
-      </div>
-
-      <div class="field">
-        <label>ملاحظة</label>
-        <input name="notes" value="شكراً لزيارتكم ❤️" />
-      </div>
-
-      <div class="hr"></div>
-      <div class="card" style="box-shadow:none">
-        <div class="cardTitle">محتوى السلة</div>
-        <div class="hr"></div>
-        <div>${state.cart.map(it => `
-          <div class="row" style="justify-content:space-between">
-            <span>${escapeHTML(it.name)}</span>
-            <span class="pill">${fmtIQD(it.price||0)}</span>
-          </div>
-        `).join("")}</div>
-        <div class="hr"></div>
-        <div class="row" style="justify-content:space-between">
-          <span class="cardTitle">المجموع</span>
-          <span class="pill good">${fmtIQD(total)}</span>
-        </div>
-      </div>
-    `;
-
-    const draft = bindDraft(wrap, "createInvoice");
-
-    openModal({
-      title: "إنشاء فاتورة من السلة",
-      bodyNode: wrap,
-      actions: [
-        { text: "إلغاء", kind: "ghost" },
-        {
-          text: "حفظ",
-          kind: "good",
-          primary: true,
-          onClick: async () => {
-            const customerName = $('[name="customerName"]', wrap).value.trim() || "زبون";
-            const customerPhone = $('[name="customerPhone"]', wrap).value.trim();
-            const plate = $('[name="plate"]', wrap).value.trim() || "—";
-            const carModel = $('[name="carModel"]', wrap).value.trim();
-            const discount = Number($('[name="discount"]', wrap).value || 0);
-            const paid = Number($('[name="paid"]', wrap).value || 0);
-            const notes = $('[name="notes"]', wrap).value.trim();
-
-            const subtotal = state.cart.reduce((a,b)=>a+(b.price||0),0);
-            const totalFinal = Math.max(0, subtotal - discount);
-
-            const inv = {
-              id: uid(),
-              invoiceNo: "INV-" + String(Math.floor(Math.random() * 90000) + 10000),
-              date: Date.now(),
-              customerName,
-              customerPhone,
-              plate,
-              carModel,
-              items: state.cart.map(x => ({ name: x.name, price: x.price || 0 })),
-              discount,
-              subtotal,
-              total: totalFinal,
-              paid,
-              notes,
-            };
-
-            state.data.invoices.unshift(inv);
-
-            const prevCart = [...state.cart];
-            state.cart = [];
-            await saveAll();
-
-            pushHistory(
-              `إنشاء فاتورة من السلة (${inv.invoiceNo})`,
-              async () => {
-                state.data.invoices = state.data.invoices.filter(x => x.id !== inv.id);
-                state.cart = prevCart;
-                await saveAll();
-              },
-              async () => {
-                state.data.invoices.unshift(inv);
-                state.cart = [];
-                await saveAll();
-              }
-            );
-
-            draft.clear();
-            toast("تم", `تم إنشاء الفاتورة: ${inv.invoiceNo}`);
-            goto(`#/invoice/${inv.id}`);
-          }
-        }
-      ]
-    });
-  }
-
-  // ---------- Settings ----------
-  function openSettings() {
-    const wrap = document.createElement("div");
-    wrap.innerHTML = `
-      <div class="grid">
-        <div class="card" style="grid-column: span 6; box-shadow:none">
-          <div class="cardTitle">المظهر</div>
-          <div class="hr"></div>
-          <div class="row">
-            <button class="btn ghost" id="setDark">Dark</button>
-            <button class="btn ghost" id="setLight">Light</button>
-          </div>
-          <div class="hr"></div>
-          <div class="field">
-            <label>لون رئيسي (Accent)</label>
-            <input type="color" id="accentPick" value="${escapeHTML(state.settings.accent)}" style="height:44px;padding:6px" />
-          </div>
-        </div>
-
-        <div class="card" style="grid-column: span 6; box-shadow:none">
-          <div class="cardTitle">ميزات</div>
-          <div class="hr"></div>
-          <div class="row">
-            <button class="btn ghost" id="toggleSound">${state.settings.sound ? "🔊 الصوت: ON" : "🔇 الصوت: OFF"}</button>
-            <button class="btn ghost" id="toggleVoice">${state.settings.voice ? "🎙️ الصوتي: ON" : "🎙️ الصوتي: OFF"}</button>
-          </div>
-          <div class="hr"></div>
-          <div class="muted">Ctrl+K لوحة أوامر • Ctrl+Z تراجع • Ctrl+Y إعادة • Ctrl+S حفظ داخل النوافذ</div>
-        </div>
-
-        <div class="card" style="grid-column: span 12; box-shadow:none">
-          <div class="cardTitle">البيانات</div>
-          <div class="hr"></div>
-          <div class="row">
-            <button class="btn" id="exportJSON">تصدير JSON</button>
-            <button class="btn ghost" id="importJSON">استيراد JSON</button>
-            <button class="btn ghost" id="exportCSV">تصدير CSV (فواتير)</button>
-            <button class="btn danger" id="resetAll">تصفير كل شيء</button>
-          </div>
-          <div class="hr"></div>
-          <div class="muted">ملاحظة: الاستيراد يستبدل البيانات الحالية.</div>
-        </div>
-      </div>
-    `;
-
-    $("#setDark", wrap).onclick = async () => { applyTheme("dark"); await saveAll(); toast("تم", "Dark"); };
-    $("#setLight", wrap).onclick = async () => { applyTheme("light"); await saveAll(); toast("تم", "Light"); };
-
-    $("#accentPick", wrap).oninput = async (e) => {
-      applyAccent(e.target.value);
-      await saveAll();
-    };
-
-    $("#toggleSound", wrap).onclick = async () => {
-      state.settings.sound = !state.settings.sound;
-      await saveAll();
-      toast("تم", `الصوت: ${state.settings.sound ? "ON" : "OFF"}`);
-      openSettings(); // تحديث سريع
-    };
-
-    $("#toggleVoice", wrap).onclick = async () => {
-      state.settings.voice = !state.settings.voice;
-      await saveAll();
-      toast("تم", `الصوتي: ${state.settings.voice ? "ON" : "OFF"}`);
-      openSettings();
-    };
-
-    $("#exportJSON", wrap).onclick = () => exportJSON();
-    $("#importJSON", wrap).onclick = () => triggerImport();
-    $("#exportCSV", wrap).onclick = () => exportCSV();
-
-    $("#resetAll", wrap).onclick = async () => {
-      // تأكيد بسيط
-      if (!confirm("متأكدة تريدين تصفير كل البيانات؟")) return;
-      await Promise.all(["customers","cars","workOrders","invoices","services","cart"].map(k => idbDel(k)));
-      state.data.customers = [];
-      state.data.cars = [];
-      state.data.workOrders = [];
-      state.data.invoices = [];
-      state.data.services = seedServices();
-      state.cart = [];
-      await saveAll();
-      toast("تم", "تم تصفير البيانات");
-      render();
-    };
-
-    openModal({
-      title: "الإعدادات",
-      bodyNode: wrap,
-      actions: [{ text: "إغلاق", kind: "ghost" }]
-    });
-  }
-
-  // ---------- Export / Import ----------
-  function exportJSON() {
-    const payload = {
-      exportedAt: nowISO(),
-      settings: state.settings,
-      data: state.data,
-      cart: state.cart,
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    downloadBlob(blob, `rpm-export-${Date.now()}.json`);
-    toast("تم", "تم تصدير JSON");
-  }
-
-  function triggerImport() {
-    const inp = $("#fileImport");
-    inp.value = "";
-    inp.click();
-  }
-
-  async function importJSONFile(file) {
-    const txt = await file.text();
-    const obj = JSON.parse(txt);
-
-    if (!obj?.data) throw new Error("ملف غير صالح");
-
-    const prev = {
-      settings: { ...state.settings },
-      data: JSON.parse(JSON.stringify(state.data)),
-      cart: [...state.cart],
-    };
-
-    state.settings = { ...state.settings, ...(obj.settings || {}) };
-    state.data = obj.data;
-    state.cart = obj.cart || [];
-
-    await saveAll();
-
-    pushHistory(
-      "استيراد بيانات",
-      async () => { state.settings = prev.settings; state.data = prev.data; state.cart = prev.cart; await saveAll(); },
-      async () => { state.settings = { ...state.settings, ...(obj.settings || {}) }; state.data = obj.data; state.cart = obj.cart || []; await saveAll(); }
-    );
-
-    applyTheme(state.settings.theme);
-    applyAccent(state.settings.accent);
-
-    toast("تم", "تم الاستيراد");
-    render();
-  }
-
-  function exportCSV() {
-    const rows = [...state.data.invoices].sort((a,b)=> (b.date||0)-(a.date||0));
-    const header = ["invoiceNo","date","customerName","customerPhone","plate","carModel","subtotal","discount","total","paid"];
-    const lines = [header.join(",")];
-
-    rows.forEach(i => {
-      const line = [
-        i.invoiceNo,
-        new Date(i.date).toISOString(),
-        csvEscape(i.customerName),
-        csvEscape(i.customerPhone),
-        csvEscape(i.plate),
-        csvEscape(i.carModel),
-        i.subtotal || 0,
-        i.discount || 0,
-        i.total || 0,
-        i.paid || 0,
-      ].join(",");
-      lines.push(line);
-    });
-
-    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
-    downloadBlob(blob, `rpm-invoices-${Date.now()}.csv`);
-    toast("تم", "تم تصدير CSV");
-  }
-
-  function csvEscape(v) {
-    const s = String(v ?? "");
-    if (/[,"\n]/.test(s)) return `"${s.replaceAll('"', '""')}"`;
-    return s;
-  }
-
-  function downloadBlob(blob, filename) {
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 400);
-  }
-
-  // ---------- QR Scanner (Camera) ----------
-  async function openScanner() {
-    const wrap = document.createElement("div");
-    wrap.innerHTML = `
-      <div class="card" style="box-shadow:none">
-        <div class="cardTitle">مسح QR بالكاميرا</div>
-        <div class="muted">سيطلب إذن الكاميرا. إذا المتصفح ما يدعم BarcodeDetector راح يظهر تنبيه.</div>
-        <div class="hr"></div>
-        <div style="position:relative; border-radius:22px; overflow:hidden; border:1px solid var(--border); background:#000">
-          <video id="v" autoplay playsinline style="width:100%; height:360px; object-fit:cover"></video>
-          <div style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center; pointer-events:none">
-            <div style="width:min(240px,70%); height:min(240px,70%); border-radius:18px; border:2px solid rgba(124,92,255,.8); box-shadow:0 0 0 999px rgba(0,0,0,.25) inset"></div>
-          </div>
-        </div>
-        <div class="hr"></div>
-        <div class="row">
-          <span class="pill" id="scanStatus">جاهز…</span>
-        </div>
-      </div>
-    `;
-
-    let stream = null;
-    let stopped = false;
-
-    const modal = openModal({
-      title: "ماسح QR",
-      bodyNode: wrap,
-      actions: [
-        { text: "إغلاق", kind: "ghost", onClick: async () => { stopped = true; stop(); } }
-      ]
-    });
-
-    const statusEl = $("#scanStatus", wrap);
-
-    const hasDetector = "BarcodeDetector" in window;
-    if (!hasDetector) {
-      statusEl.textContent = "المتصفح لا يدعم BarcodeDetector";
-      toast("تنبيه", "جرّبي Chrome حديث");
-      return;
-    }
-
-    try {
-      stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false });
-      const video = $("#v", wrap);
-      video.srcObject = stream;
-      statusEl.textContent = "يتم المسح…";
-      const detector = new BarcodeDetector({ formats: ["qr_code"] });
-
-      const tick = async () => {
-        if (stopped) return;
-        try {
-          const codes = await detector.detect(video);
-          if (codes?.length) {
-            const raw = codes[0].rawValue || "";
-            statusEl.textContent = "تم العثور على QR ✅";
-            toast("QR", raw);
-            // إذا الرابط يحتوي #/invoice/<id> ننقله
-            const m = raw.match(/#\/invoice\/([a-zA-Z0-9_-]+)/);
-            if (m) {
-              closeModal();
-              goto(`#/invoice/${m[1]}`);
-              stop();
-              return;
-            }
-          }
-        } catch {}
-        requestAnimationFrame(tick);
+        toast("تم إنشاء الفاتورة", "good");
+        modal.close();
       };
-      requestAnimationFrame(tick);
 
-    } catch (e) {
-      statusEl.textContent = "تعذّر فتح الكاميرا";
-      toast("خطأ", "تحققي من إذن الكاميرا");
-    }
-
-    function stop() {
-      try {
-        stream?.getTracks()?.forEach(t => t.stop());
-      } catch {}
-    }
-  }
-
-  // ---------- Voice Commands ----------
-  function startVoice() {
-    if (!state.settings.voice) {
-      toast("الصوتي OFF", "فعّليه من الإعدادات");
-      return;
-    }
-
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-      toast("غير مدعوم", "المتصفح لا يدعم SpeechRecognition");
-      return;
-    }
-
-    const rec = new SR();
-    rec.lang = "ar-IQ";
-    rec.interimResults = false;
-    rec.maxAlternatives = 1;
-
-    toast("🎙️", "تكلّمي… مثال: افتح الفواتير | أمر عمل جديد | ابحث عن علي");
-
-    rec.onresult = (e) => {
-      const text = e.results?.[0]?.[0]?.transcript?.trim() || "";
-      if (!text) return;
-      handleVoice(text);
-    };
-    rec.onerror = () => toast("خطأ", "تعذر استخدام المايك");
-    rec.start();
-  }
-
-  function handleVoice(text) {
-    const t = text.replace(/[ًٌٍَُِّْ]/g, "").trim();
-    const low = t.toLowerCase();
-
-    if (low.includes("افتح") && low.includes("الرئيسية")) return goto("#/dashboard");
-    if (low.includes("افتح") && (low.includes("اوامر") || low.includes("العمل"))) return goto("#/workorders");
-    if (low.includes("افتح") && low.includes("الخدمات")) return goto("#/services");
-    if (low.includes("افتح") && low.includes("الزبائن")) return goto("#/customers");
-    if (low.includes("افتح") && low.includes("الفواتير")) return goto("#/invoices");
-
-    if (low.includes("امر عمل") && (low.includes("جديد") || low.includes("اضافة"))) return openCreateWorkOrder();
-    if (low.includes("ابحث")) {
-      const q = t.replace(/ابحث( عن)?/g, "").trim();
-      return openPalette(q);
-    }
-
-    // fallback
-    openPalette(t);
-  }
-
-  // ---------- Global bindings ----------
-  function bindGlobal() {
-    // sidebar toggle
-    $("#btnToggleSidebar").onclick = () => document.body.classList.toggle("sidebarOpen");
-    $("#sidebar").addEventListener("click", (e) => {
-      const a = e.target.closest("a");
-      if (a && window.matchMedia("(max-width: 980px)").matches) {
-        document.body.classList.remove("sidebarOpen");
+      if(isEdit){
+        $("#mPrint").onclick = ()=>{
+          const updated = state.data.invoices.find(x=> x.id===inv.id) || inv;
+          printInvoice(updated);
+        };
       }
-    });
+    }
+  });
 
-    // quick actions
-    $("#btnQuickWO").onclick = () => openCreateWorkOrder();
-    $("#btnQuickInvoice").onclick = () => openCreateInvoiceFromCart();
-    $("#btnScan").onclick = () => openScanner();
-    $("#btnVoice").onclick = () => startVoice();
-    $("#btnSettings").onclick = () => openSettings();
-    $("#btnSettingsSide").onclick = () => openSettings();
-
-    // theme toggle
-    $("#btnTheme").onclick = async () => {
-      const next = (state.settings.theme === "dark") ? "light" : "dark";
-      applyTheme(next);
-      await saveAll();
-      toast("تم", `الثيم: ${next}`);
-    };
-
-    // global search input: يفتح palette
-    $("#globalSearch").addEventListener("focus", () => openPalette($("#globalSearch").value));
-    $("#globalSearch").addEventListener("keydown", (e) => {
-      if (e.key === "Enter") openPalette($("#globalSearch").value);
-    });
-
-    // export/import quick
-    $("#btnExport").onclick = () => exportJSON();
-    $("#btnImport").onclick = () => triggerImport();
-
-    // Import file handler
-    $("#fileImport").addEventListener("change", async (e) => {
-      const file = e.target.files?.[0];
-      if (!file) return;
-      try {
-        await importJSONFile(file);
-      } catch {
-        toast("خطأ", "ملف الاستيراد غير صالح");
-      }
-    });
-
-    // keyboard shortcuts
-    window.addEventListener("keydown", (e) => {
-      // Ctrl+K
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        openPalette();
-      }
-      // Ctrl+Z / Ctrl+Y
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
-        e.preventDefault();
-        undo();
-      }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "y") {
-        e.preventDefault();
-        redo();
-      }
-    });
-
-    // first interaction -> startup sound
-    window.addEventListener("pointerdown", () => playStartupSound(), { once: true });
+  function itemRow(it, idx){
+    const line = (Number(it.qty||0)*Number(it.price||0));
+    return `
+      <tr>
+        <td><input class="input" data-f="name" value="${escapeHtml(it.name||"")}" placeholder="مثال: فلتر دهن"/></td>
+        <td style="width:120px"><input class="input" data-f="qty" type="number" min="0" step="1" value="${escapeHtml(String(it.qty ?? 1))}"/></td>
+        <td style="width:160px"><input class="input" data-f="price" type="number" min="0" step="250" value="${escapeHtml(String(it.price ?? 0))}"/></td>
+        <td style="width:180px"><span data-line>${escapeHtml(fmtIQD.format(line))}</span></td>
+        <td style="width:60px"><button class="iconBtn" data-delrow title="حذف">🗑️</button></td>
+      </tr>
+    `;
   }
-
-  // ---------- Init ----------
-  async function init() {
-    $("#loading").style.display = "flex";
-
-    await registerSW();
-    await loadAll();
-
-    bindGlobal();
-
-    // أول رندر
-    if (!location.hash) location.hash = "#/dashboard";
-    render();
-    window.addEventListener("hashchange", render);
-
-    // close loading with small delay (skeleton effect)
-    setTimeout(() => { $("#loading").style.display = "none"; }, 450);
-
-    // إظهار حالة Offline/Online
-    window.addEventListener("online", () => toast("Online", "اتصال موجود"));
-    window.addEventListener("offline", () => toast("Offline", "بدون إنترنت — النظام يشتغل محلياً"));
-  }
-
-  init();
 }
+
+// Print Invoice (تصميم أرقى)
+function printInvoice(inv){
+  const s = getSettings();
+  const company = s.company || {};
+  const invoice = s.invoice || {};
+  const now = new Date();
+
+  const sub = inv.subTotal || inv.subTotal===0 ? inv.subTotal : (inv.items||[]).reduce((a,b)=>a+(Number(b.qty||0)*Number(b.price||0)),0);
+  const tax = inv.tax || 0;
+  const total = inv.total || (sub + tax);
+
+  const safe = (x)=> escapeHtml(x||"—");
+
+  const html = `
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>${safe(inv.invoiceNo)} — فاتورة</title>
+  <style>
+    *{box-sizing:border-box}
+    body{font-family: ui-sans-serif, system-ui, Tahoma, Arial; margin:0; background:#f6f7fb; color:#111}
+    .page{padding:22px}
+    .paper{
+      background:#fff; border:1px solid #e7e8ef; border-radius:16px; overflow:hidden;
+      box-shadow: 0 20px 70px rgba(0,0,0,.08);
+    }
+    .hdr{
+      padding:18px 18px 14px;
+      background: linear-gradient(135deg, #0b1220, #1b2b55);
+      color:#fff;
+      display:flex; gap:14px; align-items:flex-start; justify-content:space-between;
+    }
+    .brand{display:flex; gap:12px; align-items:center}
+    .mark{
+      width:44px; height:44px; border-radius:14px;
+      background: radial-gradient(circle at 30% 30%, #fff, #6aa7ff);
+      box-shadow: 0 0 24px rgba(106,167,255,.45);
+    }
+    .brand h1{margin:0; font-size:18px; letter-spacing:.3px}
+    .brand .sub{opacity:.85; font-size:12px; margin-top:3px}
+    .meta{ text-align:left; font-size:12px; opacity:.95 }
+    .meta b{font-size:14px}
+    .body{padding:16px 18px}
+    .grid{display:grid; gap:12px; grid-template-columns: 1fr 1fr}
+    .box{
+      border:1px solid #e7e8ef; border-radius:14px; padding:12px;
+      background: linear-gradient(180deg, #fff, #fbfbfe);
+    }
+    .box h3{margin:0 0 8px; font-size:12px; color:#4a5a7a}
+    .box .row{display:flex; justify-content:space-between; gap:10px; font-size:13px; margin:4px 0}
+    table{width:100%; border-collapse:collapse; margin-top:12px; overflow:hidden; border-radius:14px; border:1px solid #e7e8ef}
+    th,td{padding:10px 10px; border-bottom:1px solid #eef0f6; text-align:right; font-size:13px}
+    th{background:#f4f6fb; color:#4a5a7a; font-weight:700}
+    .totals{margin-top:12px; display:flex; justify-content:flex-end}
+    .sum{
+      width: min(360px, 100%);
+      border:1px solid #e7e8ef; border-radius:14px; padding:12px; background:#fbfbfe;
+    }
+    .sum .r{display:flex; justify-content:space-between; margin:6px 0; font-size:13px}
+    .sum .r strong{font-size:14px}
+    .foot{
+      padding:12px 18px 18px;
+      display:flex; justify-content:space-between; gap:12px; align-items:flex-end;
+      color:#4a5a7a; font-size:12px;
+    }
+    .tag{
+      display:inline-block; padding:6px 10px; border-radius:999px; font-size:12px;
+      border:1px solid #e7e8ef; background:#f4f6fb;
+    }
+    .tag.paid{background:#e9fbf1; border-color:#bff0d3; color:#0e7a3f}
+    .tag.unpaid{background:#fff7e6; border-color:#ffe0a8; color:#915b00}
+    .tag.draft{background:#eef1f8; border-color:#dde2f3}
+    .note{margin-top:10px; padding:10px 12px; border-radius:14px; border:1px dashed #d9ddee; background:#fbfbfe}
+    @page{margin:12mm}
+    @media print{
+      body{background:#fff}
+      .page{padding:0}
+      .paper{box-shadow:none; border:none}
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="paper">
+      <div class="hdr">
+        <div class="brand">
+          <div class="mark"></div>
+          <div>
+            <h1>${safe(company.name || "RPM — حسن الوليم")}</h1>
+            <div class="sub">${safe(company.address || "العراق")} • ${safe(company.phone || "")}</div>
+          </div>
+        </div>
+        <div class="meta">
+          <div>فاتورة خدمة</div>
+          <div><b>${safe(inv.invoiceNo || "—")}</b></div>
+          <div>${safe(fmtDate(inv.createdAt || now.getTime()))}</div>
+          <div style="margin-top:6px">
+            ${inv.status==="paid" ? `<span class="tag paid">مدفوعة</span>` :
+              inv.status==="unpaid" ? `<span class="tag unpaid">غير مدفوعة</span>` :
+              inv.status==="cancelled" ? `<span class="tag">ملغاة</span>` :
+              `<span class="tag draft">مسودة</span>`}
+          </div>
+        </div>
+      </div>
+
+      <div class="body">
+        <div class="grid">
+          <div class="box">
+            <h3>الزبون</h3>
+            <div class="row"><span>الاسم</span><span><b>${safe(inv.customerName)}</b></span></div>
+            <div class="row"><span>الهاتف</span><span>${safe(inv.customerPhone)}</span></div>
+          </div>
+          <div class="box">
+            <h3>السيارة</h3>
+            <div class="row"><span>اللوحة</span><span><b>${safe(inv.carPlate)}</b></span></div>
+            <div class="row"><span>الموديل</span><span>${safe(inv.carModel)}</span></div>
+          </div>
+        </div>
+
+        <table>
+          <thead>
+            <tr><th>الخدمة</th><th>الكمية</th><th>السعر</th><th>الإجمالي</th></tr>
+          </thead>
+          <tbody>
+            ${(inv.items||[]).map(it=>{
+              const line = (Number(it.qty||0)*Number(it.price||0));
+              return `<tr>
+                <td>${safe(it.name)}</td>
+                <td>${safe(it.qty)}</td>
+                <td>${safe(fmtIQD.format(Number(it.price||0)))}</td>
+                <td><b>${safe(fmtIQD.format(line))}</b></td>
+              </tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+
+        <div class="totals">
+          <div class="sum">
+            <div class="r"><span>الإجمالي الفرعي</span><span>${safe(fmtIQD.format(sub))}</span></div>
+            <div class="r"><span>الضريبة (${safe(inv.taxRate ?? 0)}%)</span><span>${safe(fmtIQD.format(tax))}</span></div>
+            <div class="r" style="border-top:1px dashed #e1e5f2; padding-top:8px; margin-top:8px">
+              <strong>المجموع</strong><strong>${safe(fmtIQD.format(total))}</strong>
+            </div>
+          </div>
+        </div>
+
+        ${inv.note ? `<div class="note"><b>ملاحظات:</b> ${safe(inv.note)}</div>` : ``}
+      </div>
+
+      <div class="foot">
+        <div>${safe(invoice.footerNote || "شكراً لثقتكم — نلتزم بأفضل خدمة.")}</div>
+        <div class="muted">توقيع/ختم: __________________</div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // طباعة تلقائية (اختياري)
+    setTimeout(()=> window.print(), 250);
+  </script>
+</body>
+</html>
+  `.trim();
+
+  const w = window.open("", "_blank");
+  if(!w){ toast("الرجاء السماح بفتح نافذة للطباعة", "warn"); return; }
+  w.document.open();
+  w.document.write(html);
+  w.document.close();
+}
+
+// Reports
+function renderReports(){
+  setTitle("التقارير", "ملخص + رسوم بيانية");
+
+  const inv = state.data.invoices || [];
+  const today = new Date();
+  const fromDefault = new Date(today.getFullYear(), today.getMonth(), today.getDate() - 14);
+  const params = new URLSearchParams(location.hash.split("?")[1]||"");
+  const from = params.get("from") || ymd(fromDefault);
+  const to = params.get("to") || ymd(today);
+
+  const fromTs = startOfDay(from);
+  const toTs = endOfDay(to);
+
+  const inRange = inv.filter(x=>{
+    const t = Number(x.createdAt || 0);
+    return t>=fromTs && t<=toTs;
+  });
+
+  const paid = inRange.filter(x=> x.status==="paid");
+  const unpaid = inRange.filter(x=> x.status==="unpaid" || x.status==="draft");
+
+  const revenue = paid.reduce((a,b)=> a + (b.total||0), 0);
+  const due = unpaid.reduce((a,b)=> a + (b.total||0), 0);
+  const avg = paid.length ? Math.round(revenue / paid.length) : 0;
+
+  // daily revenue series
+  const days = [];
+  for(let t=fromTs; t<=toTs; t+=86400000){
+    days.push(t);
+  }
+  const series = days.map(t=>{
+    const dayEnd = t + 86400000 - 1;
+    const v = paid.filter(x=> Number(x.createdAt||0)>=t && Number(x.createdAt||0)<=dayEnd)
+      .reduce((a,b)=> a + (b.total||0), 0);
+    return { t, v };
+  });
+
+  // top services
+  const svc = new Map();
+  inRange.forEach(x=>{
+    (x.items||[]).forEach(it=>{
+      const name = (it.name||"").trim() || "غير محدد";
+      const line = (Number(it.qty||0)*Number(it.price||0));
+      svc.set(name, (svc.get(name)||0)+line);
+    });
+  });
+  const topServices = [...svc.entries()].sort((a,b)=> b[1]-a[1]).slice(0,7);
+
+  $("#view").innerHTML = `
+    <div class="card pad">
+      <div class="row" style="justify-content:space-between; align-items:center">
+        <div>
+          <div style="font-weight:900">فلترة التاريخ</div>
+          <div class="muted small">اختاري المدة وشوفي النتائج فوراً</div>
+        </div>
+        <div class="row">
+          <div style="width:160px">
+            <label>من</label>
+            <input class="input" type="date" id="rFrom" value="${escapeHtml(from)}"/>
+          </div>
+          <div style="width:160px">
+            <label>إلى</label>
+            <input class="input" type="date" id="rTo" value="${escapeHtml(to)}"/>
+          </div>
+          <button class="btn" id="rApply">تطبيق</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid kpis" style="margin-top:12px">
+      <div class="card kpi">
+        <div class="h">إيراد (مدفوع)</div>
+        <div class="v">${escapeHtml(fmtIQD.format(revenue))}</div>
+        <div class="s">عدد المدفوعة: ${escapeHtml(fmtNum.format(paid.length))}</div>
+      </div>
+      <div class="card kpi">
+        <div class="h">مستحقات</div>
+        <div class="v">${escapeHtml(fmtIQD.format(due))}</div>
+        <div class="s">غير مدفوعة/مسودات: ${escapeHtml(fmtNum.format(unpaid.length))}</div>
+      </div>
+      <div class="card kpi">
+        <div class="h">متوسط الفاتورة (مدفوع)</div>
+        <div class="v">${escapeHtml(fmtIQD.format(avg))}</div>
+        <div class="s">يعطي صورة عن مستوى الشغل</div>
+      </div>
+      <div class="card kpi">
+        <div class="h">إجمالي الفواتير</div>
+        <div class="v">${escapeHtml(fmtNum.format(inRange.length))}</div>
+        <div class="s">ضمن الفترة المحددة</div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:12px; grid-template-columns: 1.2fr .8fr;">
+      <div class="card pad">
+        <div style="font-weight:900">الإيراد اليومي</div>
+        <div class="muted small">خط بسيط — بدون مكتبات</div>
+        <hr class="sep"/>
+        <canvas id="revChart" height="160" style="width:100%"></canvas>
+      </div>
+
+      <div class="card pad">
+        <div style="font-weight:900">أعلى الخدمات</div>
+        <div class="muted small">حسب مجموع البنود</div>
+        <hr class="sep"/>
+        ${topServices.length ? `
+          <table class="table">
+            <thead><tr><th>الخدمة</th><th>الإجمالي</th></tr></thead>
+            <tbody>
+              ${topServices.map(([name, val])=>`
+                <tr><td>${escapeHtml(name)}</td><td><b>${escapeHtml(fmtIQD.format(val))}</b></td></tr>
+              `).join("")}
+            </tbody>
+          </table>
+        ` : `<div class="empty">لا توجد بيانات كافية.</div>`}
+      </div>
+    </div>
+
+    <div class="card pad" style="margin-top:12px">
+      <div class="row" style="justify-content:space-between; align-items:center">
+        <div>
+          <div style="font-weight:900">تصدير التقارير (CSV)</div>
+          <div class="muted small">تصدير قائمة الفواتير ضمن الفترة</div>
+        </div>
+        <button class="btn" id="expCsv">تصدير CSV</button>
+      </div>
+    </div>
+  `;
+
+  $("#rApply").onclick = ()=>{
+    const f = $("#rFrom").value;
+    const t = $("#rTo").value;
+    location.hash = `#/reports?from=${encodeURIComponent(f)}&to=${encodeURIComponent(t)}`;
+  };
+
+  $("#expCsv").onclick = ()=>{
+    const rows = [
+      ["invoiceNo","status","customerName","customerPhone","carPlate","carModel","total","createdAt"],
+      ...inRange.map(x=>[
+        x.invoiceNo||"",
+        x.status||"",
+        x.customerName||"",
+        x.customerPhone||"",
+        x.carPlate||"",
+        x.carModel||"",
+        x.total||0,
+        x.createdAt||0
+      ])
+    ];
+    const csv = rows.map(r=> r.map(v=> `"${String(v).replaceAll('"','""')}"`).join(",")).join("\n");
+    downloadFile(`rpm_reports_${from}_to_${to}.csv`, csv, "text/csv;charset=utf-8");
+  };
+
+  drawLineChart($("#revChart"), series.map(x=> x.v));
+}
+
+function drawLineChart(canvas, values){
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width = canvas.clientWidth * devicePixelRatio;
+  const h = canvas.height = canvas.height * devicePixelRatio;
+  ctx.clearRect(0,0,w,h);
+
+  const pad = 16*devicePixelRatio;
+  const x0 = pad, y0 = pad, x1 = w-pad, y1 = h-pad;
+
+  const max = Math.max(1, ...values);
+  const min = 0;
+
+  // grid
+  ctx.globalAlpha = 0.35;
+  ctx.strokeStyle = "#8fb6ff";
+  ctx.lineWidth = 1*devicePixelRatio;
+  for(let i=0;i<4;i++){
+    const y = y0 + (i/3)*(y1-y0);
+    ctx.beginPath(); ctx.moveTo(x0,y); ctx.lineTo(x1,y); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // line
+  const n = values.length;
+  const px = (i)=> x0 + (i/(Math.max(1,n-1)))*(x1-x0);
+  const py = (v)=> y1 - ((v-min)/(max-min))*(y1-y0);
+
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 2*devicePixelRatio;
+  ctx.beginPath();
+  values.forEach((v,i)=>{
+    const x = px(i), y = py(v);
+    if(i===0) ctx.moveTo(x,y);
+    else ctx.lineTo(x,y);
+  });
+  ctx.stroke();
+
+  // points
+  ctx.fillStyle = "#6aa7ff";
+  values.forEach((v,i)=>{
+    const x = px(i), y = py(v);
+    ctx.beginPath(); ctx.arc(x,y, 3.5*devicePixelRatio, 0, Math.PI*2); ctx.fill();
+  });
+}
+
+// Settings
+function renderSettings(){
+  setTitle("الإعدادات", "Firebase + بيانات الورشة + نسخ احتياطي");
+
+  const s = getSettings();
+  const cfg = state.firebase.cfg;
+  const missing = (!cfg.apiKey || !cfg.messagingSenderId);
+
+  $("#view").innerHTML = `
+    <div class="grid" style="grid-template-columns: 1fr 1fr;">
+      <div class="card pad">
+        <div style="font-weight:900">بيانات الورشة</div>
+        <div class="muted small">تظهر في رأس الفاتورة</div>
+        <hr class="sep"/>
+
+        <div style="display:grid; gap:10px">
+          <div>
+            <label>اسم الورشة</label>
+            <input class="input" id="sName" value="${escapeHtml(s.company.name||"")}" />
+          </div>
+          <div class="formGrid">
+            <div>
+              <label>الهاتف</label>
+              <input class="input" id="sPhone" value="${escapeHtml(s.company.phone||"")}" />
+            </div>
+            <div>
+              <label>العنوان</label>
+              <input class="input" id="sAddr" value="${escapeHtml(s.company.address||"")}" />
+            </div>
+          </div>
+          <div class="formGrid">
+            <div>
+              <label>بادئة رقم الفاتورة (Prefix)</label>
+              <input class="input" id="sPrefix" value="${escapeHtml(s.invoice.prefix||"RPM")}" />
+            </div>
+            <div>
+              <label>ضريبة افتراضية (%)</label>
+              <input class="input" id="sTax" type="number" min="0" step="0.1" value="${escapeHtml(String(s.invoice.taxRate ?? 0))}" />
+            </div>
+          </div>
+          <div>
+            <label>نص أسفل الفاتورة</label>
+            <input class="input" id="sFooter" value="${escapeHtml(s.invoice.footerNote||"")}" />
+          </div>
+
+          <div class="row end">
+            <button class="btn" id="saveSettings">حفظ</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card pad">
+        <div style="font-weight:900">Firebase (مشروع rpm574)</div>
+        <div class="muted small">حتى يشتغل الويب لازم apiKey + messagingSenderId</div>
+        <hr class="sep"/>
+
+        ${missing ? `
+          <div class="empty" style="border-color: rgba(255,204,102,.35)">
+            <b>ناقص إعدادات Firebase.</b><br/>
+            روحي Firebase console → Project settings → Web app config وانسخي:
+            <div style="margin-top:8px" class="muted small">
+              apiKey + messagingSenderId
+            </div>
+          </div>
+          <hr class="sep"/>
+        ` : ``}
+
+        <div class="formGrid">
+          <div>
+            <label>apiKey</label>
+            <input class="input" id="fApiKey" value="${escapeHtml(cfg.apiKey||"")}" placeholder="AIza..." />
+          </div>
+          <div>
+            <label>messagingSenderId</label>
+            <input class="input" id="fSender" value="${escapeHtml(cfg.messagingSenderId||"")}" placeholder="1509..." />
+          </div>
+        </div>
+
+        <div class="formGrid" style="margin-top:10px">
+          <div>
+            <label>projectId</label>
+            <input class="input" id="fProj" value="${escapeHtml(cfg.projectId||"")}" />
+          </div>
+          <div>
+            <label>databaseURL</label>
+            <input class="input" id="fDbUrl" value="${escapeHtml(cfg.databaseURL||"")}" />
+          </div>
+        </div>
+
+        <div class="formGrid" style="margin-top:10px">
+          <div>
+            <label>authDomain</label>
+            <input class="input" id="fAuth" value="${escapeHtml(cfg.authDomain||"")}" />
+          </div>
+          <div>
+            <label>storageBucket</label>
+            <input class="input" id="fBucket" value="${escapeHtml(cfg.storageBucket||"")}" />
+          </div>
+        </div>
+
+        <div style="margin-top:10px">
+          <label>appId</label>
+          <input class="input" id="fAppId" value="${escapeHtml(cfg.appId||"")}" />
+        </div>
+
+        <div class="row end" style="margin-top:10px">
+          <button class="btn" id="saveFirebase">حفظ Firebase</button>
+          <button class="btn" id="reInit">إعادة ربط</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid" style="margin-top:12px; grid-template-columns: 1fr 1fr;">
+      <div class="card pad">
+        <div style="font-weight:900">نسخ احتياطي</div>
+        <div class="muted small">Export/Import JSON</div>
+        <hr class="sep"/>
+        <div class="row">
+          <button class="btn" id="expJson">تصدير JSON</button>
+          <button class="btn" id="impJson">استيراد JSON</button>
+          <button class="btn" id="seedDemo">بيانات تجريبية</button>
+        </div>
+        <input type="file" id="filePick" accept="application/json" style="display:none"/>
+        <div class="muted small" style="margin-top:10px">
+          التصدير يشمل: زبائن، سيارات، أوامر عمل، فواتير، إعدادات.
+        </div>
+      </div>
+
+      <div class="card pad">
+        <div style="font-weight:900">وضع التشغيل</div>
+        <div class="muted small">Firebase / محلي</div>
+        <hr class="sep"/>
+        <div class="row" style="justify-content:space-between">
+          <div>الحالة الحالية</div>
+          <div><b>${escapeHtml(state.mode)}</b></div>
+        </div>
+        <div class="row" style="justify-content:space-between; margin-top:8px">
+          <div>Firebase</div>
+          <div>${state.firebase.ready ? `<span class="tag good">متصل</span>` : `<span class="tag warn">غير جاهز</span>`}</div>
+        </div>
+        ${state.firebase.err ? `<div class="note" style="margin-top:10px; border:1px dashed #d9ddee; padding:10px; border-radius:14px">${escapeHtml(state.firebase.err)}</div>` : ``}
+      </div>
+    </div>
+  `;
+
+  $("#saveSettings").onclick = async ()=>{
+    const ns = getSettings();
+    ns.company.name = $("#sName").value.trim();
+    ns.company.phone = $("#sPhone").value.trim();
+    ns.company.address = $("#sAddr").value.trim();
+    ns.invoice.prefix = $("#sPrefix").value.trim() || "RPM";
+    ns.invoice.taxRate = Number($("#sTax").value||0);
+    ns.invoice.footerNote = $("#sFooter").value.trim();
+    await saveSettings(ns);
+  };
+
+  $("#saveFirebase").onclick = ()=>{
+    const newCfg = {
+      apiKey: $("#fApiKey").value.trim(),
+      messagingSenderId: $("#fSender").value.trim(),
+      projectId: $("#fProj").value.trim(),
+      databaseURL: $("#fDbUrl").value.trim(),
+      authDomain: $("#fAuth").value.trim(),
+      storageBucket: $("#fBucket").value.trim(),
+      appId: $("#fAppId").value.trim()
+    };
+    saveFirebaseConfig(newCfg);
+    state.firebase.cfg = loadFirebaseConfig();
+    toast("تم حفظ Firebase بالمتصفح", "good");
+  };
+
+  $("#reInit").onclick = async ()=>{
+    await initFirebase();
+    renderRoute();
+  };
+
+  $("#expJson").onclick = ()=>{
+    const payload = {
+      exportedAt: Date.now(),
+      data: {
+        customers: state.localDB.customers,
+        cars: state.localDB.cars,
+        workOrders: state.localDB.workOrders,
+        invoices: state.localDB.invoices,
+        services: state.localDB.services,
+        settings: state.localDB.settings,
+        meta: state.localDB.meta
+      }
+    };
+    downloadFile(`rpm_backup_${Date.now()}.json`, JSON.stringify(payload, null, 2), "application/json");
+  };
+
+  $("#impJson").onclick = ()=> $("#filePick").click();
+  $("#filePick").addEventListener("change", async (e)=>{
+    const file = e.target.files?.[0];
+    if(!file) return;
+    const txt = await file.text();
+    try{
+      const obj = JSON.parse(txt);
+      const d = obj.data || {};
+      // merge
+      state.localDB.customers = { ...(state.localDB.customers||{}), ...(d.customers||{}) };
+      state.localDB.cars = { ...(state.localDB.cars||{}), ...(d.cars||{}) };
+      state.localDB.workOrders = { ...(state.localDB.workOrders||{}), ...(d.workOrders||{}) };
+      state.localDB.invoices = { ...(state.localDB.invoices||{}), ...(d.invoices||{}) };
+      state.localDB.services = { ...(state.localDB.services||{}), ...(d.services||{}) };
+      state.localDB.settings = d.settings || state.localDB.settings;
+      state.localDB.meta = d.meta || state.localDB.meta;
+      saveLocalDB();
+
+      hydrateFromLocal();
+      toast("تم الاستيراد (محلياً).", "good");
+
+      // إذا Firebase شغال، نقدر ندزّ البيانات (اختياري)
+      if(state.firebase.ready){
+        if(confirm("تريدين رفع البيانات المستوردة إلى Firebase؟ (دمج)")){
+          await pushLocalToFirebase();
+          toast("تم رفع البيانات إلى Firebase", "good");
+        }
+      }
+      renderRoute();
+    }catch{
+      toast("ملف JSON غير صالح", "bad");
+    }finally{
+      e.target.value = "";
+    }
+  });
+
+  $("#seedDemo").onclick = async ()=>{
+    if(!confirm("إضافة بيانات تجريبية؟")) return;
+    await seedDemoData();
+    toast("تمت إضافة بيانات تجريبية", "good");
+    renderRoute();
+  };
+}
+
+async function pushLocalToFirebase(){
+  if(!state.firebase.ready) return;
+  // دمج إلى Firebase (بدون مسح الموجود)
+  const dbObj = state.localDB;
+
+  const mergeRoot = async (rootName, obj) => {
+    const entries = Object.entries(obj || {});
+    for(const [id, val] of entries){
+      await dbSet(`${rootName}/${id}`, val);
+    }
+  };
+
+  await mergeRoot("customers", dbObj.customers);
+  await mergeRoot("cars", dbObj.cars);
+  await mergeRoot("workOrders", dbObj.workOrders);
+  await mergeRoot("invoices", dbObj.invoices);
+  await mergeRoot("services", dbObj.services);
+  await dbSet("settings", dbObj.settings || getSettings());
+  await dbSet("meta", dbObj.meta || { counters:{ invoiceNo:1000 } });
+}
+
+function downloadFile(name, content, mime){
+  const blob = new Blob([content], { type: mime || "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=> URL.revokeObjectURL(url), 2500);
+}
+
+// Quick add
+function quickAddMenu(){
+  modal.open({
+    title:"إضافة سريعة",
+    bodyHtml: `
+      <div class="grid" style="grid-template-columns:1fr; gap:10px">
+        <button class="btn" id="q1">+ زبون</button>
+        <button class="btn" id="q2">+ سيارة</button>
+        <button class="btn" id="q3">+ أمر عمل</button>
+        <button class="btn" id="q4">+ فاتورة</button>
+      </div>
+    `,
+    footerHtml:`<button class="iconBtn" id="mCancel">إغلاق</button>`,
+    onMount(){
+      $("#mCancel").onclick = modal.close;
+      $("#q1").onclick = ()=>{ modal.close(); openCustomerEditor(); };
+      $("#q2").onclick = ()=>{ modal.close(); openCarEditor(); };
+      $("#q3").onclick = ()=>{ modal.close(); openWorkOrderEditor(); };
+      $("#q4").onclick = ()=>{ modal.close(); openInvoiceEditor(); };
+    }
+  });
+}
+
+// User menu
+function userMenu(){
+  const u = state.firebase.user;
+  modal.open({
+    title:"الحساب",
+    bodyHtml: `
+      <div class="card pad" style="background: rgba(255,255,255,.02)">
+        <div class="row" style="justify-content:space-between">
+          <div class="muted">الوضع</div><div><b>${escapeHtml(state.mode)}</b></div>
+        </div>
+        <div class="row" style="justify-content:space-between; margin-top:8px">
+          <div class="muted">Firebase</div><div>${state.firebase.ready ? "✅" : "❌"}</div>
+        </div>
+        <hr class="sep"/>
+        <div class="muted small">
+          ${u ? (u.isAnonymous ? "مستخدم مجهول (Anonymous)" : `مستخدم: ${escapeHtml(u.email||u.uid)}`) : "لا يوجد مستخدم"}
+        </div>
+      </div>
+    `,
+    footerHtml: `
+      <button class="iconBtn" id="mClose">إغلاق</button>
+      <button class="btn" id="mGoogle">Google</button>
+      <button class="btn" id="mAnon">Anonymous</button>
+      <button class="btn" id="mOut">Sign out</button>
+    `,
+    onMount(){
+      $("#mClose").onclick = modal.close;
+
+      $("#mGoogle").onclick = async ()=>{
+        if(!state.firebase.ready){ toast("Firebase غير جاهز", "bad"); return; }
+        try{
+          const { GoogleAuthProvider, signInWithPopup } = state.firebase.api;
+          const provider = new GoogleAuthProvider();
+          await signInWithPopup(state.firebase.auth, provider);
+          toast("تم تسجيل الدخول", "good");
+          modal.close();
+        }catch(e){
+          toast("فشل Google Login", "bad");
+        }
+      };
+      $("#mAnon").onclick = async ()=>{
+        if(!state.firebase.ready){ toast("Firebase غير جاهز", "bad"); return; }
+        try{
+          const { signInAnonymously } = state.firebase.api;
+          await signInAnonymously(state.firebase.auth);
+          toast("تم الدخول كمجهول", "good");
+          modal.close();
+        }catch{ toast("فشل الدخول", "bad"); }
+      };
+      $("#mOut").onclick = async ()=>{
+        if(!state.firebase.ready){ modal.close(); return; }
+        try{
+          const { signOut } = state.firebase.api;
+          await signOut(state.firebase.auth);
+          toast("تم تسجيل الخروج", "warn");
+          modal.close();
+        }catch{ toast("تعذر تسجيل الخروج", "bad"); }
+      };
+    }
+  });
+}
+
+// Demo data
+async function seedDemoData(){
+  const c1 = { name:"علي كريم", phone:"0770xxxxxxx", note:"زبون دائم", createdAt:Date.now()-86400000, updatedAt:Date.now()-86400000 };
+  const c2 = { name:"سجاد عباس", phone:"0780xxxxxxx", note:"", createdAt:Date.now()-43200000, updatedAt:Date.now()-43200000 };
+  const id1 = genId(), id2 = genId();
+  await dbSet(`customers/${id1}`, c1);
+  await dbSet(`customers/${id2}`, c2);
+
+  const v1id = genId();
+  await dbSet(`cars/${v1id}`, { plate:"بغداد 12345", model:"Camry 2020", customerId:id1, customerName:c1.name, note:"", createdAt:Date.now()-86000000, updatedAt:Date.now()-86000000 });
+
+  const nextNo = await dbNextInvoiceNo();
+  const invId = genId();
+  await dbSet(`invoices/${invId}`, {
+    invoiceNo:`RPM-${nextNo}`,
+    customerId:id1, customerName:c1.name, customerPhone:c1.phone,
+    carId:v1id, carPlate:"بغداد 12345", carModel:"Camry 2020",
+    items:[{name:"تبديل دهن", qty:1, price:25000},{name:"فلتر دهن", qty:1, price:10000}],
+    subTotal:35000, taxRate:0, tax:0, total:35000,
+    status:"paid", note:"", createdAt:Date.now()-40000000, updatedAt:Date.now()-40000000
+  });
+
+  hydrateFromLocal();
+}
+
+// ------------------ Boot ------------------
+function boot(){
+  bindNav();
+  window.addEventListener("hashchange", renderRoute);
+  if(!location.hash) location.hash = "#/dashboard";
+  renderRoute();
+
+  // Firebase init
+  initFirebase();
+}
+
+boot();
