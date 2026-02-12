@@ -2,54 +2,163 @@
 <html lang="ar" dir="rtl">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <meta name="theme-color" content="#0b1220" />
-  <title>RPM — Workshop</title>
-  <link rel="stylesheet" href="./styles.css" />
+  <title>RPM — نظام الورشة</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script type="module" src="app.js"></script>
 </head>
+
 <body>
-  <div class="appShell">
-    <aside class="sidebar" id="sidebar">
-      <div class="brand">
-        <div class="brandMark">
-          <span class="dot"></span>
-          <span class="txt" id="brandName">RPM</span>
+  <!-- Toast -->
+  <div id="toast" class="toast hidden" aria-live="polite"></div>
+
+  <!-- Auth Screen -->
+  <section id="authScreen" class="auth-screen">
+    <div class="auth-card">
+      <div class="auth-brand">
+        <div class="auth-logo" aria-hidden="true">RPM</div>
+        <div>
+          <div class="auth-title">RPM Workshop</div>
+          <div class="auth-sub">Firestore + Auth • واجهة فقط • لوحة إدارة ديناميكية</div>
         </div>
-        <div class="brandSub" id="brandSub">نظام إدارة الورشة — Firestore</div>
       </div>
 
-      <nav class="nav" id="nav"></nav>
+      <div class="hr"></div>
 
-      <div class="sideFoot">
-        <div class="pill" id="netPill">⏳ تهيئة...</div>
-        <div class="muted small" id="userPill">—</div>
+      <div class="grid2">
+        <div>
+          <label class="label">الإيميل</label>
+          <input id="authEmail" class="input" type="email" placeholder="name@email.com" autocomplete="email" />
+        </div>
+        <div>
+          <label class="label">كلمة المرور</label>
+          <input id="authPass" class="input" type="password" placeholder="••••••••" autocomplete="current-password" />
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:10px; justify-content:space-between; align-items:center">
+        <div class="mini">
+          <button id="btnSignIn" class="btn btn-primary">تسجيل دخول</button>
+          <button id="btnSignUp" class="btn">إنشاء حساب</button>
+        </div>
+        <div class="mini">
+          <span id="authRole" class="pill off">role: viewer</span>
+          <span id="authFb" class="pill off">Firestore: …</span>
+        </div>
+      </div>
+
+      <div id="authMsg" class="notice" style="margin-top:12px"></div>
+
+      <div class="hr"></div>
+
+      <div class="grid2">
+        <button id="btnEnterGuest" class="btn btn-soft">دخول قراءة فقط (إذا القواعد تسمح)</button>
+        <button id="btnBootstrap" class="btn">تهيئة القوالب والإعدادات</button>
+      </div>
+
+      <div class="small" style="margin-top:10px; color:var(--muted)">
+        <b>ملاحظة:</b> صلاحية المستخدم تُقرأ من <code>users/{uid}.role</code> (admin/manager/tech/viewer).
+      </div>
+    </div>
+  </section>
+
+  <!-- App Shell -->
+  <div id="appShell" class="app hidden">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="logo-wrap" aria-hidden="true">
+          <svg class="logo-svg" viewBox="0 0 64 64" aria-label="RPM Logo">
+            <circle cx="32" cy="32" r="28" fill="currentColor" opacity=".95"></circle>
+            <path d="M16 40c4-10 28-10 32 0" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+            <path d="M32 32 L48 24" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
+            <circle cx="32" cy="32" r="3" fill="#ffffff"/>
+            <text x="32" y="54" text-anchor="middle" font-size="14" fill="#ffffff" font-weight="900">RPM</text>
+          </svg>
+        </div>
+        <div>
+          <div class="brand-title" id="brandTitle">RPM Workshop</div>
+          <div class="brand-sub" id="brandSub">لوحة الإدارة • بيانات Firestore</div>
+        </div>
+      </div>
+
+      <nav class="nav" id="navList">
+        <!-- JS يبني القائمة من uiConfig/app.nav -->
+        <a href="#/dashboard" class="nav-item" data-route="dashboard">لوحة التحكم</a>
+        <a href="#/customers" class="nav-item" data-route="customers">الزباين</a>
+        <a href="#/cars" class="nav-item" data-route="cars">السيارات</a>
+        <a href="#/inventory" class="nav-item" data-route="inventory">المخزون</a>
+        <a href="#/orders" class="nav-item" data-route="orders">أوامر الشغل</a>
+        <a href="#/invoices" class="nav-item" data-route="invoices">الفواتير</a>
+        <a href="#/employees" class="nav-item" data-route="employees">الموظفين</a>
+        <a href="#/reports" class="nav-item" data-route="reports">التقارير</a>
+        <a href="#/settings" class="nav-item" data-route="settings">الإعدادات</a>
+        <a href="#/admin" class="nav-item" data-route="admin">Admin Studio</a>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="hint">بحث سريع:</div>
+        <input id="globalSearch" class="input" placeholder="زبون/لوحة/هاتف/فاتورة/أمر..." />
+
+        <div class="mini" style="margin-top:10px">
+          <button id="btnNew" class="btn btn-primary">+ جديد</button>
+          <button id="btnPrint" class="btn">طباعة</button>
+        </div>
+
+        <div class="hr"></div>
+
+        <div class="row" style="justify-content:space-between; align-items:center">
+          <div class="small">الحساب:</div>
+          <span class="badge" id="userBadge">—</span>
+        </div>
+
+        <div class="mini" style="margin-top:8px">
+          <button id="btnAccount" class="btn btn-soft">الحساب</button>
+          <button id="btnSignOut2" class="btn btn-danger">خروج</button>
+        </div>
+
+        <div class="small" style="margin-top:10px; color:var(--muted)">
+          <span class="dot" id="rtDot"></span>
+          <span id="rtText">Realtime: …</span>
+        </div>
       </div>
     </aside>
 
-    <div class="main">
+    <main class="main">
       <header class="topbar">
-        <button class="iconBtn mobileOnly" id="btnToggleSidebar" title="القائمة">☰</button>
-        <div class="topTitle">
-          <div class="title" id="pageTitle">لوحة التحكم</div>
-          <div class="subtitle" id="pageSubtitle">—</div>
+        <div class="top-left">
+          <button id="btnMenu" class="btn btn-icon" aria-label="Menu">☰</button>
+          <div class="page-title" id="pageTitle">لوحة التحكم</div>
         </div>
-
-        <div class="topActions">
-          <button class="btn" id="btnQuickAdd">+ إضافة</button>
-          <button class="iconBtn" id="btnSync" title="تحديث">⟳</button>
-          <button class="iconBtn" id="btnUser" title="الحساب">👤</button>
+        <div class="top-right">
+          <span class="pill" id="todayBadge">—</span>
+          <span class="pill" id="rolePill">viewer</span>
         </div>
       </header>
 
-      <main class="view" id="view"></main>
+      <section id="view" class="view"></section>
 
-      <footer class="mobileNav mobileOnly" id="mobileNav"></footer>
+      <footer class="footer">
+        <div class="small">
+          RPM — Front-end only • Firestore Collections: cars/customers/employees/departments/invoices/orders/inventory…
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <!-- Modal -->
+  <div id="modal" class="modal hidden" aria-hidden="true">
+    <div class="modal-card">
+      <div class="modal-head">
+        <div class="modal-title" id="modalTitle">—</div>
+        <button class="btn btn-icon" id="modalClose" aria-label="Close">✕</button>
+      </div>
+      <div class="modal-body" id="modalBody"></div>
+      <div class="modal-foot" id="modalFoot"></div>
     </div>
   </div>
 
-  <div id="modalRoot"></div>
-  <div id="toastRoot"></div>
-
-  <script type="module" src="./app.js"></script>
+  <!-- Print Frame -->
+  <iframe id="printFrame" class="print-frame" title="print"></iframe>
 </body>
 </html>
