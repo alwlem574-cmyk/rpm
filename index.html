@@ -1,23 +1,108 @@
+<!-- index.html -->
 <!doctype html>
 <html lang="ar" dir="rtl">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>RPM — Workshop ERP</title>
-  <link rel="stylesheet" href="styles.css" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <meta name="theme-color" content="#0b1220" />
+  <title>RPM — نظام الورشة</title>
+  <link rel="stylesheet" href="styles.css" />
+
+  <!-- Manifest (بدون ملف إضافي) -->
+  <link rel="manifest" href='data:application/manifest+json,{"name":"RPM","short_name":"RPM","lang":"ar","dir":"rtl","start_url":"./","display":"standalone","background_color":"#0b1220","theme_color":"#0b1220","description":"نظام ورشة سيارات (Front-end فقط)","categories":["business","productivity"]}' />
 </head>
 
 <body>
-  <div id="app"></div>
+  <div id="appShell" class="shell">
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true"></div>
+        <div class="brandTxt">
+          <div class="brandName">RPM</div>
+          <div class="brandSub">نظام الورشة</div>
+        </div>
+      </div>
 
-  <!-- Toast -->
-  <div id="toastHost" class="toastHost" aria-live="polite" aria-atomic="true"></div>
+      <nav class="nav">
+        <a class="navItem" href="#/dashboard" data-route="dashboard">
+          <span class="ic">🏠</span><span>الرئيسية</span>
+        </a>
+        <a class="navItem" href="#/workorders" data-route="workorders">
+          <span class="ic">🧰</span><span>أوامر العمل</span>
+        </a>
+        <a class="navItem" href="#/services" data-route="services">
+          <span class="ic">🛒</span><span>الخدمات والسلة</span>
+        </a>
+        <a class="navItem" href="#/customers" data-route="customers">
+          <span class="ic">👥</span><span>الزبائن</span>
+        </a>
+        <a class="navItem" href="#/invoices" data-route="invoices">
+          <span class="ic">🧾</span><span>الفواتير</span>
+        </a>
+      </nav>
 
-  <!-- Modal Host -->
-  <div id="modalHost" class="modalHost hidden"></div>
+      <div class="sideFooter">
+        <button class="btn ghost full" id="btnExport">تصدير البيانات</button>
+        <button class="btn ghost full" id="btnImport">استيراد بيانات</button>
+        <button class="btn ghost full" id="btnSettingsSide">الإعدادات</button>
+      </div>
+    </aside>
 
-  <!-- IMPORTANT: must be module -->
+    <!-- Main -->
+    <section class="main">
+      <!-- Topbar -->
+      <header class="topbar">
+        <button class="iconBtn" id="btnToggleSidebar" title="القائمة">☰</button>
+
+        <div class="searchBox" role="search">
+          <span class="kbdHint">Ctrl + K</span>
+          <input id="globalSearch" type="search" placeholder="بحث سريع… (أو Ctrl+K)" autocomplete="off" />
+        </div>
+
+        <div class="topActions">
+          <button class="btn" id="btnQuickWO" title="أمر عمل جديد">+ أمر عمل</button>
+          <button class="btn" id="btnQuickInvoice" title="فاتورة جديدة">+ فاتورة</button>
+          <button class="iconBtn" id="btnScan" title="مسح QR بالكاميرا">📷</button>
+          <button class="iconBtn" id="btnVoice" title="أوامر صوتية">🎙️</button>
+          <button class="iconBtn" id="btnTheme" title="تبديل الثيم">🌓</button>
+          <button class="iconBtn" id="btnSettings" title="الإعدادات">⚙️</button>
+        </div>
+      </header>
+
+      <main id="view" class="view" aria-live="polite"></main>
+
+      <!-- Bottom nav للموبايل -->
+      <nav class="bottomNav" id="bottomNav">
+        <a href="#/dashboard" data-route="dashboard">🏠<span>الرئيسية</span></a>
+        <a href="#/workorders" data-route="workorders">🧰<span>العمل</span></a>
+        <a href="#/services" data-route="services">🛒<span>الخدمات</span></a>
+        <a href="#/invoices" data-route="invoices">🧾<span>فواتير</span></a>
+        <a href="#/customers" data-route="customers">👥<span>زبائن</span></a>
+      </nav>
+    </section>
+  </div>
+
+  <!-- Loading -->
+  <div id="loading" class="loading">
+    <div class="loadingCard">
+      <div class="spinner"></div>
+      <div>
+        <div class="loadingTitle">RPM</div>
+        <div class="muted">جاري تجهيز النظام…</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toasts -->
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="true"></div>
+
+  <!-- Modal host -->
+  <div id="modalHost" class="modalHost" hidden></div>
+
+  <!-- hidden file input -->
+  <input id="fileImport" type="file" accept="application/json" hidden />
+
   <script type="module" src="app.js"></script>
 </body>
 </html>
