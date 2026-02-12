@@ -1037,9 +1037,10 @@ function bindAll(){
   bindAll();
   if(!ok){
     showAuth(true);
-    setMsg($("authMsg"), "تأكدي من apiKey داخل app_new.js", "err");
+   setMsg($("authMsg"), "تأكدي من apiKey داخل app.js", "err");
     return;
   }
   showAuth(true);
 })();
+
 
