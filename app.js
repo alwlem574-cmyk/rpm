@@ -1,4 +1,4 @@
-/* نظام الوليم RPM - V3 (Front-end only)
+/* نظام حسن الوليم RPM - V3 (Front-end only)
    - زباين + سيارات + سجل
    - تبديل دهن + عداد حالي/جاي + طباعة
    - تفاصيل أمر شغل + صرف قطع + أجور + فاتورة
@@ -50,7 +50,7 @@ const firebaseConfig = {
 const firebaseApp = initializeApp(firebaseConfig);
 const auth = getAuth(firebaseApp);
 
-// تمكين Cache دائم للويب (Single-tab) حسب الدوك citeturn4view0turn4view2
+// تمكين Cache دائم للويب (Single-tab) حسب الدوك
 const firestore = initializeFirestore(firebaseApp, {
   localCache: persistentLocalCache({ tabManager: persistentSingleTabManager() }),
 });
@@ -151,6 +151,20 @@ const Settings = {
     localStorage.setItem("alwaleem_rpm_" + key, JSON.stringify(value));
   },
 };
+
+const DEFAULT_SHOP = {
+  name: "نظام حسن الوليم RPM",
+  phone: "",
+  address: "",
+};
+
+function getShop() {
+  return Settings.get("shop", DEFAULT_SHOP);
+}
+function setShop(patch) {
+  const cur = getShop();
+  Settings.set("shop", { ...cur, ...patch });
+}
 
 const authState = {
   user: null,
@@ -393,7 +407,7 @@ function setTitle(route) {
     more: "المزيد",
     auth: "الحساب",
   };
-  $("#pageTitle").textContent = map[route] || "نظام الوليم RPM";
+  $("#pageTitle").textContent = map[route] || "نظام حسن الوليم RPM";
 }
 
 function setActiveNav(route) {
@@ -645,7 +659,7 @@ function printInvoice(inv, ctx) {
       <div class="print-wrap">
         <div class="print-header">
           <div>
-            <div class="print-brand">نظام الوليم RPM</div>
+            <div class="print-brand">${escapeHtml(getShop().name)}</div>
             <div class="print-sub">فاتورة تبديل دهن</div>
             <div class="print-sub">التاريخ: ${fmtDate(inv.createdAt)}</div>
           </div>
@@ -696,7 +710,7 @@ function printInvoice(inv, ctx) {
         </div>
       </div>
     `;
-    openPrintWindow("فاتورة تبديل دهن - نظام الوليم RPM", html);
+    openPrintWindow("فاتورة تبديل دهن - نظام حسن الوليم RPM", html);
     return;
   }
 
@@ -705,7 +719,8 @@ function printInvoice(inv, ctx) {
     <div class="print-wrap">
       <div class="print-header">
         <div>
-          <div class="print-brand">نظام الوليم RPM</div>
+          <div class="print-brand">${escapeHtml(getShop().name)}</div>
+          ${getShop().phone || getShop().address ? `<div class="print-sub" style="margin-top:4px">${escapeHtml([getShop().phone, getShop().address].filter(Boolean).join(" • "))}</div>` : ""}
           <div class="print-sub">فاتورة</div>
           <div class="print-sub">التاريخ: ${fmtDate(inv.createdAt)}</div>
         </div>
@@ -752,7 +767,7 @@ function printInvoice(inv, ctx) {
       </div>
     </div>
   `;
-  openPrintWindow("فاتورة - نظام الوليم RPM", html);
+  openPrintWindow("فاتورة - نظام حسن الوليم RPM", html);
 }
 
 /* ------------------------ Seed Demo ------------------------ */
@@ -1507,7 +1522,7 @@ async function createOilChangeInvoice() {
 async function exportAll() {
   const data = {};
   for (const s of Object.keys(stores)) data[s] = await dbAPI.getAll(s);
-  data._meta = { exportedAt: Date.now(), app: "نظام الوليم RPM", dbVer: DB_VER };
+  data._meta = { exportedAt: Date.now(), app: "نظام حسن الوليم RPM", dbVer: DB_VER };
   downloadText(`alwaleem_rpm_backup_${new Date().toISOString().slice(0,10)}.json`, JSON.stringify(data, null, 2));
 }
 
@@ -2761,6 +2776,17 @@ async function viewAuth() {
           <b>مهم:</b> حتى يشتغل التخزين السحابي لازم تفعّلين Firestore بالمشروع وتضبطين Rules على مسار <code>users/{uid}</code>.
           تگدرين تشتغلين محليًا بدون تسجيل دخول.
         </div>
+        <div class="hr"></div>
+        <div class="row" style="align-items:center; gap:10px; flex-wrap:wrap">
+          <div class="small">مسار السحابة:</div>
+          <select id="cloudScopeSelect" class="input" style="max-width:220px">
+            <option value="root">Root (مقترح)</option>
+            <option value="user">users/{uid}</option>
+          </select>
+          <button class="btn" data-act="setCloudScope">حفظ</button>
+          <span class="small">الحالي: <b>${escapeHtml(Settings.get("cloudScope","root"))}</b></span>
+        </div>
+
 
         <div class="hr"></div>
         <div class="row" style="align-items:center">
@@ -2827,6 +2853,34 @@ async function viewMore() {
         <a class="btn" href="#/backup">نسخ احتياطي</a>
       </div>
 
+      
+      <div class="hr"></div>
+      <div class="card subcard">
+        <div class="section-title">بيانات الكراج (تظهر بالطباعة)</div>
+        <div class="small">عدّلي الاسم/الهاتف/العنوان ثم احفظي. (تنعكس على فواتير الطباعة)</div>
+        <div class="hr"></div>
+
+        <div class="grid2">
+          <div>
+            <div class="small" style="margin:4px 2px">الاسم</div>
+            <input id="shopName" class="input" value="${escapeHtml(getShop().name)}" />
+          </div>
+          <div>
+            <div class="small" style="margin:4px 2px">الهاتف</div>
+            <input id="shopPhone" class="input" value="${escapeHtml(getShop().phone)}" placeholder="07xxxxxxxxx" />
+          </div>
+        </div>
+        <div style="height:10px"></div>
+        <div>
+          <div class="small" style="margin:4px 2px">العنوان</div>
+          <input id="shopAddress" class="input" value="${escapeHtml(getShop().address)}" placeholder="بغداد / ..." />
+        </div>
+
+        <div class="mini" style="margin-top:10px">
+          <button class="btn btn-primary" data-act="saveShop">حفظ بيانات الكراج</button>
+        </div>
+      </div>
+
       <div class="hr"></div>
       <div class="notice">
         إذا تحبين نضيف: تصميم طباعة أحلى (شعار/هاتف/عنوان)، أو ربط تبديل الدهن بالمخزون حتى ينخصم زيت/فلتر تلقائياً.
@@ -2871,6 +2925,10 @@ async function renderRoute() {
   if (route === "auth") html = await viewAuth();
 
   view.innerHTML = html;
+
+  // Prefill cloud scope select
+  const cs = $("#cloudScopeSelect");
+  if (cs) cs.value = Settings.get("cloudScope", "root");
 
   // Oil: auto-calc next odo
   if (route === "oil") {
@@ -2929,6 +2987,26 @@ document.addEventListener("click", async (e) => {
   const act = t?.dataset?.act;
   const id = t?.dataset?.id;
   const idx = t?.dataset?.idx;
+
+  // More: save garage info (print header)
+  if (act === "saveShop") {
+    const name = ($("#shopName")?.value || "").trim();
+    const phone = ($("#shopPhone")?.value || "").trim();
+    const address = ($("#shopAddress")?.value || "").trim();
+    setShop({ name: name || DEFAULT_SHOP.name, phone, address });
+    toast("تم حفظ بيانات الكراج ✅");
+    return;
+  }
+
+  // Auth: cloud scope (root vs users/{uid})
+  if (act === "setCloudScope") {
+    const v = $("#cloudScopeSelect")?.value || "root";
+    Settings.set("cloudScope", v);
+    toast("تم حفظ مسار السحابة ✅");
+    renderRoute();
+    return;
+  }
+
 
   if (act === "newCustomer") return createCustomer();
   if (act === "editCustomer") return editCustomer(id);
