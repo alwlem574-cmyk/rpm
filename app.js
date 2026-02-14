@@ -35,6 +35,14 @@ import {
   writeBatch,
 } from "https://www.gstatic.com/firebasejs/12.9.0/firebase-firestore.js";
 
+import {
+  getStorage,
+  ref as storageRef,
+  uploadString,
+  getDownloadURL,
+  deleteObject,
+} from "https://www.gstatic.com/firebasejs/12.9.0/firebase-storage.js";
+
 // Firebase config (rpm574)
 const firebaseConfig = {
   apiKey: "AIzaSyC0p4cqNHuqZs9_gNuKLl7nEY0MqRXbf_A",
@@ -54,6 +62,8 @@ const auth = getAuth(firebaseApp);
 const firestore = initializeFirestore(firebaseApp, {
   localCache: persistentLocalCache({ tabManager: persistentSingleTabManager() }),
 });
+const storage = getStorage(firebaseApp);
+
 
 // نخلي تسجيل الدخول يبقى محفوظ بالمتصفح
 setPersistence(auth, browserLocalPersistence).catch(() => {
@@ -74,6 +84,11 @@ const stores = {
   parts: "id",
   invoices: "id",
   employees: "id",
+  appointments: "id",
+  expenses: "id",
+  attachments: "id",
+  rbacUsers: "id",
+  rbacInvites: "id",
 };
 
 function uid() {
@@ -180,6 +195,11 @@ if (Settings.get("cloudScope", null) == null) Settings.set("cloudScope", "root")
 const CLOUD_COLLECTION_MAP = {
   vehicles: "cars",
   workOrders: "orders",
+  appointments: "appointments",
+  expenses: "expenses",
+  attachments: "attachments",
+  rbacUsers: "rbac_users",
+  rbacInvites: "rbac_invites",
   // customers: "customers",
   // employees: "employees",
   // invoices: "invoices",
@@ -199,7 +219,13 @@ function cloudBasePath() {
   return ""; // root
 }
 
+const CLOUD_ROOT_ONLY_STORES = new Set(["rbacUsers","rbacInvites"]);
+
 function cloudColPath(store) {
+  // RBAC لازم يبقى Root حتى يشتغل مهما كان cloudScope
+  if (CLOUD_ROOT_ONLY_STORES.has(store)) {
+    return cloudStoreName(store);
+  }
   const base = cloudBasePath();
   if (base == null) return null;
   return `${base}${cloudStoreName(store)}`;
@@ -367,7 +393,149 @@ async function syncCloudToLocal() {
 const state = {
   route: "dashboard",
   search: "",
+  role: "admin",
+  employeeId: "",
 };
+
+
+/* ======================== SYSTEM 4.5: Roles & Permissions (RBAC) ======================== */
+
+const ROLE_LABELS = {
+  admin: "مدير",
+  accountant: "محاسب",
+  reception: "استقبال",
+  technician: "فني",
+  pending: "غير مفعل",
+};
+
+const ROLE_ROUTES = {
+  admin: ["*"],
+  accountant: ["dashboard","orders","order","customers","customer","vehicles","vehicle","invoices","reports","expenses","backup","more","auth"],
+  reception: ["dashboard","checkin","appointments","orders","order","customers","customer","vehicles","vehicle","invoices","more","auth"],
+  technician: ["dashboard","appointments","orders","order","customers","customer","vehicles","vehicle","more","auth"],
+  pending: ["dashboard","more","auth"],
+};
+
+function normEmail(s) {
+  return String(s || "").trim().toLowerCase();
+}
+
+function currentRole() {
+  return state.role || "pending";
+}
+
+function roleLabel(r) {
+  return ROLE_LABELS[r] || r || "—";
+}
+
+function canAccessRoute(route) {
+  const r = currentRole();
+  const list = ROLE_ROUTES[r] || ROLE_ROUTES.pending;
+  return list.includes("*") || list.includes(route);
+}
+
+function applyNavPermissions() {
+  // Sidebar + bottom tabs
+  document.querySelectorAll("[data-route]").forEach(el => {
+    const r = el.dataset.route;
+    if (!r) return;
+    const ok = canAccessRoute(r);
+    el.classList.toggle("is-hidden", !ok);
+  });
+
+  // لو المستخدم داخل صفحة ممنوعة، رجعيه للداشبورد
+  const { route } = parseHash();
+  if (route && !canAccessRoute(route) && route !== "auth") {
+    location.hash = "#/dashboard";
+  }
+}
+
+async function getMyEmployeeId() {
+  if (state.employeeId) return state.employeeId;
+
+  const u = authState.user;
+  const email = normEmail(u?.email);
+  if (!email) return "";
+
+  const emps = await dbAPI.getAll("employees");
+  const me = emps.find(e => normEmail(e.email) === email);
+  if (me) {
+    state.employeeId = me.id;
+
+    // إذا سحابة: ثبتي الربط داخل RBAC للمرة الجاية
+    try {
+      if (authState.user) {
+        const uid = authState.user.uid;
+        const r = await cloudAPI.get("rbacUsers", uid);
+        if (r && !r.employeeId) {
+          r.employeeId = me.id;
+          await cloudAPI.put("rbacUsers", r);
+        }
+      }
+    } catch {}
+  }
+  return state.employeeId || "";
+}
+
+async function ensureRole() {
+  // Local بدون حساب = مدير افتراضياً
+  if (!authState.user) {
+    state.role = Settings.get("localRole", "admin");
+    state.employeeId = Settings.get("localEmployeeId", "");
+    applyNavPermissions();
+    return;
+  }
+
+  try {
+    const uid = authState.user.uid;
+    const email = normEmail(authState.user.email);
+
+    // 1) دور ثابت على UID
+    let rdoc = await cloudAPI.get("rbacUsers", uid);
+
+    // 2) إذا ما موجود: شيّكي دعوة بالإيميل
+    if (!rdoc && email) {
+      const inv = await cloudAPI.get("rbacInvites", email);
+      if (inv) {
+        rdoc = {
+          id: uid,
+          uid,
+          email,
+          role: inv.role || "reception",
+          employeeId: inv.employeeId || "",
+          createdAt: Date.now(),
+          createdBy: inv.createdBy || "",
+        };
+        await cloudAPI.put("rbacUsers", rdoc);
+        await cloudAPI.del("rbacInvites", email);
+      }
+    }
+
+    // 3) أول مستخدم بالنظام يصير Admin تلقائياً
+    if (!rdoc) {
+      const all = await cloudAPI.getAll("rbacUsers");
+      const first = !all.length;
+      rdoc = {
+        id: uid,
+        uid,
+        email,
+        role: first ? "admin" : "pending",
+        employeeId: "",
+        createdAt: Date.now(),
+      };
+      await cloudAPI.put("rbacUsers", rdoc);
+    }
+
+    state.role = rdoc.role || "pending";
+    state.employeeId = rdoc.employeeId || "";
+  } catch (e) {
+    // fallback إذا فشل الوصول
+    state.role = "admin";
+    state.employeeId = "";
+  }
+
+  applyNavPermissions();
+}
 
 function parseHash() {
   const raw = (location.hash || "#/dashboard").replace("#/", "");
@@ -392,6 +560,7 @@ function setTitle(route) {
   const map = {
     dashboard: "لوحة التحكم",
     checkin: "الاستقبال",
+    appointments: "المواعيد",
     orders: "أوامر الشغل",
     order: "تفاصيل أمر شغل",
     customers: "الزباين",
@@ -401,7 +570,9 @@ function setTitle(route) {
     oil: "تبديل دهن",
     inventory: "المخزون",
     invoices: "الفواتير",
+    expenses: "المصروفات",
     employees: "الموظفين",
+    roles: "الصلاحيات",
     reports: "التقارير",
     backup: "نسخ احتياطي",
     more: "المزيد",
@@ -1007,6 +1178,7 @@ async function createEmployee() {
     fields: [
       { name: "name", label: "اسم الموظف", required: true },
       { name: "phone", label: "الهاتف", type: "tel" },
+      { name: "email", label: "إيميل الدخول (اختياري)", type: "email", placeholder: "name@example.com" },
       { name: "specialty", label: "الاختصاص", placeholder: "ميكانيك / كهرباء..." },
       { name: "salaryType", label: "نوع الراتب", type: "select", options: [
         { value: "شهري", label: "شهري" },
@@ -1022,6 +1194,7 @@ async function createEmployee() {
     id: "emp_" + uid().slice(3),
     name: (v.name || "").trim(),
     phone: (v.phone || "").trim(),
+    email: normEmail(v.email || ""),
     specialty: (v.specialty || "").trim(),
     salaryType: (v.salaryType || "شهري").trim(),
     salaryAmount: Number(v.salaryAmount || 0),
@@ -1041,6 +1214,7 @@ async function editEmployee(id) {
     fields: [
       { name: "name", label: "اسم الموظف", required: true },
       { name: "phone", label: "الهاتف", type: "tel" },
+      { name: "email", label: "إيميل الدخول (اختياري)", type: "email", placeholder: "name@example.com" },
       { name: "specialty", label: "الاختصاص" },
       { name: "salaryType", label: "نوع الراتب", type: "select", options: [
         { value: "شهري", label: "شهري" },
@@ -1057,6 +1231,7 @@ async function editEmployee(id) {
   Object.assign(e, v);
   e.name = (e.name || "").trim();
   e.phone = (e.phone || "").trim();
+  e.email = normEmail(e.email || "");
   e.specialty = (e.specialty || "").trim();
   e.salaryType = (e.salaryType || "شهري").trim();
   e.salaryAmount = Number(e.salaryAmount || 0);
@@ -1552,6 +1727,820 @@ async function resetAll() {
 }
 
 /* ------------------------ Views ------------------------ */
+
+
+/* ======================== EXT: Appointments + Expenses + Attachments + Roles UI ======================== */
+
+const AP_STATUS_LABELS = {
+  scheduled: "مجدول",
+  done: "منجز",
+  cancelled: "ملغي",
+};
+
+function apPill(status) {
+  const s = (status || "scheduled").toLowerCase();
+  const label = AP_STATUS_LABELS[s] || status || "—";
+  const cls = s === "done" ? "ok" : s === "cancelled" ? "bad" : "progress";
+  return `<span class="pill ${cls}">${escapeHtml(label)}</span>`;
+}
+
+function storagePrefix() {
+  const scope = Settings.get("cloudScope", "root");
+  if (scope === "user") {
+    const base = userPath();
+    return base || "users/unknown";
+  }
+  return "root";
+}
+
+function ensureImageModal() {
+  if ($("#imgModal")) return;
+  document.body.insertAdjacentHTML(
+    "beforeend",
+    `
+    <div id="imgModal" class="modal hidden" role="dialog" aria-modal="true">
+      <div class="imgmodal-card">
+        <div class="modal-head">
+          <div>
+            <div class="modal-title" id="imTitle">صورة</div>
+            <div class="small" id="imSub" style="margin-top:4px"></div>
+          </div>
+          <button id="imClose" class="btn btn-icon" aria-label="Close">✕</button>
+        </div>
+        <div class="imgmodal-body">
+          <img id="imImg" alt="attachment" />
+        </div>
+      </div>
+    </div>
+    `
+  );
+
+  $("#imClose").addEventListener("click", () => $("#imgModal").classList.add("hidden"));
+  $("#imgModal").addEventListener("click", (e) => { if (e.target === $("#imgModal")) $("#imgModal").classList.add("hidden"); });
+}
+
+function openImageModal(src, title = "صورة", sub = "") {
+  ensureImageModal();
+  $("#imTitle").textContent = title;
+  $("#imSub").textContent = sub;
+  $("#imImg").src = src;
+  $("#imgModal").classList.remove("hidden");
+}
+
+function pickFiles({ accept = "image/*", multiple = true } = {}) {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = accept;
+    input.multiple = multiple;
+    input.onchange = () => resolve(Array.from(input.files || []));
+    input.click();
+  });
+}
+
+function fileToDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result || ""));
+    r.onerror = () => reject(r.error || new Error("FILE_READ_ERROR"));
+    r.readAsDataURL(file);
+  });
+}
+
+async function getAttachmentsFor(entityType, entityId) {
+  const all = await dbAPI.getAll("attachments");
+  return all
+    .filter(a => a.entityType === entityType && a.entityId === entityId)
+    .sort((a,b)=> (b.createdAt||0)-(a.createdAt||0));
+}
+
+async function renderAttachmentThumbs(entityType, entityId) {
+  const list = await getAttachmentsFor(entityType, entityId);
+  return list.map(att => {
+    const src = att.url || att.dataUrl || "";
+    const title = att.kind ? `(${att.kind})` : "";
+    return `
+      <div class="thumb-wrap">
+        <img class="thumb" src="${escapeHtml(src)}" alt="att" data-act="viewAttachment" data-id="${att.id}" />
+        <div class="thumb-actions">
+          <button class="btn" data-act="viewAttachment" data-id="${att.id}">عرض</button>
+          <button class="btn btn-danger" data-act="delAttachment" data-id="${att.id}">حذف</button>
+        </div>
+      </div>
+    `;
+  });
+}
+
+async function addAttachment(entityType, entityId, kind = "other") {
+  const files = await pickFiles({ accept: "image/*", multiple: true });
+  if (!files.length) return;
+
+  for (const f of files) {
+    const dataUrl = await fileToDataURL(f);
+    const att = {
+      id: "att_" + uid().slice(3),
+      entityType,
+      entityId,
+      kind,
+      name: f.name || "",
+      mime: f.type || "",
+      size: Number(f.size || 0),
+      createdAt: Date.now(),
+    };
+
+    if (cloudEnabled()) {
+      const path = `rpm/${storagePrefix()}/attachments/${entityType}/${entityId}/${att.id}`;
+      const r = storageRef(storage, path);
+      await uploadString(r, dataUrl, "data_url");
+      const url = await getDownloadURL(r);
+      att.storagePath = path;
+      att.url = url;
+    } else {
+      att.dataUrl = dataUrl;
+    }
+
+    await dbAPI.put("attachments", att);
+  }
+
+  toast("تم رفع المرفقات ✅");
+  renderRoute();
+}
+
+async function deleteAttachment(attId) {
+  const att = await dbAPI.get("attachments", attId);
+  if (!att) return;
+
+  if (!confirm("حذف المرفق؟")) return;
+
+  try {
+    if (cloudEnabled() && att.storagePath) {
+      await deleteObject(storageRef(storage, att.storagePath));
+    }
+  } catch {}
+
+  await dbAPI.del("attachments", attId);
+  toast("تم الحذف ✅");
+  renderRoute();
+}
+
+async function viewAttachment(attId) {
+  const att = await dbAPI.get("attachments", attId);
+  if (!att) return;
+  const src = att.url || att.dataUrl || "";
+  openImageModal(src, "مرفق", `${att.name || ""}`.trim());
+}
+
+/* ------------------------ Appointments ------------------------ */
+
+function buildWhenTs(dateStr, timeStr) {
+  // date: YYYY-MM-DD , time: HH:MM
+  const d = dateStr ? new Date(dateStr + "T00:00:00") : new Date();
+  let ts = d.getTime();
+  if (timeStr && /^\d{2}:\d{2}$/.test(timeStr)) {
+    const [hh, mm] = timeStr.split(":").map(n => Number(n));
+    ts += (hh * 60 + mm) * 60e3;
+  }
+  return ts;
+}
+
+async function createAppointment(prefill = {}) {
+  const vehicles = await dbAPI.getAll("vehicles");
+  const customers = await dbAPI.getAll("customers");
+  const employees = (await dbAPI.getAll("employees")).filter(e => e.active);
+
+  const vMap = new Map(vehicles.map(v => [v.id, v]));
+  const cMap = new Map(customers.map(c => [c.id, c]));
+
+  const vOptions = [
+    { value: "", label: "— اختاري سيارة —" },
+    ...vehicles
+      .sort((a,b)=> (a.plate||"").localeCompare(b.plate||"", "ar"))
+      .map(v => {
+        const c = cMap.get(v.customerId);
+        const label = `${v.plate || "—"} • ${[v.make,v.model,v.year].filter(Boolean).join(" ")} • ${c?.name||"—"}`;
+        return { value: v.id, label };
+      })
+  ];
+
+  const eOptions = [
+    { value: "", label: "— بدون —" },
+    ...employees
+      .sort((a,b)=>(a.name||"").localeCompare(b.name||"", "ar"))
+      .map(e => ({ value: e.id, label: `${e.name} • ${e.specialty||""}` }))
+  ];
+
+  const todayStr = new Date().toISOString().slice(0,10);
+
+  const initial = {
+    vehicleId: prefill.vehicleId || "",
+    date: prefill.date || todayStr,
+    time: prefill.time || "",
+    employeeId: prefill.employeeId || "",
+    status: prefill.status || "scheduled",
+    note: prefill.note || "",
+  };
+
+  const v = await formModal({
+    title: "موعد جديد",
+    subtitle: "تثبيت موعد للزبون/السيارة (ويمكن تحويله لأمر شغل)",
+    fields: [
+      { name: "vehicleId", label: "السيارة", type: "select", options: vOptions, required: true },
+      { name: "date", label: "التاريخ", type: "date", required: true },
+      { name: "time", label: "الوقت (اختياري)", type: "time" },
+      { name: "employeeId", label: "تعيين لفني (اختياري)", type: "select", options: eOptions },
+      { name: "status", label: "الحالة", type: "select", options: [
+        { value: "scheduled", label: "مجدول" },
+        { value: "done", label: "منجز" },
+        { value: "cancelled", label: "ملغي" },
+      ] },
+      { name: "note", label: "ملاحظة", type: "textarea", placeholder: "سبب الموعد / المشكلة..." },
+    ],
+    initial,
+    submitText: "حفظ الموعد",
+  });
+  if (!v) return;
+
+  const vv = vMap.get(v.vehicleId);
+  const ap = {
+    id: "ap_" + uid().slice(3),
+    vehicleId: v.vehicleId,
+    customerId: vv?.customerId || "",
+    employeeId: v.employeeId || "",
+    date: v.date,
+    time: v.time || "",
+    whenTs: buildWhenTs(v.date, v.time),
+    status: v.status || "scheduled",
+    note: v.note || "",
+    createdAt: Date.now(),
+  };
+
+  await dbAPI.put("appointments", ap);
+  toast("تم إضافة الموعد ✅");
+  renderRoute();
+}
+
+async function editAppointment(apId) {
+  const ap = await dbAPI.get("appointments", apId);
+  if (!ap) return;
+
+  const vehicles = await dbAPI.getAll("vehicles");
+  const customers = await dbAPI.getAll("customers");
+  const employees = (await dbAPI.getAll("employees")).filter(e => e.active);
+
+  const vMap = new Map(vehicles.map(v => [v.id, v]));
+  const cMap = new Map(customers.map(c => [c.id, c]));
+
+  const vOptions = [
+    { value: "", label: "— اختاري سيارة —" },
+    ...vehicles
+      .sort((a,b)=> (a.plate||"").localeCompare(b.plate||"", "ar"))
+      .map(v => {
+        const c = cMap.get(v.customerId);
+        const label = `${v.plate || "—"} • ${[v.make,v.model,v.year].filter(Boolean).join(" ")} • ${c?.name||"—"}`;
+        return { value: v.id, label };
+      })
+  ];
+
+  const eOptions = [
+    { value: "", label: "— بدون —" },
+    ...employees
+      .sort((a,b)=>(a.name||"").localeCompare(b.name||"", "ar"))
+      .map(e => ({ value: e.id, label: `${e.name} • ${e.specialty||""}` }))
+  ];
+
+  const v = await formModal({
+    title: "تعديل موعد",
+    fields: [
+      { name: "vehicleId", label: "السيارة", type: "select", options: vOptions, required: true },
+      { name: "date", label: "التاريخ", type: "date", required: true },
+      { name: "time", label: "الوقت", type: "time" },
+      { name: "employeeId", label: "الفني", type: "select", options: eOptions },
+      { name: "status", label: "الحالة", type: "select", options: [
+        { value: "scheduled", label: "مجدول" },
+        { value: "done", label: "منجز" },
+        { value: "cancelled", label: "ملغي" },
+      ] },
+      { name: "note", label: "ملاحظة", type: "textarea" },
+    ],
+    initial: ap,
+    submitText: "حفظ",
+  });
+  if (!v) return;
+
+  const vv = vMap.get(v.vehicleId);
+  Object.assign(ap, v);
+  ap.customerId = vv?.customerId || ap.customerId || "";
+  ap.whenTs = buildWhenTs(ap.date, ap.time);
+  await dbAPI.put("appointments", ap);
+  toast("تم التعديل ✅");
+  renderRoute();
+}
+
+async function deleteAppointment(apId) {
+  if (!confirm("حذف الموعد؟")) return;
+  await dbAPI.del("appointments", apId);
+  toast("تم الحذف ✅");
+  renderRoute();
+}
+
+async function appointmentToOrder(apId) {
+  const ap = await dbAPI.get("appointments", apId);
+  if (!ap) return;
+
+  // إنشاء أمر شغل جديد من الموعد
+  const wo = {
+    id: "wo_" + uid().slice(3),
+    customerId: ap.customerId,
+    vehicleId: ap.vehicleId,
+    employeeId: ap.employeeId || "",
+    status: "OPEN",
+    complaint: ap.note || "موعد صيانة",
+    notes: `تم التحويل من موعد بتاريخ ${ap.date} ${ap.time||""}`.trim(),
+    partLines: [],
+    laborLines: [],
+    createdAt: Date.now(),
+  };
+
+  await dbAPI.put("workOrders", wo);
+
+  ap.status = "done";
+  ap.linkedWorkOrderId = wo.id;
+  await dbAPI.put("appointments", ap);
+
+  toast("تم التحويل لأمر شغل ✅");
+  location.hash = `#/order?id=${encodeURIComponent(wo.id)}`;
+}
+
+/* ------------------------ Expenses ------------------------ */
+
+async function createExpense(prefill = {}) {
+  const todayStr = new Date().toISOString().slice(0,10);
+
+  const v = await formModal({
+    title: "مصروف جديد",
+    fields: [
+      { name: "date", label: "التاريخ", type: "date", required: true, default: todayStr },
+      { name: "amount", label: "المبلغ", type: "number", cast: "number", required: true, step: 0.01 },
+      { name: "category", label: "التصنيف", placeholder: "كهرباء / إيجار / قطع / رواتب..." },
+      { name: "method", label: "طريقة الدفع", type: "select", options: [
+        { value: "نقدي", label: "نقدي" },
+        { value: "بطاقة/تحويل", label: "بطاقة/تحويل" },
+        { value: "أخرى", label: "أخرى" },
+      ] },
+      { name: "note", label: "ملاحظة", type: "textarea" },
+    ],
+    initial: { date: todayStr, method: "نقدي", ...prefill },
+    submitText: "حفظ",
+  });
+  if (!v) return;
+
+  const exp = {
+    id: "exp_" + uid().slice(3),
+    date: v.date,
+    whenTs: buildWhenTs(v.date, "00:00"),
+    amount: Number(v.amount || 0),
+    category: (v.category || "").trim(),
+    method: (v.method || "نقدي").trim(),
+    note: (v.note || "").trim(),
+    createdAt: Date.now(),
+  };
+
+  await dbAPI.put("expenses", exp);
+  toast("تم إضافة المصروف ✅");
+  renderRoute();
+}
+
+async function editExpense(expId) {
+  const exp = await dbAPI.get("expenses", expId);
+  if (!exp) return;
+
+  const v = await formModal({
+    title: "تعديل مصروف",
+    fields: [
+      { name: "date", label: "التاريخ", type: "date", required: true },
+      { name: "amount", label: "المبلغ", type: "number", cast: "number", required: true, step: 0.01 },
+      { name: "category", label: "التصنيف" },
+      { name: "method", label: "طريقة الدفع", type: "select", options: [
+        { value: "نقدي", label: "نقدي" },
+        { value: "بطاقة/تحويل", label: "بطاقة/تحويل" },
+        { value: "أخرى", label: "أخرى" },
+      ] },
+      { name: "note", label: "ملاحظة", type: "textarea" },
+    ],
+    initial: exp,
+    submitText: "حفظ",
+  });
+  if (!v) return;
+
+  Object.assign(exp, v);
+  exp.amount = Number(exp.amount || 0);
+  exp.whenTs = buildWhenTs(exp.date, "00:00");
+  exp.category = (exp.category || "").trim();
+  exp.method = (exp.method || "نقدي").trim();
+  exp.note = (exp.note || "").trim();
+  await dbAPI.put("expenses", exp);
+  toast("تم التعديل ✅");
+  renderRoute();
+}
+
+async function deleteExpense(expId) {
+  if (!confirm("حذف المصروف؟")) return;
+  await dbAPI.del("expenses", expId);
+  toast("تم الحذف ✅");
+  renderRoute();
+}
+
+/* ------------------------ Views ------------------------ */
+
+async function viewAppointments() {
+  const appointments = await dbAPI.getAll("appointments");
+  const vehicles = await dbAPI.getAll("vehicles");
+  const customers = await dbAPI.getAll("customers");
+  const employees = await dbAPI.getAll("employees");
+
+  const vMap = new Map(vehicles.map(v=>[v.id,v]));
+  const cMap = new Map(customers.map(c=>[c.id,c]));
+  const eMap = new Map(employees.map(e=>[e.id,e]));
+
+  const q = (state.search || "").trim().toLowerCase();
+
+  let list = appointments
+    .sort((a,b)=> (b.whenTs||0)-(a.whenTs||0))
+    .filter(ap => {
+      if (!q) return true;
+      const v = vMap.get(ap.vehicleId);
+      const c = cMap.get(ap.customerId);
+      const e = ap.employeeId ? eMap.get(ap.employeeId) : null;
+      return (
+        (ap.note||"").toLowerCase().includes(q) ||
+        (v?.plate||"").toLowerCase().includes(q) ||
+        (c?.name||"").toLowerCase().includes(q) ||
+        (c?.phone||"").toLowerCase().includes(q) ||
+        (e?.name||"").toLowerCase().includes(q)
+      );
+    });
+
+  if (currentRole() === "technician") {
+    const myId = await getMyEmployeeId();
+    list = myId ? list.filter(ap => ap.employeeId === myId) : [];
+  }
+
+  return `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
+        <div>
+          <div class="section-title">المواعيد</div>
+          <div class="small">جدولة مواعيد + تحويلها لأوامر شغل</div>
+        </div>
+        <button class="btn btn-primary" data-act="newAppointment">+ موعد</button>
+      </div>
+
+      <div class="hr"></div>
+
+      ${list.length ? `
+        <table class="table">
+          <thead>
+            <tr>
+              <th>التاريخ</th>
+              <th>السيارة</th>
+              <th>الزبون</th>
+              <th>الفني</th>
+              <th>الملاحظة</th>
+              <th>الحالة</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${list.map(ap => {
+              const v = vMap.get(ap.vehicleId);
+              const c = cMap.get(ap.customerId);
+              const e = ap.employeeId ? eMap.get(ap.employeeId) : null;
+              return `
+                <tr>
+                  <td>${escapeHtml(ap.date || "")} ${escapeHtml(ap.time || "")}</td>
+                  <td><a href="#/vehicle?id=${encodeURIComponent(ap.vehicleId)}">${escapeHtml(v?.plate || "—")}</a></td>
+                  <td><a href="#/customer?id=${encodeURIComponent(ap.customerId)}">${escapeHtml(c?.name || "—")}</a></td>
+                  <td>${escapeHtml(e?.name || "—")}</td>
+                  <td class="small">${escapeHtml(ap.note || "")}</td>
+                  <td>${apPill(ap.status)}</td>
+                  <td style="white-space:nowrap">
+                    <button class="btn" data-act="editAppointment" data-id="${ap.id}">تعديل</button>
+                    <button class="btn btn-danger" data-act="delAppointment" data-id="${ap.id}">حذف</button>
+                    <button class="btn btn-soft" data-act="apToOrder" data-id="${ap.id}">تحويل</button>
+                  </td>
+                </tr>
+              `;
+            }).join("")}
+          </tbody>
+        </table>
+      ` : `<div class="notice">لا توجد مواعيد.</div>`}
+    </div>
+  `;
+}
+
+async function viewExpenses() {
+  const expenses = await dbAPI.getAll("expenses");
+  const today = new Date();
+  const startDay = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
+  const startMonth = new Date(today.getFullYear(), today.getMonth(), 1).getTime();
+  const endDay = startDay + 86400e3;
+
+  const todayExp = expenses.filter(x => x.whenTs>=startDay && x.whenTs<endDay).reduce((s,x)=> s + Number(x.amount||0), 0);
+  const monthExp = expenses.filter(x => x.whenTs>=startMonth).reduce((s,x)=> s + Number(x.amount||0), 0);
+
+  const q = (state.search || "").trim().toLowerCase();
+  const list = expenses
+    .sort((a,b)=> (b.whenTs||0)-(a.whenTs||0))
+    .filter(x => {
+      if (!q) return true;
+      return (
+        (x.category||"").toLowerCase().includes(q) ||
+        (x.note||"").toLowerCase().includes(q) ||
+        (x.method||"").toLowerCase().includes(q)
+      );
+    });
+
+  return `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
+        <div>
+          <div class="section-title">المصروفات</div>
+          <div class="small">سجل مصروفات الكراج</div>
+        </div>
+        <button class="btn btn-primary" data-act="newExpense">+ مصروف</button>
+      </div>
+
+      <div class="hr"></div>
+
+      <div class="cards">
+        <div class="card"><div class="card-title">مصروف اليوم</div><div class="card-value">${money(todayExp)}</div></div>
+        <div class="card"><div class="card-title">مصروف هذا الشهر</div><div class="card-value">${money(monthExp)}</div></div>
+        <div class="card"><div class="card-title">عدد القيود</div><div class="card-value">${list.length}</div></div>
+      </div>
+
+      <div class="hr"></div>
+
+      ${list.length ? `
+        <table class="table">
+          <thead>
+            <tr>
+              <th>التاريخ</th>
+              <th>المبلغ</th>
+              <th>التصنيف</th>
+              <th>الدفع</th>
+              <th>ملاحظة</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${list.map(x => `
+              <tr>
+                <td>${escapeHtml(x.date || "")}</td>
+                <td><b>${money(x.amount || 0)}</b></td>
+                <td>${escapeHtml(x.category || "—")}</td>
+                <td>${escapeHtml(x.method || "—")}</td>
+                <td class="small">${escapeHtml(x.note || "")}</td>
+                <td style="white-space:nowrap">
+                  <button class="btn" data-act="editExpense" data-id="${x.id}">تعديل</button>
+                  <button class="btn btn-danger" data-act="delExpense" data-id="${x.id}">حذف</button>
+                </td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>
+      ` : `<div class="notice">لا توجد مصروفات.</div>`}
+    </div>
+  `;
+}
+
+async function viewRoles() {
+  const u = authState.user;
+  if (!u) {
+    return `
+      <div class="card">
+        <div class="section-title">الصلاحيات</div>
+        <div class="notice">لازم تسجيل دخول حتى تدار الصلاحيات.</div>
+        <a class="btn btn-primary" href="#/auth">اذهب للحساب</a>
+      </div>
+    `;
+  }
+
+  const role = currentRole();
+
+  if (role !== "admin") {
+    return `
+      <div class="card">
+        <div class="section-title">الصلاحيات</div>
+        <div class="small">حسابك: <b>${escapeHtml(u.email || "")}</b></div>
+        <div style="height:10px"></div>
+        <div class="card subcard">
+          <div class="kv"><span>الدور الحالي</span><b>${escapeHtml(roleLabel(role))}</b></div>
+          <div style="height:8px"></div>
+          <div class="notice">إدارة الصلاحيات للمدير فقط.</div>
+        </div>
+      </div>
+    `;
+  }
+
+  const employees = await dbAPI.getAll("employees");
+  const eOptions = [
+    { value: "", label: "— ربط بموظف (اختياري) —" },
+    ...employees.sort((a,b)=>(a.name||"").localeCompare(b.name||"", "ar")).map(e => ({
+      value: e.id,
+      label: `${e.name} • ${e.specialty||""}`,
+    }))
+  ];
+
+  const invites = await cloudAPI.getAll("rbacInvites");
+  const users = await cloudAPI.getAll("rbacUsers");
+
+  const eMap = new Map(employees.map(e => [e.id, e]));
+
+  return `
+    <div class="card">
+      <div class="section-title">الصلاحيات</div>
+      <div class="small">إدارة دخول الموظفين (دعوات + أدوار)</div>
+      <div class="hr"></div>
+
+      <div class="card subcard">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
+          <div>
+            <div style="font-weight:900">إنشاء دعوة</div>
+            <div class="small">اكتب إيميل الموظف وحدد دوره (وبإمكانك ربطه بموظف من قائمة الموظفين)</div>
+          </div>
+          <button class="btn btn-primary" data-act="createInvite">إنشاء</button>
+        </div>
+
+        <div style="height:10px"></div>
+
+        <div class="grid2">
+          <div>
+            <div class="small" style="margin:4px 2px">الإيميل</div>
+            <input id="invEmail" class="input" type="email" placeholder="name@example.com" />
+          </div>
+          <div>
+            <div class="small" style="margin:4px 2px">الدور</div>
+            <select id="invRole" class="input">
+              <option value="reception">استقبال</option>
+              <option value="technician">فني</option>
+              <option value="accountant">محاسب</option>
+              <option value="admin">مدير</option>
+            </select>
+          </div>
+          <div style="grid-column:1/-1">
+            <div class="small" style="margin:4px 2px">ربط بموظف (اختياري)</div>
+            <select id="invEmp" class="input">
+              ${eOptions.map(o => `<option value="${escapeHtml(o.value)}">${escapeHtml(o.label)}</option>`).join("")}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <div class="hr"></div>
+
+      <div class="card subcard">
+        <div style="font-weight:900">الدعوات الحالية</div>
+        <div class="small">الدعوة تشتغل لما يسوي الموظف تسجيل دخول/إنشاء حساب بالإيميل.</div>
+        <div class="hr"></div>
+
+        ${invites.length ? `
+          <table class="table">
+            <thead>
+              <tr>
+                <th>الإيميل</th>
+                <th>الدور</th>
+                <th>الموظف</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${invites.sort((a,b)=>(a.email||"").localeCompare(b.email||"")).map(inv => `
+                <tr>
+                  <td>${escapeHtml(inv.email || inv.id || "")}</td>
+                  <td>${escapeHtml(roleLabel(inv.role))}</td>
+                  <td>${escapeHtml(eMap.get(inv.employeeId||"")?.name || "—")}</td>
+                  <td style="white-space:nowrap">
+                    <button class="btn btn-danger" data-act="revokeInvite" data-id="${escapeHtml(inv.id)}">حذف</button>
+                  </td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        ` : `<div class="notice">لا توجد دعوات.</div>`}
+      </div>
+
+      <div class="hr"></div>
+
+      <div class="card subcard">
+        <div style="font-weight:900">مستخدمين النظام</div>
+        <div class="small">تغيير الدور/الربط (يحفظ فوراً)</div>
+        <div class="hr"></div>
+
+        ${users.length ? `
+          <table class="table">
+            <thead>
+              <tr>
+                <th>الإيميل</th>
+                <th>الدور</th>
+                <th>ربط موظف</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${users.sort((a,b)=>(a.email||"").localeCompare(b.email||"")).map(ru => `
+                <tr>
+                  <td class="small">${escapeHtml(ru.email || "—")}</td>
+                  <td>
+                    <select class="input" data-role-uid="${escapeHtml(ru.id)}">
+                      <option value="reception" ${ru.role==="reception"?"selected":""}>استقبال</option>
+                      <option value="technician" ${ru.role==="technician"?"selected":""}>فني</option>
+                      <option value="accountant" ${ru.role==="accountant"?"selected":""}>محاسب</option>
+                      <option value="admin" ${ru.role==="admin"?"selected":""}>مدير</option>
+                      <option value="pending" ${ru.role==="pending"?"selected":""}>غير مفعل</option>
+                    </select>
+                  </td>
+                  <td>
+                    <select class="input" data-emp-uid="${escapeHtml(ru.id)}">
+                      ${eOptions.map(o => `<option value="${escapeHtml(o.value)}" ${(ru.employeeId||"")===(o.value||"") ? "selected" : ""}>${escapeHtml(o.label)}</option>`).join("")}
+                    </select>
+                  </td>
+                  <td style="white-space:nowrap">
+                    <button class="btn btn-primary" data-act="saveUserRole" data-id="${escapeHtml(ru.id)}">حفظ</button>
+                    ${ru.id === u.uid ? `<span class="small">(أنت)</span>` : ""}
+                  </td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        ` : `<div class="notice">لا يوجد مستخدمين بعد.</div>`}
+      </div>
+    </div>
+  `;
+}
+
+
+/* ------------------------ Roles actions ------------------------ */
+
+async function createInvite() {
+  if (currentRole() !== "admin") return toast("غير مسموح");
+
+  const email = normEmail($("#invEmail")?.value);
+  const role = $("#invRole")?.value || "reception";
+  const employeeId = $("#invEmp")?.value || "";
+
+  if (!email || !email.includes("@")) return toast("اكتب إيميل صحيح");
+
+  const inv = {
+    id: email,
+    email,
+    role,
+    employeeId,
+    createdAt: Date.now(),
+    createdBy: normEmail(authState.user?.email),
+  };
+
+  await cloudAPI.put("rbacInvites", inv);
+  toast("تم إنشاء الدعوة ✅");
+  renderRoute();
+}
+
+async function revokeInvite(invId) {
+  if (currentRole() !== "admin") return toast("غير مسموح");
+  if (!confirm("حذف الدعوة؟")) return;
+  await cloudAPI.del("rbacInvites", invId);
+  toast("تم الحذف ✅");
+  renderRoute();
+}
+
+async function saveUserRole(uid) {
+  if (currentRole() !== "admin") return toast("غير مسموح");
+
+  const roleSel = document.querySelector(`[data-role-uid="${CSS.escape(uid)}"]`);
+  const empSel = document.querySelector(`[data-emp-uid="${CSS.escape(uid)}"]`);
+  const role = roleSel?.value || "pending";
+  const employeeId = empSel?.value || "";
+
+  const rdoc = await cloudAPI.get("rbacUsers", uid);
+  if (!rdoc) return toast("ما لقيت المستخدم");
+
+  rdoc.role = role;
+  rdoc.employeeId = employeeId;
+  rdoc.updatedAt = Date.now();
+
+  await cloudAPI.put("rbacUsers", rdoc);
+
+  // لو عدلتي دورك أنتِ: حدّثي الواجهة فوراً
+  if (authState.user?.uid === uid) {
+    state.role = role;
+    state.employeeId = employeeId;
+    applyNavPermissions();
+  }
+
+  toast("تم الحفظ ✅");
+  renderRoute();
+}
+
+
 async function viewDashboard() {
   const workOrders = await dbAPI.getAll("workOrders");
   const invoices = await dbAPI.getAll("invoices");
@@ -1787,6 +2776,13 @@ async function viewOrders() {
       );
     });
 
+
+  let scoped = filtered;
+  if (currentRole() === "technician") {
+    const myId = await getMyEmployeeId();
+    scoped = myId ? filtered.filter(w => w.employeeId === myId) : [];
+  }
+
   return `
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
@@ -1799,7 +2795,7 @@ async function viewOrders() {
 
       <div class="hr"></div>
 
-      ${filtered.length ? `
+      ${scoped.length ? `
       <table class="table">
         <thead>
           <tr>
@@ -1813,7 +2809,7 @@ async function viewOrders() {
           </tr>
         </thead>
         <tbody>
-          ${filtered.map(w => {
+          ${scoped.map(w => {
             const c = cMap.get(w.customerId);
             const v = vMap.get(w.vehicleId);
             const e = w.employeeId ? eMap.get(w.employeeId) : null;
@@ -1845,6 +2841,14 @@ async function viewOrders() {
 async function viewOrderDetails(orderId) {
   const wo = await dbAPI.get("workOrders", orderId);
   if (!wo) return `<div class="card"><div class="notice">ما لقيت أمر الشغل.</div></div>`;
+
+  // صلاحيات الفني: يشوف أوامره فقط
+  if (currentRole() === "technician") {
+    const myId = await getMyEmployeeId();
+    if (!myId || wo.employeeId !== myId) {
+      return `<div class="card"><div class="notice">ما عندك صلاحية تشوف هذا الأمر.</div></div>`;
+    }
+  }
 
   const customer = await dbAPI.get("customers", wo.customerId);
   const vehicle = await dbAPI.get("vehicles", wo.vehicleId);
@@ -1987,11 +2991,30 @@ async function viewOrderDetails(orderId) {
             </div>
           </div>
         `).join("") : `<div class="notice">بعد ماكو أجور مضافة.</div>`}
+
+    <div class="hr"></div>
+
+    <div class="card subcard">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+        <div>
+          <div class="section-title">المرفقات</div>
+          <div class="small">صور قبل/بعد أو وصل — تُحفظ محلياً أو على Firebase Storage حسب وضع التخزين</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn" data-act="addAttachment" data-type="workOrder" data-kind="before" data-entity="${wo.id}">+ قبل</button>
+          <button class="btn" data-act="addAttachment" data-type="workOrder" data-kind="after" data-entity="${wo.id}">+ بعد</button>
+          <button class="btn btn-primary" data-act="addAttachment" data-type="workOrder" data-kind="other" data-entity="${wo.id}">+ مرفق</button>
+        </div>
+      </div>
+
+      <div class="gallery">
+        ${(await renderAttachmentThumbs("workOrder", wo.id)).join("") || `<div class="notice">لا توجد مرفقات.</div>`}
+      </div>
+    </div>
       </div>
     </div>
   `;
 }
-
 async function viewCustomers(params) {
   const customers = await dbAPI.getAll("customers");
   const vehicles = await dbAPI.getAll("vehicles");
@@ -2033,6 +3056,7 @@ async function viewCustomers(params) {
           <tr>
             <th>الاسم</th>
             <th>الهاتف</th>
+            <th>الإيميل</th>
             <th>عدد السيارات</th>
             <th>آخر زيارة</th>
             <th>إجراءات</th>
@@ -2257,6 +3281,7 @@ async function viewVehicleDetails(vehicleId) {
   const workOrders = (await dbAPI.getAll("workOrders")).filter(w => w.vehicleId === v.id).sort((a,b)=>b.createdAt-a.createdAt);
   const invoices = await dbAPI.getAll("invoices");
   const invByWO = new Map(invoices.map(i=>[i.workOrderId,i]));
+  const appointments = (await dbAPI.getAll("appointments")).filter(a => a.vehicleId === v.id).sort((a,b)=> (b.whenTs||0)-(a.whenTs||0));
 
   const oilInvoices = invoices
     .filter(i => i.invoiceType === "OIL")
@@ -2281,6 +3306,51 @@ async function viewVehicleDetails(vehicleId) {
 
       <div class="hr"></div>
 
+
+      <div class="card subcard">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
+          <div>
+            <div class="section-title">مواعيد السيارة</div>
+            <div class="small">موعد صيانة/فحص — يمكن تحويله لأمر شغل</div>
+          </div>
+          <button class="btn btn-primary" data-act="newAppointmentForVehicle" data-id="${v.id}">+ موعد</button>
+        </div>
+        <div class="hr"></div>
+        ${appointments.length ? appointments.slice(0, 12).map(ap => `
+          <div class="card subcard" style="margin-bottom:10px">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap">
+              <div>
+                <div style="font-weight:900">${fmtDate(ap.whenTs)} ${ap.time ? "• " + escapeHtml(ap.time) : ""}</div>
+                <div class="small">${escapeHtml(ap.note || "—")}</div>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                ${apPill(ap.status)}
+                <button class="btn" data-act="editAppointment" data-id="${ap.id}">تعديل</button>
+                <button class="btn btn-danger" data-act="delAppointment" data-id="${ap.id}">حذف</button>
+                <button class="btn btn-soft" data-act="apToOrder" data-id="${ap.id}">تحويل لأمر</button>
+              </div>
+            </div>
+          </div>
+        `).join("") : `<div class="notice">لا توجد مواعيد لهذه السيارة.</div>`}
+      </div>
+
+      <div class="hr"></div>
+
+      <div class="card subcard">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+          <div>
+            <div class="section-title">مرفقات السيارة</div>
+            <div class="small">صور/مستندات تخص السيارة</div>
+          </div>
+          <button class="btn btn-primary" data-act="addAttachment" data-type="vehicle" data-kind="other" data-entity="${v.id}">+ إضافة</button>
+        </div>
+
+        <div class="gallery">
+          ${(await renderAttachmentThumbs("vehicle", v.id)).join("") || `<div class="notice">لا توجد مرفقات.</div>`}
+        </div>
+      </div>
+
+      <div class="hr"></div>
       <div class="row">
         <div class="col">
           <div class="card subcard">
@@ -2614,6 +3684,7 @@ async function viewEmployees() {
             <th>الاسم</th>
             <th>الاختصاص</th>
             <th>الهاتف</th>
+            <th>الإيميل</th>
             <th>الراتب</th>
             <th>الحالة</th>
             <th>إجراءات</th>
@@ -2647,6 +3718,7 @@ async function viewReports() {
   const invoices = await dbAPI.getAll("invoices");
   const parts = await dbAPI.getAll("parts");
   const workOrders = await dbAPI.getAll("workOrders");
+  const expenses = await dbAPI.getAll("expenses");
 
   const today = new Date();
   const startDay = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
@@ -2656,6 +3728,9 @@ async function viewReports() {
 
   const todayPaid = invoices.filter(i => i.createdAt>=startDay && i.createdAt<endDay).reduce((s,i)=> s + Number(i.paid||0), 0);
   const monthPaid = invoices.filter(i => i.createdAt>=startMonth).reduce((s,i)=> s + Number(i.paid||0), 0);
+
+  const todayExp = expenses.filter(x => x.whenTs>=startDay && x.whenTs<endDay).reduce((s,x)=> s + Number(x.amount||0), 0);
+  const monthExp = expenses.filter(x => x.whenTs>=startMonth).reduce((s,x)=> s + Number(x.amount||0), 0);
 
   const totalRemaining = invoices.reduce((s,i)=> s + Math.max(0, Number(i.total||0)-Number(i.paid||0)), 0);
 
@@ -2684,10 +3759,14 @@ async function viewReports() {
 
       <div class="cards">
         <div class="card"><div class="card-title">مدفوع اليوم</div><div class="card-value">${money(todayPaid)}</div></div>
+        <div class="card"><div class="card-title">مصروف اليوم</div><div class="card-value">${money(todayExp)}</div></div>
+        <div class="card"><div class="card-title">صافي اليوم</div><div class="card-value">${money(todayPaid - todayExp)}</div></div>
         <div class="card"><div class="card-title">مدفوع هذا الشهر</div><div class="card-value">${money(monthPaid)}</div></div>
+        <div class="card"><div class="card-title">مصروف هذا الشهر</div><div class="card-value">${money(monthExp)}</div></div>
         <div class="card"><div class="card-title">مبالغ متبقية (ديون)</div><div class="card-value">${money(totalRemaining)}</div></div>
-        <div class="card"><div class="card-title">عدد تبديل دهن هذا الشهر</div><div class="card-value">${oilCountMonth}</div></div>
       </div>
+
+      <div class="small" style="margin-top:8px">عدد تبديل دهن هذا الشهر: <b>${oilCountMonth}</b></div>
 
       <div class="hr"></div>
 
@@ -2848,7 +3927,10 @@ async function viewMore() {
         <a class="btn" href="#/customers">الزباين</a>
         <a class="btn" href="#/vehicles">السيارات</a>
         <a class="btn" href="#/invoices">الفواتير</a>
+        <a class="btn" href="#/expenses">المصروفات</a>
+        <a class="btn" href="#/appointments">المواعيد</a>
         <a class="btn" href="#/employees">الموظفين</a>
+        <a class="btn" href="#/roles">الصلاحيات</a>
         <a class="btn" href="#/reports">التقارير</a>
         <a class="btn" href="#/backup">نسخ احتياطي</a>
       </div>
@@ -2894,6 +3976,13 @@ async function renderRoute() {
   const { route, params } = parseHash();
   state.route = route;
 
+  // منع الوصول حسب الدور
+  if (!canAccessRoute(route) && route !== "auth") {
+    const view = $("#view");
+    view.innerHTML = `<div class="card"><div class="notice">ما عندك صلاحية لهالصفحة (${escapeHtml(roleLabel(currentRole()))}).</div></div>`;
+    return;
+  }
+
   setTitle(route);
   setActiveNav(route);
 
@@ -2901,7 +3990,8 @@ async function renderRoute() {
   const cloudOk = cloudEnabled();
   const label = cloudOk ? "سحابة" : "محلي";
   const who = cloudOk && authState.user ? (authState.user.email || String(authState.user.uid).slice(0, 6) + "…") : "";
-  $("#todayBadge").textContent = `اليوم: ${d.toLocaleDateString("ar-IQ")} • ${label}${who ? " • " + who : ""}`;
+  const rLabel = roleLabel(currentRole());
+  $("#todayBadge").textContent = `اليوم: ${d.toLocaleDateString("ar-IQ")} • ${label}${who ? " • " + who : ""} • ${rLabel}`;
 
   const view = $("#view");
   view.innerHTML = `<div class="notice">... جاري التحميل</div>`;
@@ -2920,6 +4010,9 @@ async function renderRoute() {
   if (route === "invoices") html = await viewInvoices();
   if (route === "employees") html = await viewEmployees();
   if (route === "reports") html = await viewReports();
+  if (route === "expenses") html = await viewExpenses();
+  if (route === "appointments") html = await viewAppointments(params);
+  if (route === "roles") html = await viewRoles();
   if (route === "backup") html = await viewBackup();
   if (route === "more") html = await viewMore();
   if (route === "auth") html = await viewAuth();
@@ -2972,6 +4065,8 @@ document.addEventListener("click", async (e) => {
     $("#modal").classList.add("hidden");
     if (q === "checkin") location.hash = "#/checkin";
     if (q === "oil") location.hash = "#/oil";
+    if (q === "appointment") return createAppointment();
+    if (q === "expense") return createExpense();
     if (q === "customer") return createCustomer();
     if (q === "vehicle") return createVehicle();
     if (q === "employee") return createEmployee();
@@ -3015,6 +4110,28 @@ document.addEventListener("click", async (e) => {
   if (act === "newVehicleForCustomer") return createVehicle(id);
   if (act === "editVehicle") return editVehicle(id);
   if (act === "deleteVehicle") return deleteVehicle(id);
+
+  // Appointments
+  if (act === "newAppointment") return createAppointment();
+  if (act === "newAppointmentForVehicle") return createAppointment({ vehicleId: id });
+  if (act === "editAppointment") return editAppointment(id);
+  if (act === "delAppointment") return deleteAppointment(id);
+  if (act === "apToOrder") return appointmentToOrder(id);
+
+  // Expenses
+  if (act === "newExpense") return createExpense();
+  if (act === "editExpense") return editExpense(id);
+  if (act === "delExpense") return deleteExpense(id);
+
+  // Attachments
+  if (act === "addAttachment") return addAttachment(t.dataset.type, t.dataset.entity, t.dataset.kind);
+  if (act === "delAttachment") return deleteAttachment(id);
+  if (act === "viewAttachment") return viewAttachment(id);
+
+  // Roles
+  if (act === "createInvite") return createInvite();
+  if (act === "revokeInvite") return revokeInvite(id);
+  if (act === "saveUserRole") return saveUserRole(id);
 
   if (act === "newEmployee") return createEmployee();
   if (act === "editEmployee") return editEmployee(id);
@@ -3137,7 +4254,7 @@ $("#globalSearch").addEventListener("input", () => {
   state.search = $("#globalSearch").value || "";
   const r = parseHash().route;
   // rerender for pages where search makes sense
-  if (["orders","customers","vehicles","inventory"].includes(r)) renderRoute();
+  if (["orders","customers","vehicles","inventory","appointments","expenses"].includes(r)) renderRoute();
 });
 
 $("#btnSeed").addEventListener("click", seedDemo);
@@ -3150,17 +4267,19 @@ window.addEventListener("hashchange", () => { $("#sidebar").classList.remove("op
   // Firebase Auth persistence (يبقى مسجّل دخول)
   setPersistence(auth, browserLocalPersistence).catch(() => {});
 
-  onAuthStateChanged(auth, (u) => {
+  onAuthStateChanged(auth, async (u) => {
     authState.user = u || null;
 
     const btn = $("#btnAuth");
-    if (btn) btn.textContent = u ? (u.email ? "حساب" : "حساب") : "الحساب";
+    if (btn) btn.textContent = u ? "حساب" : "الحساب";
 
     // إذا كانت السحابة مفعّلة وطلعنا من الحساب، نرجع محلي حتى التطبيق يظل يشتغل
     if (!u && Settings.get("storageMode", "local") === "firebase") {
       Settings.set("storageMode", "local");
       toast("تم التحويل للمحلي لأن الحساب خرج", "warn", 4200);
     }
+
+    await ensureRole();
 
     // تحديث الواجهة
     renderRoute();
