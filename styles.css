@@ -360,3 +360,58 @@ textarea{ min-height:90px; resize:vertical; }
   flex-wrap:wrap;
   margin-top: 8px;
 }
+
+
+/* ====== Extensions: Roles + Appointments + Expenses + Attachments ====== */
+.is-hidden{ display:none !important; }
+
+.gallery{
+  display:grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px,1fr));
+  gap:10px;
+  margin-top:10px;
+}
+.thumb{
+  width:100%;
+  height:110px;
+  object-fit:cover;
+  border-radius:14px;
+  border:1px solid var(--border);
+  background:#fff;
+}
+.thumb-wrap{
+  position:relative;
+}
+.thumb-actions{
+  position:absolute;
+  inset:auto 6px 6px 6px;
+  display:flex;
+  gap:6px;
+  justify-content:space-between;
+}
+.thumb-actions .btn{
+  padding:6px 10px;
+  font-size:12px;
+  border-radius:12px;
+  backdrop-filter: blur(6px);
+}
+
+/* Image viewer modal */
+.imgmodal-card{
+  width:min(920px, 96vw);
+  max-height: 86vh;
+  overflow:auto;
+  background:var(--card);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  border:1px solid var(--border);
+}
+.imgmodal-body{
+  padding:12px;
+}
+.imgmodal-body img{
+  width:100%;
+  height:auto;
+  border-radius: 14px;
+  border:1px solid var(--border);
+}
