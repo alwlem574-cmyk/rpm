@@ -1,119 +1,0 @@
-<!doctype html>
-<html lang="ar" dir="rtl">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <base href="./">
-  <title>نظام حسن الوليم RPM</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A//www.w3.org/2000/svg'%20viewBox%3D'0%200%2064%2064'%3E%3Crect%20width%3D'64'%20height%3D'64'%20rx%3D'14'%20fill%3D'%23111827'/%3E%3Ctext%20x%3D'32'%20y%3D'42'%20font-size%3D'24'%20text-anchor%3D'middle'%20fill%3D'white'%20font-family%3D'Arial'%20font-weight%3D'700'%3ERPM%3C/text%3E%3C/svg%3E" />
-<link rel="stylesheet" href="styles.css?v=11" />
-  <!-- Libs (CDN) للتكاملات: Excel + QR + Scanner -->
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/html5-qrcode@2.3.10/minified/html5-qrcode.min.js"></script>
-  <!-- app.js صار Module حتى نكدر نستورد Firebase من الـ CDN بدون باك-إند -->
-  <script type="module" src="app.js?v=11"></script>
-</head>
-
-<body>
-  <div class="app">
-    <aside class="sidebar" id="sidebar">
-      <div class="brand">
-        <!-- Logo SVG بسيط -->
-        <div class="logo-wrap">
-          <svg class="logo-svg" viewBox="0 0 64 64" aria-label="RPM Logo">
-            <circle cx="32" cy="32" r="28" fill="#111827"></circle>
-            <path d="M16 40c4-10 28-10 32 0" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
-            <path d="M32 32 L48 24" stroke="#ffffff" stroke-width="3" stroke-linecap="round"/>
-            <circle cx="32" cy="32" r="3" fill="#ffffff"></circle>
-            <text x="32" y="54" text-anchor="middle" font-size="14" fill="#ffffff" font-weight="900">RPM</text>
-          </svg>
-        </div>
-
-        <div>
-          <div class="brand-title">نظام حسن الوليم RPM</div>
-          <div class="brand-sub">إدارة كراج • واجهة فقط • سحابة فقط (Firebase) بدون باك-إند</div>
-        </div>
-      </div>
-
-      <nav class="nav">
-        <a href="#/dashboard" class="nav-item" data-route="dashboard">لوحة التحكم</a>
-        <a href="#/checkin" class="nav-item" data-route="checkin">الاستقبال</a>
-        <a href="#/appointments" class="nav-item" data-route="appointments">المواعيد</a>
-        <a href="#/orders" class="nav-item" data-route="orders">أوامر الشغل</a>
-        <a href="#/workboard" class="nav-item" data-route="workboard">لوحة الورشة</a>
-        <a href="#/customers" class="nav-item" data-route="customers">الزباين</a>
-        <a href="#/vehicles" class="nav-item" data-route="vehicles">السيارات</a>
-        <a href="#/oil" class="nav-item" data-route="oil">تبديل دهن</a>
-        <a href="#/inventory" class="nav-item" data-route="inventory">المخزون</a>
-        <a href="#/invoices" class="nav-item" data-route="invoices">الفواتير</a>
-        <a href="#/expenses" class="nav-item" data-route="expenses">المصروفات</a>
-        <a href="#/employees" class="nav-item" data-route="employees">الموظفين</a>
-        <a href="#/roles" class="nav-item" data-route="roles">الصلاحيات</a>
-        <a href="#/activity" class="nav-item" data-route="activity">سجل النشاط</a>
-        <a href="#/reports" class="nav-item" data-route="reports">التقارير</a>
-        <a href="#/backup" class="nav-item" data-route="backup">نسخ احتياطي</a>
-      </nav>
-
-      <div class="sidebar-footer">
-        <div class="hint">بحث سريع:</div>
-        <input id="globalSearch" class="input" placeholder="زبون/لوحة/هاتف/رقم أمر..." />
-        <div class="mini">
-          <button id="btnNew" class="btn btn-primary">+ جديد</button>
-          <button id="btnSeed" class="btn">بيانات تجريبية</button>
-        </div>
-        <div class="small" style="margin-top:8px">
-          تلميح: الطباعة من داخل الصفحة + تگدرين تسوين Save as PDF.
-        </div>
-      </div>
-    </aside>
-
-    <main class="main">
-      <header class="topbar">
-        <div class="top-left">
-          <button id="btnMenu" class="btn btn-icon" aria-label="Menu">☰</button>
-          <div class="page-title" id="pageTitle">لوحة التحكم</div>
-        </div>
-        <div class="top-right">
-          <span class="badge" id="todayBadge"></span>
-          <button id="btnAuth" class="btn btn-soft" style="margin-right:8px">الحساب</button>
-        </div>
-      </header>
-
-      <section id="view" class="view"></section>
-    </main>
-
-    <!-- Bottom tabs للموبايل -->
-    <nav class="bottom-nav">
-      <a href="#/dashboard" class="tab" data-route="dashboard">🏠<span>الرئيسية</span></a>
-      <a href="#/checkin" class="tab" data-route="checkin">🧾<span>استقبال</span></a>
-      <a href="#/orders" class="tab" data-route="orders">🛠️<span>أوامر</span></a>
-      <a href="#/oil" class="tab" data-route="oil">🛢️<span>دهن</span></a>
-      <a href="#/more" class="tab" data-route="more">⋯<span>المزيد</span></a>
-    </nav>
-  </div>
-
-  <!-- Modal: Quick Create -->
-  <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
-    <div class="modal-card">
-      <div class="modal-head">
-        <div class="modal-title">إنشاء سريع</div>
-        <button id="modalClose" class="btn btn-icon" aria-label="Close">✕</button>
-      </div>
-      <div class="modal-body">
-        <div class="grid2">
-          <button class="btn btn-primary" data-quick="checkin">استقبال</button>
-          <button class="btn" data-quick="appointment">موعد جديد</button>
-          <button class="btn" data-quick="oil">تبديل دهن</button>
-          <button class="btn" data-quick="expense">مصروف جديد</button>
-          <button class="btn" data-quick="customer">زبون جديد</button>
-          <button class="btn" data-quick="vehicle">سيارة جديدة</button>
-          <button class="btn" data-quick="employee">موظف جديد</button>
-          <button class="btn" data-quick="part">قطعة جديدة</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-</body>
-</html>
